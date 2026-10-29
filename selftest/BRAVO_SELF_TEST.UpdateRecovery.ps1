@@ -50,9 +50,10 @@
 
         function script:Remove-BRAVOUpdateOperationDirectory {
             [CmdletBinding()]
-            param([string]$Path, [string]$ExpectedParent, [string]$OperationId)
+            param([string]$Path, [string]$ExpectedParent, [string]$OperationId, [string[]]$AllowedRoot = @())
             if ([IO.Path]::GetFileName($Path) -ne $OperationId) { throw 'stub: leaf != operationId' }
             if ([IO.Path]::GetDirectoryName($Path) -ne $ExpectedParent.TrimEnd('\')) { throw 'stub: parent != expected' }
+            if ((@($AllowedRoot).Count -eq 0) -or (@($AllowedRoot | ForEach-Object { $_.TrimEnd([char]92) }) -notcontains $ExpectedParent.TrimEnd([char]92))) { throw 'stub: AllowedRoot (engine roots) не передано або не містить ExpectedParent' }
             Remove-Item -LiteralPath $Path -Recurse -Force
         }
 
@@ -164,7 +165,10 @@
             OpId = [guid]::NewGuid().ToString()
             Adapter = @{}
         }
-        foreach ($key in @('Runtime', 'State', 'Lock', 'Staging', 'Backup')) { New-Item -ItemType Directory -Path $environment[$key] -Force | Out-Null }
+        foreach ($key in @('Runtime', 'State', 'Lock')) { New-Item -ItemType Directory -Path $environment[$key] -Force | Out-Null }
+        # H1: корені staging/backup — через канонічний Initialize (захищений власник/DACL), інакше
+        # Remove-BRAVOUpdateOperationDirectory -AllowedRoot (справедливо) відмовляє.
+        $null = & $updateModule { param($x) Initialize-BRAVOUpdateProtectedRoots -Paths $x -Only @('StagingRoot', 'BackupRoot') } ([pscustomobject]@{ StateRoot = $environment.State; LockRoot = $environment.Lock; StagingRoot = $environment.Staging; BackupRoot = $environment.Backup })
         $utf8 = New-Object System.Text.UTF8Encoding $false
         [IO.File]::WriteAllText((Join-Path $environment.Runtime 'BRAVO_FIXTURE.ps1'), "# fixture`r`n", $utf8)
         [IO.File]::WriteAllText((Join-Path $environment.Runtime 'BRAVO.local.config'), '{"site":"Example Lab"}', $utf8)
