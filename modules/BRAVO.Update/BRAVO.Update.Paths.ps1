@@ -253,6 +253,8 @@ function New-BRAVOUpdateProtectedDirectory {
     }
 }
 
+$script:BRAVOUpdateAclDeniedPrefix = 'доступ до ACL заборонено: '
+
 function Get-BRAVOUpdateProtectedRootProblem {
     <#
     .SYNOPSIS
@@ -271,7 +273,9 @@ function Get-BRAVOUpdateProtectedRootProblem {
         [Parameter(Mandatory = $true)][string]$Path,
         [ValidateSet('Private', 'ReadOnly', 'Requests')][string]$Kind = 'Private',
         [switch]$Lenient,
-        [scriptblock]$AdminCheck = $null
+        [scriptblock]$AdminCheck = $null,
+        # Seam тестів: param($Path) -> об'єкт ACL (типово Get-Acl). Кидає UnauthorizedAccessException для імітації відмови.
+        [scriptblock]$AclReader = $null
     )
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -287,7 +291,15 @@ function Get-BRAVOUpdateProtectedRootProblem {
             'Requests' { $allowedMask = [int]($rights::CreateFiles -bor $rights::ExecuteFile -bor $rights::ReadAttributes -bor $rights::Synchronize) }
             default { $allowedMask = 0 }
         }
-        $acl = Get-Acl -LiteralPath $Path
+        $acl = $null
+        try {
+            if ($null -ne $AclReader) { $acl = & $AclReader $Path } else { $acl = Get-Acl -LiteralPath $Path }
+        } catch [System.UnauthorizedAccessException] {
+            # Відмову читання ACL окремо маркуємо: неелевований процес (фільтрований токен не бачить ACE Administrators)
+            # не може її трактувати як доказ небезпеки, а елевований — трактує (fail closed).
+            $problems.Add($script:BRAVOUpdateAclDeniedPrefix + $Path)
+            return $problems.ToArray()
+        }
         if ((-not $Lenient) -and (-not $acl.AreAccessRulesProtected)) { $problems.Add('успадкування прав не вимкнено: ' + $Path) }
         $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
         if ($trusted -notcontains $ownerSid) { $problems.Add('власник ' + $ownerSid + ' не з довіреного списку: ' + $Path) }
@@ -385,12 +397,14 @@ function Initialize-BRAVOUpdateProtectedRoots {
         [string]$ProgramDataRoot = '',
         # Обмеження переліку ролями (Get-BRAVOUpdateProtectedRootSpec.Role); без нього — усі корені й контейнери.
         [string[]]$Only = @(),
-        [scriptblock]$AdminCheck = $null
+        [scriptblock]$AdminCheck = $null,
+        [scriptblock]$AclReader = $null
     )
 
     $created = New-Object System.Collections.Generic.List[string]
     $reapplied = New-Object System.Collections.Generic.List[string]
     $missing = New-Object System.Collections.Generic.List[string]
+    $deferred = New-Object System.Collections.Generic.List[string]
     $problems = New-Object System.Collections.Generic.List[string]
     $includeCurrent = Test-BRAVOUpdateTrustCurrentUser -AdminCheck $AdminCheck
     $spec = @()
@@ -417,9 +431,16 @@ function Initialize-BRAVOUpdateProtectedRoots {
                 if ($made.Success) { $created.Add($path) } else { foreach ($item in $made.Problems) { $problems.Add([string]$item) } }
                 continue
             }
-            $found = @(Get-BRAVOUpdateProtectedRootProblem -Path $path -Kind ([string]$entry.Kind) -AdminCheck $AdminCheck)
+            $found = @(Get-BRAVOUpdateProtectedRootProblem -Path $path -Kind ([string]$entry.Kind) -AdminCheck $AdminCheck -AclReader $AclReader)
             if ($found.Count -eq 0) { continue }
-            if ($Validate) { foreach ($item in $found) { $problems.Add([string]$item) }; continue }
+            if ($Validate) {
+                foreach ($item in $found) {
+                    # Неелевований -Validate: відмова читання ACL ≠ небезпечний корінь (Private-корені читає лише
+                    # Administrators/SYSTEM) — перевірку виконає елевований worker. Елевований: лишається проблемою.
+                    if ($includeCurrent -and ([string]$item).StartsWith($script:BRAVOUpdateAclDeniedPrefix, [StringComparison]::Ordinal)) { $deferred.Add($path) } else { $problems.Add([string]$item) }
+                }
+                continue
+            }
             if (-not (Test-BRAVOUpdateOwnerTrusted -Path $path -AdminCheck $AdminCheck)) {
                 foreach ($item in $found) { $problems.Add([string]$item) }
                 $problems.Add('каталог не змінено: власник недовірений, потрібне ручне прибирання (могло бути підкинуто вміст): ' + $path)
@@ -446,6 +467,7 @@ function Initialize-BRAVOUpdateProtectedRoots {
         Created   = $created.ToArray()
         Reapplied = $reapplied.ToArray()
         Missing   = $missing.ToArray()
+        Deferred  = $deferred.ToArray()
         Problems  = $problems.ToArray()
         Findings  = $findings.ToArray()
     }
