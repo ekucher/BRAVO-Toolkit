@@ -17804,6 +17804,14 @@ $global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
+    # Похідні рядки з незмінних файлів репозиторію (runtime 845 КБ + ServiceCycle/
+    # ServiceRecovery + stubs) будуються ОДИН раз на дочірній процес і далі лише
+    # читаються сценаріями (рядки, не AST). Раніше кожен із ~55 сценаріїв заново
+    # парсив усе це (OPT-08). Збій побудови не кешується: кожен сценарій знову
+    # кине ту саму помилку й отримає ProbeError (fail-closed). Файл runtime.ps1,
+    # seed, scenario-seed, Import-Module -Force і виклик точки входу лишаються
+    # посценарними.
+    if ($null -eq $script:probeShared) {
     $probeRuntimeText = [IO.File]::ReadAllText(
         (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
     $probeParseErrors = $null
@@ -17873,6 +17881,15 @@ try {
         [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
         [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
     }
+    $script:probeShared = @{
+        ParamBlockText = [string]$probeAst.ParamBlock.Extent.Text
+        FunctionTexts = [string]($probeFunctionTexts -join "`n`n")
+        Stubs = [string]$probeStubs
+        RegionText = [string]$probeRegion.ToString()
+        FinallyText = [string]('} finally ' + $probeOuterTry.Finally.Extent.Text)
+    }
+    }
+    $probeShared = $script:probeShared
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
     # ThrowInSizeCheck: exchangAPI зупинена до прогону. #349 *InitiallyStopped:
@@ -18063,18 +18080,18 @@ try {
         $probeScenarioSeedFile = [IO.File]::ReadAllText($probeScenarioSeedPath, [Text.Encoding]::UTF8)
     }
     $probeGenerated = @(
-        $probeAst.ParamBlock.Extent.Text,
+        $probeShared.ParamBlockText,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
         'Set-StrictMode -Version 2.0',
-        ($probeFunctionTexts -join "`n`n"),
-        $probeStubs,
+        $probeShared.FunctionTexts,
+        $probeShared.Stubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
         $probeRestoreSeed,
         $probeScenarioSeedFile,
         'try {',
-        $probeRegion.ToString(),
-        ('} finally ' + $probeOuterTry.Finally.Extent.Text),
+        $probeShared.RegionText,
+        $probeShared.FinallyText,
         '}',
         'Invoke-BRAVOMaintenanceOrchestrationProbe'
     ) -join "`n"
