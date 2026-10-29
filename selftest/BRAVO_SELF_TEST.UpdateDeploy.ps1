@@ -763,7 +763,7 @@ function script:Invoke-BRAVORollback {
             $csj = Read-E2Journal -Sandbox $cs
             Test-BRAVOCondition -Condition ($crashed -and ([string]$csj.state -eq 'Open') -and $csj.mutationStarted -and (Test-E2LocksFree -Sandbox $cs) -and ((Get-E2RollbackCount -Sandbox $cs) -eq 0)) -Name 'UpdateDeploy/Crash-NoRollbackJournalOpen' -Failure 'Crash: виняток, журнал Open з mutationStarted, rollback не викликано, lock-и звільнені.'
             if ($null -ne (Get-Command -Name 'Invoke-BRAVORecovery' -ErrorAction SilentlyContinue)) {
-                $rec = Invoke-BRAVORecovery -StateRoot $cs.State -LockRoot $cs.Lock -OperationLockPath $cs.OpLock -Adapter $cs.Adapter -VersionStatePath $cs.VersionState
+                $rec = Invoke-BRAVORecovery -StateRoot $cs.State -LockRoot $cs.Lock -OperationLockPath $cs.OpLock -Adapter $cs.Adapter -VersionStatePath $cs.VersionState -RuntimeRoot $cs.Runtime -StagingRoot $cs.Staging -BackupRoot $cs.Backup
                 $csj2 = Read-E2Journal -Sandbox $cs
                 Test-BRAVOCondition -Condition ([string]$csj2.state -ne 'Open') -Name 'UpdateDeploy/Crash-RecoveryClosesJournal' -Failure ('Recovery закриває журнал після Crash; status=' + $rec.status)
             }

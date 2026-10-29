@@ -46,8 +46,21 @@ function Get-UpdRbTreeHash {
 # suite модуль перезавантажується (-Force), тож stub-и не просочуються далі.
 & $updRbModule {
     $script:UpdRbLog = New-Object System.Collections.Generic.List[string]
-    $script:UpdRbMode = @{ ValidationStatus = 'Pass'; RestoreComplete = $true; ReconcileVerdict = 'PASS' }
-    function script:Disable-BRAVOAllManagedTasks { [CmdletBinding()] param($Adapter) $script:UpdRbLog.Add('Disable') }
+    $script:UpdRbMode = @{ ValidationStatus = 'Pass'; RestoreComplete = $true; ReconcileVerdict = 'PASS'; LiveEnabled = $false }
+    $script:UpdRbProbe = $null
+    function script:Disable-BRAVOAllManagedTasks {
+        [CmdletBinding()] param($Adapter, $RuntimeRoot = '', $Snapshot = $null)
+        # Probe фіксує стан runtime у МОМЕНТ вимкнення (порядок quiesce -> restore).
+        $suffix = ''
+        if ($null -ne $script:UpdRbProbe) { $suffix = '@' + [string](& $script:UpdRbProbe) }
+        $script:UpdRbLog.Add('Disable' + $suffix)
+        [pscustomobject]@{ Disabled = @(); Failed = @(); IsComplete = $true }
+    }
+    function script:Get-BRAVOSchedulerSnapshot {
+        [CmdletBinding()] param($Adapter, $RuntimeRoot = '', $TaskPath = '', $ManagedTaskName = @())
+        $script:UpdRbLog.Add('LiveRead')
+        [pscustomobject]@{ tasks = @([pscustomobject]@{ name = 'T1'; exists = $true; enabled = [bool]$script:UpdRbMode.LiveEnabled }) }
+    }
     function script:Restore-BRAVOManagedTaskState {
         [CmdletBinding()] param($Snapshot, $Adapter)
         $script:UpdRbLog.Add('RestoreTasks')
@@ -65,8 +78,8 @@ function Get-UpdRbTreeHash {
     }
 }
 function Reset-UpdRbStubs {
-    param([string]$ValidationStatus = 'Pass', [bool]$RestoreComplete = $true, [string]$ReconcileVerdict = 'PASS')
-    & $updRbModule { param($v, $r, $c) $script:UpdRbLog.Clear(); $script:UpdRbMode = @{ ValidationStatus = $v; RestoreComplete = $r; ReconcileVerdict = $c } } $ValidationStatus $RestoreComplete $ReconcileVerdict
+    param([string]$ValidationStatus = 'Pass', [bool]$RestoreComplete = $true, [string]$ReconcileVerdict = 'PASS', [bool]$LiveEnabled = $false, $Probe = $null)
+    & $updRbModule { param($v, $r, $c, $l, $p) $script:UpdRbLog.Clear(); $script:UpdRbProbe = $p; $script:UpdRbMode = @{ ValidationStatus = $v; RestoreComplete = $r; ReconcileVerdict = $c; LiveEnabled = $l } } $ValidationStatus $RestoreComplete $ReconcileVerdict $LiveEnabled $Probe
 }
 function Get-UpdRbLog { $items = @(& $updRbModule { $script:UpdRbLog.ToArray() }); return $items }
 
@@ -79,7 +92,7 @@ function New-UpdRbUpdateScenario {
     $base = Join-Path $updRbTemp ($Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $s = @{ Base = $base }
     $s.Runtime = Join-Path $base 'runtime Сервер'
-    $s.State = Join-Path $base 'state'
+    $s.State = Join-Path $base 'state'; $s.Staging = Join-Path $base 'staging'; $s.Backup = Join-Path $base 'backup'
     $s.Backup = Join-Path $base 'backup'
     $s.Staging = Join-Path $base 'staging'
     $s.OpLock = Join-Path $base 'locks\BRAVO_OPERATION.lock'
@@ -109,7 +122,7 @@ function New-UpdRbUpdateScenario {
         [System.IO.File]::Copy($source, $target, $true)
         $backupHashes[$key] = Get-UpdRbSha -Path $source
     }
-    Write-UpdRbFile -Path (Join-Path $backupDir 'backup-manifest.json') -Text ((@{ schemaVersion = 1; operationId = $s.OperationId; files = $backupHashes } | ConvertTo-Json -Depth 5))
+    Write-UpdRbFile -Path (Join-Path $backupDir 'backup-manifest.json') -Text ((@{ schemaVersion = 1; operationId = $s.OperationId; sourceRuntimeRoot = $s.Runtime; createdUtc = '2026-01-01T00:00:00.0000000Z'; excludeFiles = @(); excludeDirs = @(); files = $backupHashes; fileCount = $backupHashes.Count; totalBytes = 0 } | ConvertTo-Json -Depth 5))
     $s.BackupDir = $backupDir
     $s.OrigTree = Get-UpdRbTreeHash -Root $s.Runtime
 
@@ -143,7 +156,7 @@ function New-UpdRbUpdateScenario {
 
     $journal = Invoke-UpdRbCall -Name 'New-BRAVOUpdateJournal' -Arguments @{
         StateRoot = $s.State; Action = 'Update'; OperationId = $s.OperationId; PlanId = [guid]::NewGuid().ToString()
-        RuntimeRoot = $s.Runtime; StagingRoot = (Join-Path $s.Staging $s.OperationId); BackupRoot = $s.Backup
+        RuntimeRoot = $s.Runtime; StagingRoot = $s.Staging; BackupRoot = $s.Backup
         SourceVersion = '5.2.5'; TargetVersion = '5.2.6'
     }
     $manifestSha = Get-UpdRbSha -Path (Join-Path $backupDir 'backup-manifest.json')
@@ -163,12 +176,59 @@ function New-UpdRbUpdateScenario {
     return $s
 }
 
-function Invoke-UpdRbRollback {
-    param($Scenario, $Fault = $null)
-    $arguments = @{
-        Journal = $Scenario.Journal; Adapter = @{}; StateRoot = $Scenario.State; LockRoot = (Join-Path $Scenario.Base 'locks')
-        OperationLockPath = $Scenario.OpLock; VersionStatePath = $Scenario.VersionState
+# Repair -Scope Scheduler: файли не змінювались, backup = $null, Deploy-фази немає;
+# після межі mutation відбулися лише QuiesceTasks/ConfigureScheduler і зсув state.
+function New-UpdRbSchedulerOnlyScenario {
+    param([string]$Name)
+    $base = Join-Path $updRbTemp ($Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $s = @{ Base = $base }
+    $s.Runtime = Join-Path $base 'runtime Сервер'
+    $s.State = Join-Path $base 'state'; $s.Staging = Join-Path $base 'staging'; $s.Backup = Join-Path $base 'backup'
+    $s.OpLock = Join-Path $base 'locks\BRAVO_OPERATION.lock'
+    $s.VersionState = Join-Path $base 'state-file\BRAVO_VERSION_STATE.json'
+    $s.OperationId = [guid]::NewGuid().ToString()
+    $s.OpDir = Join-Path (Join-Path $s.State 'Operations') $s.OperationId
+    [void](New-Item -ItemType Directory -Path $s.Runtime, $s.State -Force)
+    $files = [ordered]@{ 'BRAVO_A.ps1' = 'A'; 'VERSION.json' = '{"packageVersion":"5.2.5"}' }
+    $hashes = [ordered]@{}
+    foreach ($key in $files.Keys) {
+        Write-UpdRbFile -Path (Join-Path $s.Runtime $key) -Text $files[$key]
+        $hashes[$key] = Get-UpdRbSha -Path (Join-Path $s.Runtime $key)
     }
+    Write-UpdRbFile -Path (Join-Path $s.Runtime 'RUNTIME_MANIFEST.json') -Text ((@{ schemaVersion = 1; files = $hashes } | ConvertTo-Json -Depth 5))
+    $s.OrigTree = Get-UpdRbTreeHash -Root $s.Runtime
+    Write-UpdRbFile -Path $s.VersionState -Text $updRbOldState
+    $s.OrigStateSha = Get-UpdRbSha -Path $s.VersionState
+    $s.Snapshot = Invoke-UpdRbCall -Name 'Get-BRAVOVersionStateSnapshot' -Arguments @{ VersionStatePath = $s.VersionState; OperationDirectory = $s.OpDir }
+    $schedulerPath = Join-Path $s.OpDir 'scheduler-snapshot.json'
+    Write-UpdRbFile -Path $schedulerPath -Text '{"schemaVersion":1,"tasks":[{"name":"T1","enabled":true}]}'
+    Write-UpdRbFile -Path $s.VersionState -Text (Get-UpdRbStateText -Version '5.2.5')
+    $s.RaisedStateSha = Get-UpdRbSha -Path $s.VersionState
+    $journal = Invoke-UpdRbCall -Name 'New-BRAVOUpdateJournal' -Arguments @{
+        StateRoot = $s.State; Action = 'Repair'; OperationId = $s.OperationId; PlanId = [guid]::NewGuid().ToString()
+        RuntimeRoot = $s.Runtime; StagingRoot = (Join-Path $base 'staging'); BackupRoot = (Join-Path $base 'backup')
+        SourceVersion = '5.2.5'; TargetVersion = '5.2.5'
+    }
+    [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalSchedulerSnapshot' -Arguments @{ Journal = $journal; Path = $schedulerPath; StateRoot = $s.State })
+    [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalMutationStarted' -Arguments @{ Journal = $journal; StateRoot = $s.State })
+    [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalField' -Arguments @{ Journal = $journal; Name = 'versionState'; Value = $s.Snapshot; StateRoot = $s.State })
+    foreach ($phase in @('QuiesceTasks', 'ConfigureScheduler')) {
+        [void](Invoke-UpdRbCall -Name 'Add-BRAVOUpdateJournalPhaseIntent' -Arguments @{ Journal = $journal; Phase = $phase; StateRoot = $s.State })
+    }
+    $s.Journal = $journal
+    return $s
+}
+
+function Invoke-UpdRbRollback {
+    param($Scenario, $Fault = $null, $Adapter = $null, [string]$JournalPath = '')
+    if ($null -eq $Adapter) { $Adapter = @{} }
+    # Корені engine передаються явно (journal trust): sandbox-значення, не production-шляхи.
+    $arguments = @{
+        Journal = $Scenario.Journal; Adapter = $Adapter; StateRoot = $Scenario.State; LockRoot = (Join-Path $Scenario.Base 'locks')
+        OperationLockPath = $Scenario.OpLock; VersionStatePath = $Scenario.VersionState
+        RuntimeRoot = $Scenario.Runtime; StagingRoot = $Scenario.Staging; BackupRoot = $Scenario.Backup
+    }
+    if ($JournalPath -ne '') { $arguments.JournalPath = $JournalPath }
     if ($null -ne $Fault) { $arguments.FaultInjection = $Fault }
     return (Invoke-UpdRbCall -Name 'Invoke-BRAVORollback' -Arguments $arguments)
 }
@@ -186,7 +246,7 @@ function New-UpdRbInstallScenario {
     $base = Join-Path $updRbTemp ($Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     $s = @{ Base = $base }
     $s.Runtime = Join-Path $base 'install root Кореневий'
-    $s.State = Join-Path $base 'state'
+    $s.State = Join-Path $base 'state'; $s.Staging = Join-Path $base 'staging'; $s.Backup = Join-Path $base 'backup'
     $s.OpLock = Join-Path $base 'locks\BRAVO_OPERATION.lock'
     $s.VersionState = Join-Path $base 'state-file\BRAVO_VERSION_STATE.json'
     $s.OperationId = [guid]::NewGuid().ToString()
@@ -228,6 +288,7 @@ function New-UpdRbInstallScenario {
     return $s
 }
 
+# __UPDRB_HELPERS_END__ (дочірній процес no-prompt тесту завантажує текст до цього маркера)
 try {
     # --- Characterization: legacy-поведінка Invoke-BRAVODeployExactRestore незмінна ---
     & {
@@ -371,11 +432,11 @@ try {
         Test-BRAVOCondition -Condition ((Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.OrigTree) -Name 'UpdateRollback/Success/RuntimeEqualsBackup' -Failure 'після відкату дерево runtime має збігатися з вихідним (включно з видаленням доданих файлів і порожніх каталогів)'
         Test-BRAVOCondition -Condition ((Get-UpdRbSha -Path $s.VersionState) -eq $s.OrigStateSha) -Name 'UpdateRollback/Success/VersionStateRestored' -Failure 'state, піднятий до target, має бути повернений до знімка'
         Test-BRAVOCondition -Condition ($journalAfter.state -eq 'RolledBack' -and [int]$journalAfter.rollbackAttempts -eq 1) -Name 'UpdateRollback/Success/JournalRolledBackAttempts' -Failure 'журнал: RolledBack, rollbackAttempts=1'
-        $expectedOrder = @('Reconcile', 'Validate:Rollback', 'RestoreTasks')
+        $expectedOrder = @('Disable', 'LiveRead', 'Reconcile', 'Validate:Rollback', 'RestoreTasks')
         Test-BRAVOCondition -Condition (($log -join ',') -eq ($expectedOrder -join ',')) -Name 'UpdateRollback/Success/StepOrderTasksLast' -Failure "порядок: Scheduler -> Validate -> RestoreTasks (без Disable); отримано: $($log -join ',')"
         $phaseNames = @($journalAfter.phases | ForEach-Object { [string]$_.phase })
         $allDurable = $true
-        foreach ($p in @('Rollback.OperationLock', 'Rollback.RestoreFiles', 'Rollback.RestoreVersionState', 'Rollback.Verify', 'Rollback.Scheduler', 'Rollback.Validate', 'Rollback.RestoreTasks', 'Rollback.Finalize')) {
+        foreach ($p in @('Rollback.OperationLock', 'Rollback.QuiesceTasks', 'Rollback.RestoreFiles', 'Rollback.RestoreVersionState', 'Rollback.Verify', 'Rollback.Scheduler', 'Rollback.Validate', 'Rollback.RestoreTasks', 'Rollback.Finalize')) {
             $entry = @($journalAfter.phases | Where-Object { [string]$_.phase -eq $p })
             if ($entry.Count -ne 1 -or [string]$entry[0].outcome -ne 'Succeeded') { $allDurable = $false }
         }
@@ -395,7 +456,7 @@ try {
 
     # --- Crash у кожній фазі Rollback.* -> повторний запуск -> той самий фінальний стан ---
     & {
-        foreach ($phase in @('Rollback.OperationLock', 'Rollback.RestoreFiles', 'Rollback.RestoreVersionState', 'Rollback.Verify', 'Rollback.Scheduler', 'Rollback.Validate', 'Rollback.RestoreTasks', 'Rollback.Finalize')) {
+        foreach ($phase in @('Rollback.OperationLock', 'Rollback.QuiesceTasks', 'Rollback.RestoreFiles', 'Rollback.RestoreVersionState', 'Rollback.Verify', 'Rollback.Scheduler', 'Rollback.Validate', 'Rollback.RestoreTasks', 'Rollback.Finalize')) {
             foreach ($point in @('Before', 'AfterIntent', 'AfterSideEffect', 'AfterComplete')) {
                 Reset-UpdRbStubs
                 $s = New-UpdRbUpdateScenario -Name 'crash' -ConfigureScheduler
@@ -553,7 +614,7 @@ try {
         }
 
         # Crash у кожній фазі install-відкату -> повтор -> RolledBack.
-        foreach ($phase in @('Rollback.OperationLock', 'Rollback.InstallCleanup', 'Rollback.RestoreVersionState', 'Rollback.Finalize')) {
+        foreach ($phase in @('Rollback.OperationLock', 'Rollback.QuiesceTasks', 'Rollback.InstallCleanup', 'Rollback.RestoreVersionState', 'Rollback.Finalize')) {
             foreach ($point in @('AfterIntent', 'AfterSideEffect')) {
                 Reset-UpdRbStubs
                 $s = New-UpdRbInstallScenario -Name 'inst-crash'
@@ -564,6 +625,225 @@ try {
                 Test-BRAVOCondition -Condition ($crashed -and $r.status -eq 'RolledBack' -and -not (Test-Path -LiteralPath $s.Runtime) -and -not (Test-Path -LiteralPath $s.VersionState)) -Name ('UpdateRollback/InstallCrash/' + $phase + '.' + $point + '/Converges') -Failure "crash=$crashed status=$($r.status)"
             }
         }
+    }
+
+    # --- Repair -Scope Scheduler: backup = $null, збій після межі -> RolledBack (stub-и) ---
+    & {
+        Reset-UpdRbStubs
+        $s = New-UpdRbSchedulerOnlyScenario -Name 'schedonly'
+        $r = Invoke-UpdRbRollback -Scenario $s
+        $log = @(Get-UpdRbLog)
+        $journalAfter = Read-UpdRbJournal -Scenario $s
+        Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and $journalAfter.state -eq 'RolledBack' -and $null -eq $journalAfter.backup) -Name 'UpdateRollback/SchedulerOnly/RolledBack' -Failure "backup=null: має бути RolledBack; status=$($r.status) $($r.rollback.message)"
+        Test-BRAVOCondition -Condition ((Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.OrigTree -and (Get-UpdRbSha -Path $s.VersionState) -eq $s.OrigStateSha) -Name 'UpdateRollback/SchedulerOnly/FilesUntouchedStateRestored' -Failure 'файли не змінюються, version-state повертається до знімка'
+        Test-BRAVOCondition -Condition (($log -join ',') -eq 'Disable,LiveRead,Reconcile,Validate:Rollback,RestoreTasks') -Name 'UpdateRollback/SchedulerOnly/OnlyTaskStatesRestored' -Failure "scheduler -> validate -> restore tasks; отримано: $($log -join ',')"
+    }
+
+    # --- Жодна функція engine не питає в консолі: дочірній powershell.exe БЕЗ -NonInteractive,
+    # реальні Test-BRAVODeploymentValidation/Invoke-BRAVORollback, таймаут = «завис на запиті» ---
+    & {
+        if ($null -eq (Get-Command -Name 'Start-BRAVOProcessWithBomFreeInput' -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -DisableNameChecking
+        }
+        $childDir = Join-Path $updRbTemp 'noprompt child'
+        [void](New-Item -ItemType Directory -Path $childDir -Force)
+        $childPath = Join-Path $childDir 'noprompt.ps1'
+        $resultPath = Join-Path $childDir 'result.json'
+        $childText = @'
+param([string]$Root, [string]$Fragment, [string]$ResultPath)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$root = $Root
+$src = [System.IO.File]::ReadAllText($Fragment)
+$end = $src.IndexOf('# __UPDRB_HELPERS_END__')
+. ([scriptblock]::Create($src.Substring(0, $end)))
+# Скидаємо stub-и фрагмента; лишаємо stub лише для функцій, що торкаються Task Scheduler.
+Import-Module (Join-Path $Root 'modules\BRAVO.Update\BRAVO.Update.psm1') -Force -DisableNameChecking
+$updRbModule = Get-Module BRAVO.Update
+& $updRbModule {
+    function script:Disable-BRAVOAllManagedTasks { [CmdletBinding()] param($Adapter, $RuntimeRoot = '', $Snapshot = $null) [pscustomobject]@{ Disabled = @(); Failed = @(); IsComplete = $true } }
+    function script:Restore-BRAVOManagedTaskState { [CmdletBinding()] param($Snapshot, $Adapter) [pscustomobject]@{ Restored = @(); Failed = @(); IsComplete = $true } }
+    function script:Get-BRAVOSchedulerSnapshot { [CmdletBinding()] param($Adapter, $RuntimeRoot = '', $TaskPath = '', $ManagedTaskName = @()) [pscustomobject]@{ tasks = @() } }
+    function script:Invoke-BRAVOSchedulerReconcile { [CmdletBinding()] param($Context, $Snapshot) [pscustomobject]@{ Verdict = 'PASS'; ExitCode = 0; CreatedTasks = @(); RequiescedTasks = @(); Problems = @() } }
+}
+$ok = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
+$adapter = @{
+    InvokeGuard = $ok; InvokeSetupValidate = $ok; InvokeSetupScheduler = $ok; InvokeSelfTest = $ok
+    TestCredentialPresence = { param($RuntimeRoot, $Component) [pscustomobject]@{ Component = $Component; Presence = 'Found'; ExitCode = 0 } }
+    GetManagedTasks = { param($TaskPath) @() }
+    SetTaskEnabled = { param($TaskPath, $Name, $Enabled) [pscustomobject]@{ Success = $true; Message = '' } }
+    GetEffectiveConfiguration = { param($RuntimeRoot) [pscustomobject]@{ Success = $true; ExitCode = 0; Configuration = $null; Message = '' } }
+    Now = { [datetime]::UtcNow }
+}
+$s = New-UpdRbSchedulerOnlyScenario -Name 'child'
+# Baseline site-конфігурації (U10): без нього реальна валідація SiteConfigPreserved = Fail.
+$site = Invoke-UpdRbCall -Name 'Get-BRAVOSiteConfigurationBaseline' -Arguments @{ RuntimeRoot = $s.Runtime }
+[void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalField' -Arguments @{ Journal = $s.Journal; Name = 'baseline'; Value = ([pscustomobject]@{ siteConfig = $site; guardExitCode = 0 }); StateRoot = $s.State })
+$r = Invoke-UpdRbCall -Name 'Invoke-BRAVORollback' -Arguments @{
+    Journal = $s.Journal; Adapter = $adapter; StateRoot = $s.State; LockRoot = (Join-Path $s.Base 'locks')
+    OperationLockPath = $s.OpLock; VersionStatePath = $s.VersionState
+    RuntimeRoot = $s.Runtime; StagingRoot = $s.Staging; BackupRoot = $s.Backup
+}
+$payload = [pscustomobject]@{ status = [string]$r.status; message = [string]$r.rollback.message; treeSame = ((Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.OrigTree) }
+[System.IO.File]::WriteAllText($ResultPath, ($payload | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+$tmp = [System.IO.Path]::GetFullPath($updRbTemp)
+if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()), [System.StringComparison]::OrdinalIgnoreCase) -and ([System.IO.Path]::GetFileName($tmp)).StartsWith('bravo-updrb-')) {
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
+'@
+        [System.IO.File]::WriteAllText($childPath, $childText, (New-Object System.Text.UTF8Encoding($true)))
+        $fragmentPath = Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRollback.ps1'
+        $psExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $psExe
+        # Навмисно БЕЗ -NonInteractive: запит Mandatory-параметра тоді завис би (таймаут).
+        $startInfo.Arguments = '-NoProfile -ExecutionPolicy RemoteSigned -File "' + $childPath + '" -Root "' + $root + '" -Fragment "' + $fragmentPath + '" -ResultPath "' + $resultPath + '"'
+        $startInfo.UseShellExecute = $false
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $startInfo.CreateNoWindow = $true
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        $timedOut = $false
+        $childOutput = ''
+        try {
+            Start-BRAVOProcessWithBomFreeInput -Process $process
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(240000)) {
+                $timedOut = $true
+                # Лише власний об'єкт Process (handle зі Start).
+                try { $process.Kill() } catch { $null = $_ }
+            } else {
+                $process.WaitForExit()
+                $childOutput = [string]$stdoutTask.Result + [string]$stderrTask.Result
+            }
+        } finally {
+            $process.Dispose()
+        }
+        $parsed = $null
+        if ([System.IO.File]::Exists($resultPath)) { $parsed = [System.IO.File]::ReadAllText($resultPath) | ConvertFrom-Json }
+        Test-BRAVOCondition -Condition ((-not $timedOut) -and $null -ne $parsed -and $parsed.status -eq 'RolledBack' -and $parsed.treeSame) -Name 'UpdateRollback/SchedulerOnly/NoPromptInChildWithoutNonInteractive' -Failure "timedOut=$timedOut status=$(if ($null -ne $parsed) { $parsed.status + ' ' + $parsed.message } else { 'немає результату' }) output=$childOutput"
+    }
+
+    # --- P1-a: durable quiesce задач ПЕРЕД відновленням файлів (crash після Activate) ---
+    & {
+        $s = New-UpdRbUpdateScenario -Name 'activate'
+        [void](Invoke-UpdRbCall -Name 'Add-BRAVOUpdateJournalPhaseIntent' -Arguments @{ Journal = $s.Journal; Phase = 'Activate'; StateRoot = $s.State })
+        $runtimePath = $s.Runtime
+        $probe = { if ([System.IO.File]::ReadAllText((Join-Path $runtimePath 'BRAVO_A.ps1')) -eq 'new A') { 'deployed' } else { 'restored' } }.GetNewClosure()
+        Reset-UpdRbStubs -Probe $probe
+        $r = Invoke-UpdRbRollback -Scenario $s
+        $log = @(Get-UpdRbLog)
+        Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and $log.Count -ge 2 -and $log[0] -eq 'Disable@deployed' -and $log[1] -eq 'LiveRead') -Name 'UpdateRollback/Quiesce/TasksDisabledBeforeFileRestore' -Failure "Disable має бути першим і до зміни файлів (deployed); log: $($log -join ',')"
+
+        # Crash у Rollback.RestoreTasks -> повторний запуск знову спочатку вимикає задачі.
+        $s2 = New-UpdRbUpdateScenario -Name 'activate2'
+        Reset-UpdRbStubs
+        $crashed = $false
+        try { [void](Invoke-UpdRbRollback -Scenario $s2 -Fault @{ 'Rollback.RestoreTasks.AfterSideEffect' = 'Crash' }) } catch { $crashed = $true }
+        $s2.Journal = Read-UpdRbJournal -Scenario $s2
+        $r2 = Invoke-UpdRbRollback -Scenario $s2
+        $disables = @(@(Get-UpdRbLog) | Where-Object { $_ -like 'Disable*' })
+        Test-BRAVOCondition -Condition ($crashed -and $r2.status -eq 'RolledBack' -and $disables.Count -eq 2) -Name 'UpdateRollback/Quiesce/RerunQuiescesAgain' -Failure "кожен (пере)запуск починається з quiesce; Disable=$($disables.Count)"
+
+        # Задача лишилась увімкненою після вимкнення -> Critical, файли не чіпаються.
+        Reset-UpdRbStubs -LiveEnabled $true
+        $s3 = New-UpdRbUpdateScenario -Name 'stillenabled'
+        $r3 = Invoke-UpdRbRollback -Scenario $s3
+        Test-BRAVOCondition -Condition ($r3.status -eq 'Critical' -and (Get-UpdRbTreeHash -Root $s3.Runtime) -eq $s3.DeployedTree -and @(Get-UpdRbLog) -notcontains 'RestoreTasks') -Name 'UpdateRollback/Quiesce/StillEnabledIsCritical' -Failure "увімкнена задача після quiesce -> Critical без змін; status=$($r3.status)"
+    }
+
+    # --- P1-b: junction у runtime -> відкат відмовляє, ціль поза коренем не чіпається ---
+    & {
+        Reset-UpdRbStubs
+        $s = New-UpdRbUpdateScenario -Name 'junction'
+        $outside = Join-Path $s.Base 'outside target'
+        Write-UpdRbFile -Path (Join-Path $outside 'B.ps1') -Text 'outside victim'
+        $sub = Join-Path $s.Runtime 'sub dir'
+        Remove-Item -LiteralPath $sub -Recurse -Force
+        $mk = & cmd.exe /c ('mklink /J "' + $sub + '" "' + $outside + '"') 2>&1
+        try {
+            if (Test-Path -LiteralPath $sub) {
+                $r = Invoke-UpdRbRollback -Scenario $s
+                Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and [System.IO.File]::ReadAllText((Join-Path $outside 'B.ps1')) -eq 'outside victim' -and [System.IO.File]::ReadAllText((Join-Path $s.Runtime 'BRAVO_A.ps1')) -eq 'new A' -and @($r.findings | Where-Object { $_.id -eq 'Rollback.Critical' }).Count -eq 1) -Name 'UpdateRollback/Reparse/JunctionInRuntimeRefused' -Failure "junction у runtime: Critical, ціль поза коренем і файли не змінено; status=$($r.status) $($r.rollback.message)"
+            } else {
+                Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateRollback/Reparse/JunctionInRuntimeRefused' -Failure ('mklink /J недоступний: ' + $mk)
+            }
+        } finally {
+            if (Test-Path -LiteralPath $sub) { [System.IO.File]::GetAttributes($sub) | Out-Null; [System.IO.Directory]::Delete($sub) }
+        }
+    }
+
+    # --- Підроблений журнал: Critical без жодних побічних ефектів ---
+    & {
+        $attacker = Join-Path $updRbTemp 'attacker files'
+        Write-UpdRbFile -Path (Join-Path $attacker 'BRAVO_A.ps1') -Text 'attacker file'
+        Write-UpdRbFile -Path (Join-Path $attacker 'installed.txt') -Text 'attacker'
+        Write-UpdRbFile -Path (Join-Path $attacker 'snap.snapshot') -Text 'attacker snapshot'
+        $attackerBefore = Get-UpdRbTreeHash -Root $attacker
+        $forgeries = @(
+            @{ Name = 'ForeignRuntimeRoot'; Apply = { param($s) $s.Journal.runtimeRoot = $attacker } },
+            @{ Name = 'BackupPathOutsideBackupRoot'; Apply = { param($s) $s.Journal.backup.path = $attacker } },
+            @{ Name = 'SnapshotPathOutsideOperations'; Apply = { param($s) $s.Journal.versionState.snapshotPath = (Join-Path $attacker 'snap.snapshot') } },
+            @{ Name = 'SchedulerSnapshotOutsideOperations'; Apply = { param($s) $s.Journal.schedulerSnapshot.path = (Join-Path $attacker 'snap.snapshot') } },
+            @{ Name = 'ForeignBackupRoot'; Apply = { param($s) $s.Journal.backupRoot = $attacker } },
+            @{ Name = 'ForeignStagingRoot'; Apply = { param($s) $s.Journal.stagingRoot = $attacker } }
+        )
+        foreach ($forgery in $forgeries) {
+            Reset-UpdRbStubs
+            $s = New-UpdRbUpdateScenario -Name 'forged'
+            $stateBefore = Get-UpdRbSha -Path $s.VersionState
+            & $forgery.Apply $s
+            $calls = New-Object System.Collections.Generic.List[string]
+            $adapter = @{
+                GetManagedTasks = { param($p) $calls.Add('GetManagedTasks') }.GetNewClosure()
+                SetTaskEnabled = { param($p, $n, $e) $calls.Add('SetTaskEnabled') }.GetNewClosure()
+                InvokeSetupScheduler = { param($r) $calls.Add('InvokeSetupScheduler') }.GetNewClosure()
+                InvokeGuard = { param($r) $calls.Add('InvokeGuard') }.GetNewClosure()
+            }
+            $r = Invoke-UpdRbRollback -Scenario $s -Adapter $adapter
+            $clean = ($r.status -eq 'Critical') -and ($calls.Count -eq 0) -and (@(Get-UpdRbLog).Count -eq 0) -and ((Get-UpdRbTreeHash -Root $attacker) -eq $attackerBefore) -and ((Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.DeployedTree) -and ((Get-UpdRbSha -Path $s.VersionState) -eq $stateBefore) -and ((Read-UpdRbJournal -Scenario $s).state -eq 'Open') -and (@($r.findings | Where-Object { $_.id -eq 'Rollback.JournalUntrusted' }).Count -eq 1)
+            Test-BRAVOCondition -Condition $clean -Name ('UpdateRollback/Forged/' + $forgery.Name) -Failure "status=$($r.status) adapterCalls=$($calls.Count) log=$(@(Get-UpdRbLog) -join ',') $($r.rollback.message)"
+        }
+
+        # operationId не збігається з іменем файлу журналу.
+        Reset-UpdRbStubs
+        $s = New-UpdRbUpdateScenario -Name 'forged-opid'
+        $otherName = Join-Path (Join-Path $s.State 'Journal') ([guid]::NewGuid().ToString() + '.json')
+        $r = Invoke-UpdRbRollback -Scenario $s -JournalPath $otherName
+        Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and @(Get-UpdRbLog).Count -eq 0 -and (Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.DeployedTree) -Name 'UpdateRollback/Forged/OperationIdFileNameMismatch' -Failure "opId != ім'я файлу -> Critical без дій; status=$($r.status)"
+        $s.Journal.operationId = 'NOT-A-GUID'
+        $r = Invoke-UpdRbRollback -Scenario $s
+        Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and @(Get-UpdRbLog).Count -eq 0) -Name 'UpdateRollback/Forged/OperationIdNotGuid' -Failure "operationId не GUID -> Critical без дій; status=$($r.status)"
+
+        # Без переданого RuntimeRoot (Update) довіряти runtimeRoot із журналу не можна.
+        Reset-UpdRbStubs
+        $s = New-UpdRbUpdateScenario -Name 'noruntimeroot'
+        $arguments = @{ Journal = $s.Journal; Adapter = @{}; StateRoot = $s.State; OperationLockPath = $s.OpLock; VersionStatePath = $s.VersionState; StagingRoot = $s.Staging; BackupRoot = $s.Backup }
+        $r = Invoke-UpdRbCall -Name 'Invoke-BRAVORollback' -Arguments $arguments
+        Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and @(Get-UpdRbLog).Count -eq 0 -and (Get-UpdRbTreeHash -Root $s.Runtime) -eq $s.DeployedTree) -Name 'UpdateRollback/Forged/RuntimeRootNotSuppliedFailsClosed' -Failure "без RuntimeRoot -> Critical без дій; status=$($r.status)"
+
+        # Install: journal.runtimeRoot != корінь викликача -> файли за підміненим коренем не видаляються.
+        Reset-UpdRbStubs
+        $s = New-UpdRbInstallScenario -Name 'forged-install'
+        $fakeRoot = Join-Path $updRbTemp 'attacker install root'
+        Write-UpdRbFile -Path (Join-Path $fakeRoot 'BRAVO_A.ps1') -Text 'installed A'
+        Write-UpdRbFile -Path (Join-Path $fakeRoot 'sub dir\B.ps1') -Text 'installed B'
+        $fakeBefore = Get-UpdRbTreeHash -Root $fakeRoot
+        $s.Journal.runtimeRoot = $fakeRoot
+        $r = Invoke-UpdRbRollback -Scenario $s
+        $s.Journal.runtimeRoot = $s.Runtime
+        Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and (Get-UpdRbTreeHash -Root $fakeRoot) -eq $fakeBefore -and (Test-Path -LiteralPath $s.Runtime) -and @(Get-UpdRbLog).Count -eq 0) -Name 'UpdateRollback/Forged/InstallForeignRuntimeRoot' -Failure "Install: підмінений корінь -> Critical без дій; status=$($r.status) $($r.rollback.message)"
+    }
+
+    # --- Прямий виклик Invoke-BRAVOInstallRollback з недовіреним журналом ---
+    & {
+        Reset-UpdRbStubs
+        $s = New-UpdRbInstallScenario -Name 'direct-install'
+        $s.Journal.operationId = 'bad id'
+        $direct = Invoke-UpdRbCall -Name 'Invoke-BRAVOInstallRollback' -Arguments @{ Journal = $s.Journal; Adapter = @{}; StateRoot = $s.State }
+        Test-BRAVOCondition -Condition ((-not $direct.Success) -and @(Get-UpdRbLog).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $s.Runtime 'BRAVO_A.ps1'))) -Name 'UpdateRollback/Forged/InstallRollbackDirectUntrusted' -Failure 'Invoke-BRAVOInstallRollback сам перевіряє довіру до будь-якої дії'
     }
 } finally {
     [Environment]::SetEnvironmentVariable('BRAVO_ALLOW_DOWNGRADE', $updRbSavedDowngrade, 'Process')
