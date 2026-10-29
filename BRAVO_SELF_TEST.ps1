@@ -2390,6 +2390,108 @@ function Get-BRAVOSelfTestAstTypePredicate {
     return $predicate
 }
 
+# Предикат "ім'я вузла належить набору" для FindAll (OPT-03/OPT-07): теж
+# компілюється в .NET-делегат, а не викликає scriptblock на кожному вузлі.
+# Пропускає ЗАВЖДИ FunctionDefinitionAst, а VariableExpressionAst і CommandAst -
+# лише коли VariablePath.UserPath / GetCommandName() є в наборі (порівняння
+# за правилами самого набору). Це фільтр-надмножина: подальша класифікація
+# вузлів лишається в аналізаторі без змін. Кешу тут немає: набір залежить від
+# конкретного аналізу, предикат будується щоразу.
+function Get-BRAVOSelfTestAstNameFilterPredicate {
+    param([Parameter(Mandatory = $true)][System.Collections.Generic.HashSet[string]]$Name)
+
+    $predicate = $null
+    try {
+        $nodeParameter = [Linq.Expressions.Expression]::Parameter([Management.Automation.Language.Ast], 'node')
+        $setConstant = [Linq.Expressions.Expression]::Constant($Name, [System.Collections.Generic.HashSet[string]])
+        $containsMethod = [System.Collections.Generic.HashSet[string]].GetMethod('Contains', [Type[]]@([string]))
+        $variableType = [Management.Automation.Language.VariableExpressionAst]
+        $commandType = [Management.Automation.Language.CommandAst]
+        $userPath = [Linq.Expressions.Expression]::Property(
+            [Linq.Expressions.Expression]::Property([Linq.Expressions.Expression]::Convert($nodeParameter, $variableType), 'VariablePath'),
+            'UserPath')
+        $commandName = [Linq.Expressions.Expression]::Call(
+            [Linq.Expressions.Expression]::Convert($nodeParameter, $commandType),
+            $commandType.GetMethod('GetCommandName', [Type[]]@()))
+        $variableTest = [Linq.Expressions.Expression]::AndAlso(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, $variableType),
+            [Linq.Expressions.Expression]::Call($setConstant, $containsMethod, [Linq.Expressions.Expression[]]@($userPath)))
+        $commandTest = [Linq.Expressions.Expression]::AndAlso(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, $commandType),
+            [Linq.Expressions.Expression]::Call($setConstant, $containsMethod, [Linq.Expressions.Expression[]]@($commandName)))
+        $body = [Linq.Expressions.Expression]::OrElse(
+            [Linq.Expressions.Expression]::OrElse(
+                [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.FunctionDefinitionAst]),
+                $variableTest),
+            $commandTest)
+        $predicate = [Linq.Expressions.Expression]::Lambda(
+            [Func[Management.Automation.Language.Ast, bool]],
+            $body,
+            [Linq.Expressions.ParameterExpression[]]@($nodeParameter)
+        ).Compile()
+    } catch {
+        # Linq.Expressions недоступні: повільніший предикат з тією самою семантикою.
+        $fallbackNames = $Name
+        $predicate = {
+            param($node)
+            if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+            if ($node -is [Management.Automation.Language.VariableExpressionAst]) { return $fallbackNames.Contains($node.VariablePath.UserPath) }
+            if ($node -is [Management.Automation.Language.CommandAst]) {
+                $fallbackCommandName = $node.GetCommandName()
+                return ($null -ne $fallbackCommandName -and $fallbackNames.Contains($fallbackCommandName))
+            }
+            return $false
+        }.GetNewClosure()
+    }
+    return $predicate
+}
+
+# Предикат "форма визначення" для FindAll (OPT-03/OPT-07): FunctionDefinitionAst
+# і змінні, чий безпосередній батько може зробити їх ціллю присвоєння,
+# змінною foreach чи параметром (Assignment, Convert, ArrayLiteral, ForEach,
+# Parameter). Надмножина справжніх визначень: точну перевірку (Left,
+# Variable, вкладення Convert/ArrayLiteral) робить сам аналізатор.
+function Get-BRAVOSelfTestAstDefinitionShapePredicate {
+    $parentTypes = @(
+        [Management.Automation.Language.AssignmentStatementAst],
+        [Management.Automation.Language.ConvertExpressionAst],
+        [Management.Automation.Language.ArrayLiteralAst],
+        [Management.Automation.Language.ForEachStatementAst],
+        [Management.Automation.Language.ParameterAst])
+    $predicate = $null
+    try {
+        $nodeParameter = [Linq.Expressions.Expression]::Parameter([Management.Automation.Language.Ast], 'node')
+        $parentExpression = [Linq.Expressions.Expression]::Property($nodeParameter, 'Parent')
+        $parentTest = $null
+        foreach ($parentType in $parentTypes) {
+            $typeTest = [Linq.Expressions.Expression]::TypeIs($parentExpression, $parentType)
+            if ($null -eq $parentTest) { $parentTest = $typeTest } else { $parentTest = [Linq.Expressions.Expression]::OrElse($parentTest, $typeTest) }
+        }
+        $body = [Linq.Expressions.Expression]::OrElse(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.FunctionDefinitionAst]),
+            [Linq.Expressions.Expression]::AndAlso(
+                [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.VariableExpressionAst]),
+                $parentTest))
+        $predicate = [Linq.Expressions.Expression]::Lambda(
+            [Func[Management.Automation.Language.Ast, bool]],
+            $body,
+            [Linq.Expressions.ParameterExpression[]]@($nodeParameter)
+        ).Compile()
+    } catch {
+        $fallbackParentTypes = $parentTypes
+        $predicate = {
+            param($node)
+            if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+            if (-not ($node -is [Management.Automation.Language.VariableExpressionAst])) { return $false }
+            foreach ($fallbackParentType in $fallbackParentTypes) {
+                if ($node.Parent -is $fallbackParentType) { return $true }
+            }
+            return $false
+        }.GetNewClosure()
+    }
+    return $predicate
+}
+
 # #219 (частина B): ЗОВНІШНІЙ try охоплює і основне тіло, і хвіст. Його
 # catch/finally — гарантований термінальний шлях: будь-який виняток поза
 # секціями або збій самого звіту закінчується звітом (чи мінімальним
@@ -37084,10 +37186,34 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
         # Дорогий підйом до меж scope — лише для визначень і для тих читань,
         # чиє ім'я взагалі визначає якийсь фрагмент.
         $unitFacts = @()
-        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
-            [Management.Automation.Language.VariableExpressionAst],
-            [Management.Automation.Language.FunctionDefinitionAst],
-            [Management.Automation.Language.CommandAst])
+        # Корінь і фрагменти розбираються лише на вузлах, чиє ім'я МОЖЕ
+        # визначати фрагмент: імена з визначень фрагментів (надмножина, без
+        # перевірки scope), включно з варіантами з кваліфікатором scope. Решта
+        # вузлів на результат не впливає: визначення кореня враховуються лише
+        # для імен, які визначає фрагмент ($fragmentDefinedKeys), а читання -
+        # лише для імен із $fragmentOwners, і обидва є підмножиною цього набору.
+        $definitionShapePredicate = Get-BRAVOSelfTestAstDefinitionShapePredicate
+        $candidateNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $qualifierPrefixes = @('script:', 'global:', 'local:', 'private:', 'variable:', 'using:')
+        foreach ($fragmentUnit in $units) {
+            if ($null -eq $fragmentUnit.Suite) { continue }
+            foreach ($shapeNode in @($fragmentUnit.Ast.FindAll($definitionShapePredicate, $true))) {
+                if ($shapeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    [void]$candidateNames.Add([string]$shapeNode.Name)
+                    continue
+                }
+                $shapeName = [string]$shapeNode.VariablePath.UserPath
+                $shapeQualifierEnd = $shapeName.IndexOf(':')
+                if ($shapeQualifierEnd -ge 0) { $shapeName = $shapeName.Substring($shapeQualifierEnd + 1) }
+                [void]$candidateNames.Add($shapeName)
+            }
+        }
+        $filterNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($candidateName in $candidateNames) {
+            [void]$filterNames.Add($candidateName)
+            foreach ($qualifierPrefix in $qualifierPrefixes) { [void]$filterNames.Add($qualifierPrefix + $candidateName) }
+        }
+        $unitNodePredicate = Get-BRAVOSelfTestAstNameFilterPredicate -Name $filterNames
         foreach ($unit in $units) {
             $definitionNodes = New-Object System.Collections.ArrayList
             $useKeys = New-Object System.Collections.ArrayList
@@ -37161,7 +37287,22 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
                 if (($pass -eq 'Root') -ne $isRootUnit) { continue }
                 foreach ($definitionNode in $facts.DefinitionNodes) {
                     if ($isRootUnit -and -not $fragmentDefinedKeys.Contains($definitionNode.Key)) { continue }
-                    $context = & $getContext $definitionNode.Node $facts.Unit.Ast
+                    # Контекст без виклику scriptblock-а на кожен вузол: підйом до
+                    # найближчого scope-блока тут, а $getContext - лише коли контекст
+                    # цього блока ще не пораховано (його результат кешується).
+                    $scopeBlock = $definitionNode.Node.Parent
+                    while ($null -ne $scopeBlock -and -not [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast) -and
+                        -not ($scopeBlock -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                            $scopeBlock -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                        $scopeBlock = $scopeBlock.Parent
+                    }
+                    if ($null -eq $scopeBlock -or [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast)) {
+                        $context = $fileScopeContext
+                    } elseif ($blockContextCache.ContainsKey($scopeBlock)) {
+                        $context = $blockContextCache[$scopeBlock]
+                    } else {
+                        $context = & $getContext $definitionNode.Node $facts.Unit.Ast
+                    }
                     if ($null -eq $context) { continue }
                     if ($context.Scopes.Count -eq 0 -or $definitionNode.Qualified) {
                         [void]$facts.Definitions.Add([pscustomobject]@{
@@ -37220,30 +37361,43 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
             $consumerSuite = $facts.Unit.Suite
             for ($useIndex = 0; $useIndex -lt $facts.UseKeys.Count; $useIndex++) {
                 if (-not $fragmentOwners.ContainsKey($facts.UseKeys[$useIndex])) { continue }
-                $use = [pscustomobject]@{ Key = [string]$facts.UseKeys[$useIndex]; Node = $facts.UseNodes[$useIndex] }
-                if ($rootInFunction.ContainsKey($use.Key)) { continue }
-                if ($null -ne $consumerSuite -and $suiteDefinitions.ContainsKey($consumerSuite + '|' + $use.Key)) { continue }
-                $readOffset = if ($null -eq $consumerSuite) { $use.Node.Extent.StartOffset } else { $facts.Unit.GateOffset }
-                if ($rootEarliest.ContainsKey($use.Key) -and $rootEarliest[$use.Key] -lt $readOffset) { continue }
-                $context = & $getContext $use.Node $facts.Unit.Ast
+                $useKey = [string]$facts.UseKeys[$useIndex]
+                $useNode = $facts.UseNodes[$useIndex]
+                if ($rootInFunction.ContainsKey($useKey)) { continue }
+                if ($null -ne $consumerSuite -and $suiteDefinitions.ContainsKey($consumerSuite + '|' + $useKey)) { continue }
+                $readOffset = if ($null -eq $consumerSuite) { $useNode.Extent.StartOffset } else { $facts.Unit.GateOffset }
+                if ($rootEarliest.ContainsKey($useKey) -and $rootEarliest[$useKey] -lt $readOffset) { continue }
+                $scopeBlock = $useNode.Parent
+                while ($null -ne $scopeBlock -and -not [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast) -and
+                    -not ($scopeBlock -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                        $scopeBlock -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                    $scopeBlock = $scopeBlock.Parent
+                }
+                if ($null -eq $scopeBlock -or [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast)) {
+                    $context = $fileScopeContext
+                } elseif ($blockContextCache.ContainsKey($scopeBlock)) {
+                    $context = $blockContextCache[$scopeBlock]
+                } else {
+                    $context = & $getContext $useNode $facts.Unit.Ast
+                }
                 if ($null -eq $context) { continue }
-                if ($context.InFunction -and $rootEarliest.ContainsKey($use.Key)) { continue }
+                if ($context.InFunction -and $rootEarliest.ContainsKey($useKey)) { continue }
                 $owners = New-Object System.Collections.ArrayList
-                foreach ($ownerEntry in $fragmentOwners[$use.Key].GetEnumerator()) {
+                foreach ($ownerEntry in $fragmentOwners[$useKey].GetEnumerator()) {
                     if ($ownerEntry.Key -eq $consumerSuite) { continue }
                     if ($context.InFunction -or $ownerEntry.Value -lt $readOffset) { [void]$owners.Add([string]$ownerEntry.Key) }
                 }
                 if ($owners.Count -eq 0) { continue }
                 $isLocal = $false
                 foreach ($scope in $context.Scopes) {
-                    if ($facts.LocalNames.ContainsKey($scope) -and $facts.LocalNames[$scope].Contains($use.Key)) { $isLocal = $true; break }
+                    if ($facts.LocalNames.ContainsKey($scope) -and $facts.LocalNames[$scope].Contains($useKey)) { $isLocal = $true; break }
                 }
                 if ($isLocal) { continue }
                 $consumerLabel = if ($null -eq $consumerSuite) { 'корінь' } else { "suite $consumerSuite" }
-                if (-not $seenFindings.Add($use.Key + '|' + $consumerLabel)) { continue }
+                if (-not $seenFindings.Add($useKey + '|' + $consumerLabel)) { continue }
                 $findings.Add(("{0} визначає лише suite {1}, а читає {2} ({3}:{4})" -f
-                        $use.Key, ([string]::Join('/', @($owners | Sort-Object))), $consumerLabel,
-                        $facts.Unit.Fragment, $use.Node.Extent.StartLineNumber))
+                        $useKey, ([string]::Join('/', @($owners | Sort-Object))), $consumerLabel,
+                        $facts.Unit.Fragment, $useNode.Extent.StartLineNumber))
             }
         }
 
