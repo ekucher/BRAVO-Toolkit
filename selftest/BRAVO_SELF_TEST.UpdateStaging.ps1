@@ -1,0 +1,231 @@
+﻿# Suite UpdateStaging: lifecycle/operation lock і безпечний staging BRAVO.Update
+# (INS-035). Фрагмент dot-source-иться з BRAVO_SELF_TEST.ps1 ($root заданий).
+
+Import-Module (Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.psm1') -Force -DisableNameChecking
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$updStagingTempPrefix = Join-Path ([System.IO.Path]::GetTempPath()) ('bravo-updstg-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $updStagingTempPrefix -Force)
+
+# Будує ZIP із довільними іменами entry: @( @{ Name; Text } ... ).
+function New-UpdStagingTestZip {
+    param([string]$Path, [object[]]$Items)
+    $zipStream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    $zip = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($item in $Items) {
+            $entry = $zip.CreateEntry([string]$item.Name)
+            if (-not ([string]$item.Name).EndsWith('/')) {
+                $writer = New-Object System.IO.StreamWriter($entry.Open(), (New-Object System.Text.UTF8Encoding $false))
+                $writer.Write([string]$item.Text)
+                $writer.Dispose()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+        $zipStream.Dispose()
+    }
+}
+
+try {
+    # --- Lifecycle lock -----------------------------------------------------
+    & {
+        $lockRoot = Join-Path $updStagingTempPrefix 'lock root Кореневий'
+        $first = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-1'
+        Test-BRAVOCondition -Condition ($first.Success -and $null -ne $first.Stream) -Name 'UpdateStaging/LifecycleLockAcquired' -Failure 'перше захоплення lifecycle-lock має вдатися'
+        Test-BRAVOCondition -Condition ((Split-Path -Leaf $first.Path) -eq 'BRAVO_UPDATE.lock') -Name 'UpdateStaging/LifecycleLockFileName' -Failure 'ім''я lock-файла має бути BRAVO_UPDATE.lock'
+        $second = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-2'
+        Test-BRAVOCondition -Condition (-not $second.Success -and $null -eq $second.Stream) -Name 'UpdateStaging/LifecycleLockBusy' -Failure 'друге захоплення має повернути Success=$false без винятку'
+        Test-BRAVOCondition -Condition ($null -ne $second.Holder -and [string]$second.Holder.operationId -eq 'op-1' -and [int]$second.Holder.pid -eq $PID) -Name 'UpdateStaging/LifecycleLockHolderReadable' -Failure 'holder зайнятого lock-а має читатися (operationId, pid)'
+        Test-BRAVOCondition -Condition ($null -ne $second.Holder.PSObject.Properties['processStartTime'] -and $null -ne $second.Holder.PSObject.Properties['startedAt']) -Name 'UpdateStaging/LifecycleLockHolderFields' -Failure 'holder має містити processStartTime і startedAt'
+        Exit-BRAVOUpdateLifecycleLock -Lock $first
+        $third = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-3'
+        Test-BRAVOCondition -Condition ($third.Success -and [string]$third.Holder.operationId -eq 'op-3') -Name 'UpdateStaging/LifecycleLockReacquire' -Failure 'після Exit повторне захоплення має вдатися'
+        Exit-BRAVOUpdateLifecycleLock -Lock $third
+        Exit-BRAVOUpdateLifecycleLock -Lock $null
+        Test-BRAVOCondition -Condition (-not (Test-Path -LiteralPath (Join-Path $lockRoot 'BRAVO_UPDATE.holder.json'))) -Name 'UpdateStaging/LifecycleLockSidecarRemoved' -Failure 'Exit має прибрати sidecar holder'
+    }
+
+    # --- Operation lock -----------------------------------------------------
+    & {
+        $opPath = Join-Path $updStagingTempPrefix 'op lock Папка\BRAVO_OPERATION.lock'
+        $idle = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition (-not $idle.Active -and $null -eq $idle.Holder) -Name 'UpdateStaging/OperationLockInactiveMissing' -Failure 'без файла lock неактивний'
+        $first = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-a' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition ($first.Success) -Name 'UpdateStaging/OperationLockAcquired' -Failure 'захоплення operation-lock має вдатися'
+        $active = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition ($active.Active -and $null -ne $active.Holder -and [string]$active.Holder.operation -eq 'Update') -Name 'UpdateStaging/OperationLockActiveHolder' -Failure 'активний lock має давати holder operation=Update'
+        $second = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-b' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition (-not $second.Success -and $null -ne $second.Holder) -Name 'UpdateStaging/OperationLockBusy' -Failure 'зайнятий lock: Success=$false і читабельний holder'
+        $json = & (Get-Module BRAVO.Update) { param($p) Read-BRAVOUpdateLockHolderFile -Path $p } $opPath
+        Test-BRAVOCondition -Condition ([string]$json.operation -eq 'Update' -and [string]$json.generationId -eq 'op-a' -and [string]$json.packageVersion -eq '9.9.9' -and [string]$json.hostname -eq [Environment]::MachineName -and $null -eq $json.config) -Name 'UpdateStaging/OperationLockCanonicalFormat' -Failure 'JSON-holder має канонічний формат'
+        Exit-BRAVOUpdateOperationLock -Lock $first
+        $after = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition (-not $after.Active) -Name 'UpdateStaging/OperationLockReleasedInactive' -Failure 'після Exit lock неактивний'
+        $third = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-c' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition ($third.Success) -Name 'UpdateStaging/OperationLockReacquire' -Failure 'після Exit повторне захоплення має вдатися'
+        Exit-BRAVOUpdateOperationLock -Lock $third
+    }
+
+    # --- Private directory & reparse ---------------------------------------
+    & {
+        $dir = Join-Path $updStagingTempPrefix 'private Приватний'
+        $created = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition ($created.Success -and (Test-Path -LiteralPath $dir -PathType Container)) -Name 'UpdateStaging/PrivateDirCreated' -Failure ('приватний каталог не створено: ' + ($created.Problems -join '; '))
+        $acl = Get-Acl -LiteralPath $dir
+        Test-BRAVOCondition -Condition ($acl.AreAccessRulesProtected) -Name 'UpdateStaging/PrivateDirNoInheritance' -Failure 'успадкування DACL має бути вимкнено'
+        $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        Test-BRAVOCondition -Condition (@($rules | Where-Object { $_.IsInherited }).Count -eq 0) -Name 'UpdateStaging/PrivateDirNoInheritedRules' -Failure 'не має бути успадкованих правил'
+        $sids = @($rules | ForEach-Object { [string]$_.IdentityReference.Value })
+        $currentSidValue = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        Test-BRAVOCondition -Condition (($sids -contains 'S-1-5-32-544') -and ($sids -contains 'S-1-5-18') -and ($sids -contains $currentSidValue) -and (@($sids | Where-Object { $_ -notin @('S-1-5-32-544', 'S-1-5-18', $currentSidValue) }).Count -eq 0)) -Name 'UpdateStaging/PrivateDirTrustedOnly' -Failure 'мають бути лише Administrators, SYSTEM і поточний користувач'
+        # Наявний порожній каталог допустимий, непорожній — ні.
+        $again = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition ($again.Success) -Name 'UpdateStaging/PrivateDirExistingEmptyOk' -Failure 'наявний порожній каталог має прийматися'
+        [System.IO.File]::WriteAllText((Join-Path $dir 'x.txt'), 'x')
+        $nonEmpty = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition (-not $nonEmpty.Success -and $nonEmpty.Problems.Count -gt 0) -Name 'UpdateStaging/PrivateDirNonEmptyRefused' -Failure 'непорожній каталог має відхилятися'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path $dir)) -Name 'UpdateStaging/ReparseNegative' -Failure 'звичайний каталог не reparse point'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path (Join-Path $dir 'missing\child'))) -Name 'UpdateStaging/ReparseMissingSkipped' -Failure 'неіснуючий шлях без reparse у предках -> $false'
+        # Junction: створюємо через cmd mklink /J (без елевації), лише якщо вдалося.
+        $target = Join-Path $updStagingTempPrefix 'junction target'
+        $junction = Join-Path $updStagingTempPrefix 'junction link'
+        [void](New-Item -ItemType Directory -Path $target -Force)
+        $null = & cmd.exe /c mklink /J ('"' + $junction + '"') ('"' + $target + '"') 2>&1
+        if (Test-Path -LiteralPath $junction) {
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path $junction) -Name 'UpdateStaging/ReparseJunctionDetected' -Failure 'junction має виявлятися'
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path (Join-Path $junction 'child')) -Name 'UpdateStaging/ReparseAncestorDetected' -Failure 'junction серед предків має виявлятися'
+            Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path $junction -StopAt $junction)) -Name 'UpdateStaging/ReparseStopAt' -Failure 'StopAt виключає межу'
+            $viaJunction = New-BRAVOUpdatePrivateDirectory -Path $junction
+            Test-BRAVOCondition -Condition (-not $viaJunction.Success) -Name 'UpdateStaging/PrivateDirReparseRefused' -Failure 'reparse point має відхилятися'
+            [System.IO.Directory]::Delete($junction)
+        } else {
+            Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateStaging/ReparseJunction' -Failure 'junction створити не вдалося'
+        }
+    }
+
+    # --- Перевірка ZIP ------------------------------------------------------
+    & {
+        $good = Join-Path $updStagingTempPrefix 'good пакет.zip'
+        New-UpdStagingTestZip -Path $good -Items @(
+            @{ Name = 'a.txt'; Text = 'one' },
+            @{ Name = 'Підтека з пробілом/файл Один.txt'; Text = 'два' },
+            @{ Name = 'dir/'; Text = '' },
+            @{ Name = 'dir\sub\b.txt'; Text = 'three' })
+        $valid = Test-BRAVOUpdateZipEntries -ZipPath $good
+        Test-BRAVOCondition -Condition ($valid.IsValid -and $valid.Entries.Count -eq 4 -and $valid.TotalUncompressedBytes -gt 0) -Name 'UpdateStaging/ZipValid' -Failure ('валідний ZIP відхилено: ' + ($valid.Problems -join '; '))
+
+        $cases = [ordered]@{
+            'DotDot'      = '../x.txt'
+            'DotDotMid'   = 'a/../../x.txt'
+            'DriveRooted' = 'C:/x.txt'
+            'Unc'         = '\\server\share\x.txt'
+            'Rooted'      = '/etc/x.txt'
+            'Ads'         = 'a:b'
+            'AdsStream'   = 'file.txt:stream'
+            'TrailingDot' = 'dir/name.'
+            'Reserved'    = 'dir/NUL.txt'
+            'InvalidChar' = 'dir/a*b.txt'
+        }
+        foreach ($caseName in $cases.Keys) {
+            $badZip = Join-Path $updStagingTempPrefix ('bad-' + $caseName + '.zip')
+            New-UpdStagingTestZip -Path $badZip -Items @(@{ Name = 'ok.txt'; Text = 'ok' }, @{ Name = [string]$cases[$caseName]; Text = 'evil' })
+            $badResult = Test-BRAVOUpdateZipEntries -ZipPath $badZip
+            Test-BRAVOCondition -Condition (-not $badResult.IsValid -and $badResult.Problems.Count -gt 0) -Name ('UpdateStaging/ZipRejects' + $caseName) -Failure ('ім''я "' + $cases[$caseName] + '" має відхилятися')
+        }
+        $dupZip = Join-Path $updStagingTempPrefix 'dup.zip'
+        New-UpdStagingTestZip -Path $dupZip -Items @(@{ Name = 'A.txt'; Text = '1' }, @{ Name = 'a.txt'; Text = '2' })
+        $dupResult = Test-BRAVOUpdateZipEntries -ZipPath $dupZip
+        Test-BRAVOCondition -Condition (-not $dupResult.IsValid -and (@($dupResult.Problems) -join ' ') -match 'дублікат') -Name 'UpdateStaging/ZipRejectsCaseDuplicates' -Failure 'A.txt/a.txt мають відхилятися'
+        $dupSlash = Join-Path $updStagingTempPrefix 'dup-slash.zip'
+        New-UpdStagingTestZip -Path $dupSlash -Items @(@{ Name = 'd/x.txt'; Text = '1' }, @{ Name = 'D\x.txt'; Text = '2' })
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath $dupSlash).IsValid) -Name 'UpdateStaging/ZipRejectsSlashNormalisedDuplicates' -Failure 'дублікати після нормалізації слешів мають відхилятися'
+
+        $limits = Test-BRAVOUpdateZipEntries -ZipPath $good -MaxEntries 2
+        Test-BRAVOCondition -Condition (-not $limits.IsValid) -Name 'UpdateStaging/ZipRejectsTooManyEntries' -Failure 'перевищення -MaxEntries має відхилятися'
+        $limits = Test-BRAVOUpdateZipEntries -ZipPath $good -MaxTotalBytes 5
+        Test-BRAVOCondition -Condition (-not $limits.IsValid) -Name 'UpdateStaging/ZipRejectsTooLarge' -Failure 'перевищення -MaxTotalBytes має відхилятися'
+
+        $bomb = Join-Path $updStagingTempPrefix 'bomb.zip'
+        $bombStream = New-Object System.IO.FileStream($bomb, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        $bombZip = New-Object System.IO.Compression.ZipArchive($bombStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        $bombEntry = $bombZip.CreateEntry('zeros.bin', [System.IO.Compression.CompressionLevel]::Optimal)
+        $bombOut = $bombEntry.Open()
+        $zeros = New-Object byte[] 1048576
+        for ($i = 0; $i -lt 12; $i++) { $bombOut.Write($zeros, 0, $zeros.Length) }
+        $bombOut.Dispose(); $bombZip.Dispose(); $bombStream.Dispose()
+        $bombResult = Test-BRAVOUpdateZipEntries -ZipPath $bomb
+        Test-BRAVOCondition -Condition (-not $bombResult.IsValid -and (@($bombResult.Problems) -join ' ') -match 'стиснення') -Name 'UpdateStaging/ZipRejectsCompressionBomb' -Failure '12 МБ нулів (>200:1) мають відхилятися'
+
+        $notZip = Join-Path $updStagingTempPrefix 'not a zip.zip'
+        [System.IO.File]::WriteAllText($notZip, 'це не архів')
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath $notZip).IsValid) -Name 'UpdateStaging/ZipRejectsCorrupt' -Failure 'пошкоджений ZIP має відхилятися'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath (Join-Path $updStagingTempPrefix 'missing.zip')).IsValid) -Name 'UpdateStaging/ZipRejectsMissing' -Failure 'відсутній ZIP має відхилятися'
+    }
+
+    # --- Розпакування -------------------------------------------------------
+    & {
+        $good = Join-Path $updStagingTempPrefix 'expand пакет.zip'
+        New-UpdStagingTestZip -Path $good -Items @(
+            @{ Name = 'a.txt'; Text = 'one' },
+            @{ Name = 'Підтека з пробілом/файл Один.txt'; Text = 'два' },
+            @{ Name = 'empty dir/'; Text = '' },
+            @{ Name = 'dir\sub\b.txt'; Text = 'three' })
+        $sha = (Get-FileHash -LiteralPath $good -Algorithm SHA256).Hash
+
+        $dest = Join-Path $updStagingTempPrefix 'dest Призначення'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest)
+        $ok = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest -ExpectedSha256 $sha
+        Test-BRAVOCondition -Condition ($ok.Success -and $ok.FileCount -eq 3) -Name 'UpdateStaging/ExpandOk' -Failure ('розпакування не вдалося: ' + ($ok.Problems -join '; '))
+        Test-BRAVOCondition -Condition ([System.IO.File]::ReadAllText((Join-Path $dest 'Підтека з пробілом\файл Один.txt')) -eq 'два' -and (Test-Path -LiteralPath (Join-Path $dest 'empty dir') -PathType Container) -and (Test-Path -LiteralPath (Join-Path $dest 'dir\sub\b.txt'))) -Name 'UpdateStaging/ExpandContent' -Failure 'вміст розпакованого не збігається'
+        Test-BRAVOCondition -Condition ((Get-BRAVOUpdateDirectorySize -Path $dest) -eq ([long]([System.Text.Encoding]::UTF8.GetByteCount('one') + [System.Text.Encoding]::UTF8.GetByteCount('два') + [System.Text.Encoding]::UTF8.GetByteCount('three')))) -Name 'UpdateStaging/DirectorySize' -Failure 'розмір каталогу має дорівнювати сумі файлів'
+
+        # Повторне розпакування в уже непорожній каталог відхиляється, наявне не чіпається.
+        $again = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest
+        Test-BRAVOCondition -Condition (-not $again.Success -and (Test-Path -LiteralPath (Join-Path $dest 'a.txt'))) -Name 'UpdateStaging/ExpandNonEmptyRefused' -Failure 'непорожнє призначення має відхилятися, вміст лишається'
+
+        # Неправильний SHA256.
+        $dest2 = Join-Path $updStagingTempPrefix 'dest2'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest2)
+        $badSha = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest2 -ExpectedSha256 ('0' * 64)
+        Test-BRAVOCondition -Condition (-not $badSha.Success -and @(Get-ChildItem -LiteralPath $dest2 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandShaMismatchRefused' -Failure 'невірний SHA256 має відхилятися без жодного файла'
+
+        # Шкідливий ZIP: нічого не розпаковується.
+        $evil = Join-Path $updStagingTempPrefix 'evil.zip'
+        New-UpdStagingTestZip -Path $evil -Items @(@{ Name = 'good.txt'; Text = 'g' }, @{ Name = '../escape.txt'; Text = 'e' })
+        $evilResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $evil -DestinationRoot $dest2
+        Test-BRAVOCondition -Condition (-not $evilResult.Success -and @(Get-ChildItem -LiteralPath $dest2 -Force).Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $updStagingTempPrefix 'escape.txt'))) -Name 'UpdateStaging/ExpandEvilRefused' -Failure 'шкідливий ZIP не має залишати файлів'
+
+        # Призначення без захищеного DACL (звичайний каталог) відхиляється.
+        $plain = Join-Path $updStagingTempPrefix 'plain dest'
+        [void](New-Item -ItemType Directory -Path $plain -Force)
+        $plainResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $plain
+        Test-BRAVOCondition -Condition (-not $plainResult.Success -and @(Get-ChildItem -LiteralPath $plain -Force).Count -eq 0) -Name 'UpdateStaging/ExpandNonPrivateRefused' -Failure 'неприватний каталог має відхилятися'
+
+        # Відсутнє призначення.
+        $missingDest = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot (Join-Path $updStagingTempPrefix 'no such dest')
+        Test-BRAVOCondition -Condition (-not $missingDest.Success) -Name 'UpdateStaging/ExpandMissingDestRefused' -Failure 'відсутнє призначення має відхилятися'
+
+        # Відкат: перший файл створено, другий конфліктує (файл і каталог з одним ім'ям) -> нічого не лишається.
+        $conflict = Join-Path $updStagingTempPrefix 'conflict.zip'
+        New-UpdStagingTestZip -Path $conflict -Items @(@{ Name = 'p/one.txt'; Text = '1' }, @{ Name = 'p/two'; Text = '2' }, @{ Name = 'p/two/inner.txt'; Text = '3' })
+        $dest3 = Join-Path $updStagingTempPrefix 'dest3'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest3)
+        $conflictResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $conflict -DestinationRoot $dest3
+        Test-BRAVOCondition -Condition (-not $conflictResult.Success -and @(Get-ChildItem -LiteralPath $dest3 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandRollbackOnFailure' -Failure 'при збої розпакування створене має бути видалене'
+    }
+
+    # --- Вільне місце -------------------------------------------------------
+    & {
+        $space = Get-BRAVOUpdateFreeSpace -Path (Join-Path $updStagingTempPrefix 'not yet created')
+        Test-BRAVOCondition -Condition ($null -eq $space.Error -and $space.AvailableFreeBytes -gt 0 -and -not [string]::IsNullOrEmpty($space.Volume)) -Name 'UpdateStaging/FreeSpace' -Failure 'вільне місце тому має визначатися'
+        $unc = Get-BRAVOUpdateFreeSpace -Path '\\host-a\share\x'
+        Test-BRAVOCondition -Condition ($null -eq $unc.AvailableFreeBytes -and $null -ne $unc.Error) -Name 'UpdateStaging/FreeSpaceUncUnknown' -Failure 'UNC -> невідомо з Error'
+    }
+} finally {
+    if ($updStagingTempPrefix.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Split-Path -Leaf $updStagingTempPrefix) -like 'bravo-updstg-*' -and (Test-Path -LiteralPath $updStagingTempPrefix)) {
+        Remove-Item -LiteralPath $updStagingTempPrefix -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
