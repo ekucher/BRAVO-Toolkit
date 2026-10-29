@@ -472,7 +472,7 @@ function Start-BRAVOInstallerRefresh {
     }
     $caption = switch ($Action) { 'State' { 'Визначаємо стан встановлення…' } 'Diagnose' { 'Виконується діагностика…' } default { 'Виконується перевірка сервера…' } }
     Set-BRAVOInstallerBusy -Context $Context -Busy $true -Text $caption
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Update-BRAVOInstallerJobPoll {

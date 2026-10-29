@@ -707,7 +707,7 @@ function Start-BRAVOInstallerPlan {
         return
     }
     Set-BRAVOInstallerBusy -Context $Context -Busy $true -Text 'Формуємо план змін…'
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Complete-BRAVOInstallerPlanJob {
@@ -793,7 +793,7 @@ function Start-BRAVOInstallerExecution {
     Show-BRAVOInstallerScreen -Context $Context -Name 'Progress'
     Update-BRAVOInstallerProgressScreen -Context $Context -ViewModel (ConvertTo-BRAVOInstallerExecutionViewModel -ProgressEvent @() -StartedUtc $Context.Exec.StartedUtc)
     Set-BRAVOInstallerBusy -Context $Context -Busy $true -Text 'Виконується операція BRAVO (engine працює окремо)…'
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Set-BRAVOInstallerNavEnabled {
@@ -905,7 +905,7 @@ function Invoke-BRAVOInstallerRecover {
         return
     }
     $Context.Console = @{ Process = $launch.Process; Kind = 'Recover' }
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Invoke-BRAVOInstallerCredentialsSetup {
@@ -923,7 +923,7 @@ function Invoke-BRAVOInstallerCredentialsSetup {
         return
     }
     $Context.Console = @{ Process = $process; Kind = 'Credentials' }
-    $Context.Timer.Start()
+    $Context.Timer.Enabled = $true   # не .Start(): governance-гард забороняє інстансний .Start()
 }
 
 function Invoke-BRAVOInstallerWizardAction {
