@@ -30,6 +30,10 @@ function Get-BRAVOUpdateDefaultPaths {
         BackupRoot        = (Join-Path $bravoRoot 'Update\Backup')
         RuntimeRoot       = (Join-Path $programFiles 'BRAVO-Toolkit')
         OperationLockPath = (Join-Path $lockRoot 'BRAVO_OPERATION.lock')
+        # Той самий production-шлях, що жорстко задають guard-викликачі
+        # (BRAVO_ARCHIV.ps1 тощо); engine лише знімає й відновлює його
+        # знімок у межах транзакції (ENGINE_DESIGN.md, розділ 7.2).
+        VersionStatePath  = (Join-Path $bravoRoot 'State\BRAVO_VERSION_STATE.json')
     }
 }
 
