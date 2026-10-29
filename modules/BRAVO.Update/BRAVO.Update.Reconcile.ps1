@@ -305,6 +305,9 @@ function Get-BRAVOSchedulerSnapshot {
         schemaVersion = 1
         capturedUtc   = $capturedUtc
         taskPath      = $scope.TaskPath
+        # Цільовий runtime, за конфігурацією якого визначено область: решта функцій
+        # передає його adapter-у, щоб межі керованих задач не залежали від ToolkitRoot.
+        runtimeRoot   = $RuntimeRoot
         tasks         = @($tasks.ToArray())
     }
 }
@@ -410,12 +413,13 @@ function Set-BRAVOReconcileTaskEnabled {
         [Parameter(Mandatory = $true)]$Adapter,
         [Parameter(Mandatory = $true)][string]$TaskPath,
         [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)][bool]$Enabled
+        [Parameter(Mandatory = $true)][bool]$Enabled,
+        [string]$RuntimeRoot = ''
     )
 
     try {
         $setEnabled = Get-BRAVOReconcileAdapterAction -Adapter $Adapter -Name 'SetTaskEnabled'
-        $result = & $setEnabled $TaskPath $Name $Enabled
+        $result = & $setEnabled $TaskPath $Name $Enabled $RuntimeRoot
         if (($null -ne $result) -and [bool](Get-BRAVOUpdatePropertyValue -InputObject $result -Name 'Success' -Default $false)) {
             return [pscustomobject]@{ Success = $true; Message = '' }
         }
@@ -429,6 +433,17 @@ function Set-BRAVOReconcileTaskEnabled {
 # ----------------------------------------------------------------------
 # Призупинення, відновлення, аварійне вимкнення
 # ----------------------------------------------------------------------
+function Resolve-BRAVOReconcileRuntimeRoot {
+    # Цільовий runtime для adapter-а: явний параметр, інакше runtimeRoot знімка, інакше ''.
+    # Саме він визначає область керованих задач (TaskPath/імена) у default-adapter, тому
+    # його не можна губити між знімком і SetTaskEnabled/GetManagedTasks.
+    [CmdletBinding()]
+    param([string]$RuntimeRoot = '', [AllowNull()]$Snapshot = $null)
+
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) { return $RuntimeRoot }
+    return [string](Get-BRAVOUpdatePropertyValue -InputObject $Snapshot -Name 'runtimeRoot' -Default '')
+}
+
 
 function Suspend-BRAVOManagedTasks {
     <#
@@ -439,7 +454,7 @@ function Suspend-BRAVOManagedTasks {
         Будь-який Failed = збій фази для викликача.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter, [string]$RuntimeRoot = '')
 
     $disabled = New-Object System.Collections.Generic.List[object]
     $failed = New-Object System.Collections.Generic.List[object]
@@ -449,10 +464,11 @@ function Suspend-BRAVOManagedTasks {
         return [pscustomobject]@{ Disabled = @(); Failed = @($failed.ToArray()) }
     }
     $taskPath = [string](Get-BRAVOUpdatePropertyValue -InputObject $Snapshot -Name 'taskPath')
+    $effectiveRoot = Resolve-BRAVOReconcileRuntimeRoot -RuntimeRoot $RuntimeRoot -Snapshot $Snapshot
     foreach ($task in @(Get-BRAVOUpdatePropertyValue -InputObject $Snapshot -Name 'tasks' -Default @())) {
         if (-not ([bool]$task.exists -and [bool]$task.enabled)) { continue }
         $name = [string]$task.name
-        $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $taskPath -Name $name -Enabled $false
+        $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $taskPath -Name $name -Enabled $false -RuntimeRoot $effectiveRoot
         if ($set.Success) {
             $disabled.Add([pscustomobject][ordered]@{ path = $taskPath; name = $name })
         } else {
@@ -472,7 +488,7 @@ function Restore-BRAVOManagedTaskState {
         (fail closed), а не «нічого відновлювати».
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [Parameter(Mandatory = $true)]$Adapter, [string]$RuntimeRoot = '')
 
     $restored = New-Object System.Collections.Generic.List[object]
     $failed = New-Object System.Collections.Generic.List[object]
@@ -481,10 +497,11 @@ function Restore-BRAVOManagedTaskState {
         $failed.Add([pscustomobject][ordered]@{ path = ''; name = ''; message = ($shape -join '; ') })
     } else {
         $taskPath = [string](Get-BRAVOUpdatePropertyValue -InputObject $Snapshot -Name 'taskPath')
+        $effectiveRoot = Resolve-BRAVOReconcileRuntimeRoot -RuntimeRoot $RuntimeRoot -Snapshot $Snapshot
         foreach ($task in @(Get-BRAVOUpdatePropertyValue -InputObject $Snapshot -Name 'tasks' -Default @())) {
             if (-not ([bool]$task.exists -and [bool]$task.enabled)) { continue }
             $name = [string]$task.name
-            $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $taskPath -Name $name -Enabled $true
+            $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $taskPath -Name $name -Enabled $true -RuntimeRoot $effectiveRoot
             if ($set.Success) {
                 $restored.Add([pscustomobject][ordered]@{ path = $taskPath; name = $name })
             } else {
@@ -520,13 +537,14 @@ function Disable-BRAVOAllManagedTasks {
     try {
         $snapshotScope = $null
         if ($null -ne $Snapshot) { $snapshotScope = Get-BRAVOReconcileScopeFromSnapshot -Snapshot $Snapshot }
+        $effectiveRoot = Resolve-BRAVOReconcileRuntimeRoot -RuntimeRoot $RuntimeRoot -Snapshot $Snapshot
         $live = $null
         $liveError = ''
         try {
             if ($null -ne $snapshotScope) {
-                $live = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $RuntimeRoot -TaskPath $snapshotScope.TaskPath -ManagedTaskName $snapshotScope.Names
+                $live = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $effectiveRoot -TaskPath $snapshotScope.TaskPath -ManagedTaskName $snapshotScope.Names
             } else {
-                $live = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $RuntimeRoot -TaskPath $TaskPath -ManagedTaskName $ManagedTaskName
+                $live = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $effectiveRoot -TaskPath $TaskPath -ManagedTaskName $ManagedTaskName
             }
         } catch {
             $live = $null
@@ -542,7 +560,7 @@ function Disable-BRAVOAllManagedTasks {
             $failed.Add([pscustomobject][ordered]@{ path = ''; name = ''; message = "Не вдалося визначити керовані задачі: $liveError" })
         }
         foreach ($target in $targets.ToArray()) {
-            $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $target.path -Name $target.name -Enabled $false
+            $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $target.path -Name $target.name -Enabled $false -RuntimeRoot $effectiveRoot
             if ($set.Success) {
                 $disabled.Add([pscustomobject][ordered]@{ path = $target.path; name = $target.name })
             } else {
@@ -676,7 +694,7 @@ function Invoke-BRAVOSchedulerReconcile {
             }
             $enabledNow = @(Get-BRAVOReconcileEnabledTask -Snapshot $current)
             if ($enabledNow.Count -eq 0) { $verified = $true; break }
-            $suspend = Suspend-BRAVOManagedTasks -Snapshot $current -Adapter $adapter
+            $suspend = Suspend-BRAVOManagedTasks -Snapshot $current -Adapter $adapter -RuntimeRoot $runtimeRoot
             foreach ($item in @($suspend.Disabled)) { $requiesced.Add($item) }
             foreach ($item in @($suspend.Failed)) { $problems.Add("Не вимкнено '$($item.name)': $($item.message)") }
         }
@@ -732,9 +750,11 @@ function Set-BRAVOTaskActivation {
         [Parameter(Mandatory = $true)]$Adapter,
         [Parameter(Mandatory = $true)][ValidateSet('Success', 'SuccessWithWarnings', 'Failed', 'RolledBack', 'Critical')][string]$OutcomeStatus,
         [ValidateSet('', 'Install', 'Update', 'Repair')][string]$Action = '',
-        [string[]]$WarningText = @()
+        [string[]]$WarningText = @(),
+        [string]$RuntimeRoot = ''
     )
 
+    $effectiveRoot = Resolve-BRAVOReconcileRuntimeRoot -RuntimeRoot $RuntimeRoot -Snapshot $Snapshot
     $activationPolicy = 'ActivateOnSuccessOnly'
     $policyAction = ''
     if ($Policy -is [string]) {
@@ -796,7 +816,7 @@ function Set-BRAVOTaskActivation {
 
     $expectedEnabled = @(Get-BRAVOReconcileEnabledTask -Snapshot $Snapshot)
     if ($restorePrevious) {
-        $restore = Restore-BRAVOManagedTaskState -Snapshot $Snapshot -Adapter $Adapter
+        $restore = Restore-BRAVOManagedTaskState -Snapshot $Snapshot -Adapter $Adapter -RuntimeRoot $effectiveRoot
         if (-not $restore.IsComplete) {
             $details = (@($restore.Failed | ForEach-Object { [string]$_.name + ': ' + [string]$_.message }) -join '; ')
             $activation = & $unknown 'Activation.RestoreIncomplete' 'Не всі задачі відновлено в попередньому стані' 'Частина задач, що були активні до операції, не ввімкнена.' $details
@@ -820,12 +840,12 @@ function Set-BRAVOTaskActivation {
     $final = $null
     $details = ''
     try {
-        $final = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -TaskPath $scope.TaskPath -ManagedTaskName $scope.Names
+        $final = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $effectiveRoot -TaskPath $scope.TaskPath -ManagedTaskName $scope.Names
         $stillEnabled = @(Get-BRAVOReconcileEnabledTask -Snapshot $final)
         if ($stillEnabled.Count -gt 0) {
-            $suspend = Suspend-BRAVOManagedTasks -Snapshot $final -Adapter $Adapter
+            $suspend = Suspend-BRAVOManagedTasks -Snapshot $final -Adapter $Adapter -RuntimeRoot $effectiveRoot
             $details = (@($suspend.Failed | ForEach-Object { [string]$_.name + ': ' + [string]$_.message }) -join '; ')
-            $final = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -TaskPath $scope.TaskPath -ManagedTaskName $scope.Names
+            $final = Get-BRAVOSchedulerSnapshot -Adapter $Adapter -RuntimeRoot $effectiveRoot -TaskPath $scope.TaskPath -ManagedTaskName $scope.Names
         }
     } catch {
         $final = $null

@@ -482,6 +482,65 @@ try {
     }
 
     # ------------------------------------------------------------------
+    # RuntimeRoot має доходити до adapter-а (область задач залежить від нього)
+    # ------------------------------------------------------------------
+    & {
+        $target = 'C:\target runtime'
+        $rootStub = @{ Tasks = @{ 'Cust-A' = $true; 'Cust-B' = $true }; Log = (New-Object System.Collections.Generic.List[string]); Target = $target }
+        $rootAdapter = @{}
+        # Область існує лише для цільового root; будь-який інший (ToolkitRoot) = чужа область.
+        $rootAdapter.GetEffectiveConfiguration = {
+            param($RuntimeRoot)
+            $path = 'Wrong'; if ($RuntimeRoot -eq $rootStub.Target) { $path = 'Custom Шлях' }
+            $scheduler = [pscustomobject]@{ TaskPath = $path; Backup = [pscustomobject]@{ TaskName = 'Cust-A' }; Health = [pscustomobject]@{ TaskName = 'Cust-B' } }
+            return [pscustomobject]@{ Success = $true; ExitCode = 0; Configuration = [pscustomobject]@{ schedulerSettings = $scheduler }; Message = '' }
+        }.GetNewClosure()
+        $rootAdapter.GetManagedTasks = {
+            param($TaskPath, $RuntimeRoot)
+            $rootStub.Log.Add("GET|$RuntimeRoot")
+            if ($RuntimeRoot -ne $rootStub.Target) { throw 'GetManagedTasks: чужий RuntimeRoot' }
+            foreach ($name in @($rootStub.Tasks.Keys)) { [pscustomobject]@{ Name = $name; Path = '\Custom Шлях\'; Exists = $true; State = 'Ready'; Enabled = [bool]$rootStub.Tasks[$name] } }
+        }.GetNewClosure()
+        $rootAdapter.SetTaskEnabled = {
+            param($TaskPath, $Name, $Enabled, $RuntimeRoot)
+            $rootStub.Log.Add("SET|$Name|$Enabled|$RuntimeRoot")
+            if ($RuntimeRoot -ne $rootStub.Target) { throw 'SetTaskEnabled: чужий RuntimeRoot' }
+            $rootStub.Tasks[$Name] = [bool]$Enabled
+            return [pscustomobject]@{ Success = $true; Message = '' }
+        }.GetNewClosure()
+        $rootAdapter.InvokeSetupScheduler = {
+            param($RuntimeRoot)
+            foreach ($name in @($rootStub.Tasks.Keys)) { $rootStub.Tasks[$name] = $true }
+            return [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false }
+        }.GetNewClosure()
+
+        $snapshot = Invoke-ReconcileTestCall -Name 'Get-BRAVOSchedulerSnapshot' -Params @{ Adapter = $rootAdapter; RuntimeRoot = $target }
+        Test-BRAVOCondition -Condition (($snapshot.runtimeRoot -ceq $target) -and ($snapshot.taskPath -ceq '\Custom Шлях\') -and (@($snapshot.tasks | Where-Object { $_.enabled }).Count -eq 2)) -Name 'UpdateReconcile/RuntimeRoot.SnapshotRecordsRoot' -Failure 'знімок має містити runtimeRoot і область цільового runtime'
+
+        $suspend = Invoke-ReconcileTestCall -Name 'Suspend-BRAVOManagedTasks' -Params @{ Snapshot = $snapshot; Adapter = $rootAdapter }
+        Test-BRAVOCondition -Condition ((@($suspend.Failed).Count -eq 0) -and (@($suspend.Disabled).Count -eq 2) -and (@($rootStub.Log | Where-Object { $_ -like 'SET|*' -and $_ -notlike ('*|' + $target) }).Count -eq 0)) -Name 'UpdateReconcile/RuntimeRoot.SuspendUsesSnapshotRoot' -Failure 'Suspend без -RuntimeRoot має передати runtimeRoot знімка 4-м аргументом'
+        $restore = Invoke-ReconcileTestCall -Name 'Restore-BRAVOManagedTaskState' -Params @{ Snapshot = $snapshot; Adapter = $rootAdapter }
+        Test-BRAVOCondition -Condition ($restore.IsComplete -and (@($restore.Restored).Count -eq 2)) -Name 'UpdateReconcile/RuntimeRoot.RestoreUsesSnapshotRoot' -Failure 'Restore без -RuntimeRoot має використати root знімка'
+        $disableAll = Invoke-ReconcileTestCall -Name 'Disable-BRAVOAllManagedTasks' -Params @{ Adapter = $rootAdapter; Snapshot = $snapshot }
+        Test-BRAVOCondition -Condition ($disableAll.IsComplete -and (@($disableAll.Disabled).Count -eq 2) -and (@($rootStub.Log | Where-Object { $_ -like 'GET|*' -and $_ -ne ('GET|' + $target) }).Count -eq 0)) -Name 'UpdateReconcile/RuntimeRoot.DisableAllUsesSnapshotRoot' -Failure 'Disable-All без RuntimeRoot має брати root знімка і для GetManagedTasks'
+        # Явний -RuntimeRoot перекриває знімок.
+        $explicit = Invoke-ReconcileTestCall -Name 'Suspend-BRAVOManagedTasks' -Params @{ Snapshot = $snapshot; Adapter = $rootAdapter; RuntimeRoot = 'C:\other' }
+        Test-BRAVOCondition -Condition (@($explicit.Failed).Count -eq 2) -Name 'UpdateReconcile/RuntimeRoot.ExplicitOverrides' -Failure 'явний RuntimeRoot має використовуватись'
+
+        $rootStub.Tasks['Cust-A'] = $true
+        $rootStub.Tasks['Cust-B'] = $false
+        $before = Invoke-ReconcileTestCall -Name 'Get-BRAVOSchedulerSnapshot' -Params @{ Adapter = $rootAdapter; RuntimeRoot = $target }
+        $stateRoot = Join-Path $reconcileTestRoot 'state root-scope'
+        $reconcile = Invoke-ReconcileTestCall -Name 'Invoke-BRAVOSchedulerReconcile' -Params @{ Context = ([pscustomobject]@{ Adapter = $rootAdapter; Paths = [pscustomobject]@{ RuntimeRoot = $target; StateRoot = $stateRoot } }); Snapshot = $before }
+        Test-BRAVOCondition -Condition (($reconcile.Verdict -ceq 'PASS') -and (@($rootStub.Tasks.Keys | Where-Object { $rootStub.Tasks[$_] }).Count -eq 0)) -Name 'UpdateReconcile/RuntimeRoot.ReconcileUsesContextRoot' -Failure 'Reconcile має працювати з областю цільового runtime і вимкнути все'
+
+        $activation = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $before; Adapter = $rootAdapter; OutcomeStatus = 'Success'; Action = 'Update' }
+        Test-BRAVOCondition -Condition (($activation.TaskActivation.state -ceq 'Active') -and [bool]$rootStub.Tasks['Cust-A'] -and (-not [bool]$rootStub.Tasks['Cust-B'])) -Name 'UpdateReconcile/RuntimeRoot.ActivationUsesSnapshotRoot' -Failure 'Set-BRAVOTaskActivation має використати root знімка'
+        $critical = Invoke-ReconcileTestCall -Name 'Set-BRAVOTaskActivation' -Params @{ Policy = 'ActivateOnSuccessOnly'; Snapshot = $before; Adapter = $rootAdapter; OutcomeStatus = 'Critical'; Action = 'Update' }
+        Test-BRAVOCondition -Condition (($critical.TaskActivation.state -ceq 'Inactive') -and (@($rootStub.Tasks.Keys | Where-Object { $rootStub.Tasks[$_] }).Count -eq 0)) -Name 'UpdateReconcile/RuntimeRoot.CriticalVerifyUsesSnapshotRoot' -Failure 'перевірка Inactive має читати область за root знімка'
+    }
+
+    # ------------------------------------------------------------------
     # Default adapter: обмеження області (гілки до звернення до COM)
     # ------------------------------------------------------------------
     & {
