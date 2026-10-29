@@ -7139,6 +7139,11 @@ $attributionScenarios = @(
     @{ Label = 'CoAuthoredByAiWithNoreply'; Message = "fix: x`n`nCo-Authored-By: Claude <noreply@anthropic.com>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI', 'AI_NOREPLY_ADDRESS') }
     @{ Label = 'CoAuthoredByAiLowerCase'; Message = "fix: x`n`nco-authored-by: codex <bot@example.invalid>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI') }
     @{ Label = 'CoAuthoredByHumanAllowed'; Message = "fix: x`n`nCo-Authored-By: Jane Doe <jane@example.invalid>"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'CoAuthoredByHumanNamedLikeToolAllowed'; Message = "fix: x`n`nCo-Authored-By: Claude Martin <claude.martin@example.org>"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'CoAuthoredByHumanAtAiCompanyAllowed'; Message = "fix: x`n`nCo-Authored-By: Jane Doe <jane@openai.com>"; Author = 'dev@example.invalid'; Expect = @() }
+    @{ Label = 'CoAuthoredByAiWithCrLf'; Message = "fix: x`r`n`r`nCo-Authored-By: Claude <bot@example.invalid>`r`n"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI') }
+    @{ Label = 'CoAuthoredByAiModelName';Message = "fix: x`n`nCo-Authored-By: Claude Opus 4.5 <bot@example.invalid>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI') }
+    @{ Label = 'CoAuthoredByAiGitHubBotAddress'; Message = "fix: x`n`nCo-Authored-By: Helper <175728472+Copilot@users.noreply.github.com>"; Author = 'dev@example.invalid'; Expect = @('CO_AUTHORED_BY_AI') }
     @{ Label = 'SessionTrailerAndLink'; Message = "fix: x`n`nClaude-Session: https://claude.ai/code/session_0000"; Author = 'dev@example.invalid'; Expect = @('SESSION_TRAILER', 'AI_SESSION_LINK') }
     @{ Label = 'AiAssistedTrailer'; Message = "fix: x`n`nAI-assisted: yes"; Author = 'dev@example.invalid'; Expect = @('AI_ASSISTED_TRAILER') }
     @{ Label = 'GeneratedFooter'; Message = "fix: x`n`nGenerated with [Claude Code](https://claude.com/claude-code)"; Author = 'dev@example.invalid'; Expect = @('GENERATED_BY_AI', 'AI_SESSION_LINK') }

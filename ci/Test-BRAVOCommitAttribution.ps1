@@ -51,8 +51,13 @@ function Get-BRAVOCommitAttributionViolation {
     )
 
     $aiTool = '(?:claude|anthropic|codex|openai|chatgpt|copilot|gemini)'
+    # Співавтор - AI, коли ВСЕ ім'я є назвою інструмента (з необов'язковими моделлю
+    # чи версією: "Claude", "Claude Opus 4.5", "GitHub Copilot") або адреса - службова
+    # noreply AI-провайдера чи бота GitHub. Підрядок не рахується: людина
+    # "Claude Martin" чи адреса @openai.com співавтором-AI не є (PR #531, P2).
+    $aiCoAuthorName = '(?i)^(?:github[ \t]+)?' + $aiTool + '(?:[ \t]+(?:code|cli|agent|assistant|opus|sonnet|haiku|fable|pro|ultra|flash|[0-9][0-9.]*))*(?:\[bot\])?$'
+    $aiCoAuthorEmail = '(?i)^(?:noreply@(?:anthropic|openai)\.com|(?:[0-9]+\+)?' + $aiTool + '(?:-[a-z0-9-]+)?(?:\[bot\])?@users\.noreply\.github\.com)$'
     $rules = [ordered]@{
-        'CO_AUTHORED_BY_AI'   = '(?im)^[ \t]*co-authored-by:[^\r\n]*' + $aiTool
         'SESSION_TRAILER'     = '(?im)^[ \t]*claude-session:'
         'AI_ASSISTED_TRAILER' = '(?im)^[ \t]*ai-assisted:'
         # Футер - рядок, де перед "Generated" немає літер (емодзі, пробіли); інакше
@@ -65,6 +70,16 @@ function Get-BRAVOCommitAttributionViolation {
 
     $violations = New-Object System.Collections.Generic.List[string]
     $text = if ($null -eq $Message) { '' } else { $Message }
+    # \r? перед кінцем рядка: вивід git show у PowerShell приходить із CRLF, а $ у
+    # режимі (?m) стоїть лише перед \n.
+    foreach ($trailer in [regex]::Matches($text, '(?im)^[ \t]*co-authored-by:[ \t]*([^<\r\n]*?)[ \t]*(?:<([^>\r\n]*)>)?[ \t]*\r?$')) {
+        $coAuthorName = $trailer.Groups[1].Value.Trim()
+        $coAuthorEmail = $trailer.Groups[2].Value.Trim()
+        if ($coAuthorName -match $aiCoAuthorName -or ($coAuthorEmail.Length -gt 0 -and $coAuthorEmail -match $aiCoAuthorEmail)) {
+            [void]$violations.Add('CO_AUTHORED_BY_AI')
+            break
+        }
+    }
     foreach ($rule in $rules.Keys) {
         if ($text -match $rules[$rule]) { [void]$violations.Add($rule) }
     }
