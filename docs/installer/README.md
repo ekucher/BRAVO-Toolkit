@@ -10,30 +10,84 @@
 
 ## Стан реалізації (гілка feature/installer-v1)
 
-Реалізацію Installer v1 розпочато в гілці `feature/installer-v1`. Цей розділ
-відділяє те, що вже є в коді, від того, що лишається design.
+Реалізація Installer v1 іде в гілці `feature/installer-v1`. Цей розділ
+відділяє те, що вже є в коді, від того, що лишається design. «Реалізовано»
+означає: код є в гілці й покритий названим suite-ом self-test у sandbox
+(stub-адаптери, тимчасові корені). Це **не** перевірка на реальному хості.
 
-Реалізовано в коді гілки:
+**Installer v1 не прийнятий для production.** Ніщо в цій гілці не є
+production acceptance і не дає дозволу на deployment, merge, release чи pilot.
 
-- каркас модуля `modules/BRAVO.Update/` і контракти engine (INS-010…014) —
-  форми даних і назви функцій у [CONTRACTS.md](CONTRACTS.md);
-- коди завершення `80`/`81`/`82` у `modules/BRAVO.ExitCodes`.
+### Реалізовано в коді
 
-У роботі (хвилі B–J детального плану; фінальний перелік оновлює lead під час
-інтеграції): read-only discovery/preflight/plan, acquisition і verification,
-backup/deploy/reconcile, rollback і recovery, clean install, repair,
-`BRAVO_UPDATE.ps1`, GUI.
+| INS | Що | Де | Suite |
+|---|---|---|---|
+| INS-010…014 | Контракти State/Preflight/Plan/Progress/Result/Journal, атомарний журнал, шляхи за замовчуванням, adapter | `BRAVO.Update.Contracts.ps1`, `.Journal.ps1`, `.Paths.ps1` | `UpdateContracts` |
+| — | Коди завершення `80`/`81`/`82` | `modules/BRAVO.ExitCodes` | — |
+| INS-020 | Read-only discovery стану встановлення | `.Discovery.ps1` | `UpdateDiscovery` |
+| INS-021, INS-022 | Preflight і бар'єр міграції конфігурації | `.Preflight.ps1` | `UpdatePreflight` |
+| INS-023 | Побудова плану, fingerprint передумов | `.Plan.ps1` | `UpdatePlan` |
+| INS-024 | Діагностичний звіт з редакцією секретів і ідентифікаторів | `.Diagnostics.ps1` | `UpdateDiagnostics` |
+| INS-030…034, INS-036 | Отримання (online за тегом, offline zip), верифікація артефакта, prerelease policy, перевірка staged runtime | `.Release.ps1` | `UpdateRelease` |
+| INS-035 | Lifecycle lock, operation lock, приватний staging і безпечне розпакування | `.Lock.ps1`, `.Staging.ps1` | `UpdateStaging` |
+| INS-040 | Модуль `modules/BRAVO.Update` | | — |
+| INS-041 | Worker-протокол і тонкий CLI `BRAVO_UPDATE.ps1` | `.Worker.ps1`, `BRAVO_UPDATE.ps1` | `UpdateWorker` |
+| INS-043 | Верифікований backup runtime | `.Backup.ps1` | `UpdateBackup` |
+| INS-045, INS-046 | Baseline site-конфігурації, знімок/призупинення/відновлення задач, reconcile scheduler, активація (D6) | `.Reconcile.ps1` | `UpdateReconcile` |
+| INS-047 | Post-deployment validation | `.Validation.ps1` | `UpdateValidation` |
+| INS-050…052 | Транзакційний відкат, знімок і відновлення version-state (D13), відкат clean install | `.Rollback.ps1` | `UpdateRollback` |
+| INS-053, INS-054 | Виявлення перерваної операції, recovery до known-good | `.Recovery.ps1` | `UpdateRecovery` |
+| INS-070…074 | Same-version repair (обгортка над ядром deploy) | `.Repair.ps1` | `UpdateRecovery` |
+| INS-080…083, INS-100 | WinForms-каркас GUI, read-only прототип (лише `State`/`Preflight`; mutation-кнопки вимкнені) | `BRAVO_INSTALLER.ps1`, `modules/BRAVO.Installer.UI` | `InstallerUI` |
+
+Інструкція оператора — [OPERATOR_GUIDE.md](OPERATOR_GUIDE.md).
+
+### Ще не в цьому знімку гілки
+
+Частини, від яких залежать Update/Install/Repair end-to-end; на момент
+цього оновлення документації вони в окремих гілках на інтеграції:
+
+- INS-044, INS-042 — ядро розгортання `Invoke-BRAVODeployment` (крок U3
+  `ConsumedPlans`, cancel через `control\cancel`, mutation boundary);
+  `BRAVO.Update.Deploy.ps1` поки порожній, suite `UpdateDeploy` не
+  зареєстровано. Без нього `-Action Update` завершується
+  `Failed/Error` (`Worker.DispatchFailed`), а Repair — blocker-ом
+  `Repair.CoreUnavailable`;
+- INS-060…065 — clean install `Install-BRAVOToolkit`;
+  `BRAVO.Update.Install.ps1` поки порожній, suite `UpdateInstall` не
+  зареєстровано;
+- INS-055 — наскрізний failure injection по фазах deploy (fault points є
+  лише у відкаті й recovery);
+- INS-084…092, INS-101…104 — екрани майстра, виконання через UAC, екрани
+  результату й Maintenance Center у GUI (у прототипі є лише read-only
+  каркас екранів «Діагностика», «Налаштування», «Журнали»).
 
 Рішення, закладені за замовчуванням і ще не затверджені власником, — у
-[DECISIONS.md](DECISIONS.md).
+[DECISIONS.md](DECISIONS.md) (зокрема відкриті R1–R7).
 
-Явно **не виконано**:
+### Явно не виконано
 
 - fleet inventory і Config v2 fleet migration (INS-001, INS-002);
+- scheduled update — `NotifyOnly`/`StageOnly`/`Automatic` (INS-110…120)
+  виключено зі scope v1 (D1);
 - VM acceptance (INS-130…142);
 - pilot і рішення про rollout (INS-150…155).
 
-Ніщо в цій гілці не є production acceptance і не дає дозволу на deployment.
+### Перевірки, які потребують реального хоста або VM
+
+Self-test у sandbox їх не замінює:
+
+- COM Task Scheduler: читання, вимкнення й увімкнення реальних задач
+  (`GetManagedTasks`/`SetTaskEnabled`), повторна реєстрація через
+  `BRAVO_SETUP -Action Scheduler` і негайне вимкнення;
+- ACL каталогів протоколу (`Requests`, `Operations`, `control`,
+  `ConsumedPlans`), staging і backup під SYSTEM та під елевованим
+  адміністратором;
+- UAC-потік: неелевований CLI/GUI → `Start-Process -Verb RunAs` → worker,
+  скасування UAC (код 36);
+- ACL `BRAVO_VERSION_STATE.json` після `File.Replace` під час відновлення
+  version-state;
+- GUI: масштабування DPI, RDP-сесії, Server Core без desktop.
 
 ## Мета
 
