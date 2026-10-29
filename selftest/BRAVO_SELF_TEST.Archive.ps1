@@ -3411,7 +3411,15 @@ try {
 $vssWorkDirModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText $archiveScriptText `
     -FunctionNames @('Get-BRAVOVSSDiskshadowWorkDirectory')
-$vssWorkDirRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_VSS_WORKDIR_SELF_TEST_{0}' -f [guid]::NewGuid().ToString('N'))
+# ASCII-фікстури мусять мати ASCII-батьківський шлях: на установці з
+# кириличним %TEMP% (саме цей сценарій виправляється) корінь у GetTempPath()
+# зробив би не-ASCII і "ASCII"-кандидатів, і тест падав би при коректному
+# хелпері. Як у ManualLaunchers: C:\Windows\Temp завжди ASCII.
+$vssWorkDirTempBase = [IO.Path]::GetTempPath()
+if ($vssWorkDirTempBase -cmatch '[^\x00-\x7F]') {
+    $vssWorkDirTempBase = Join-Path $env:SystemRoot 'Temp'
+}
+$vssWorkDirRoot = Join-Path $vssWorkDirTempBase ('BRAVO_VSS_WORKDIR_SELF_TEST_{0}' -f [guid]::NewGuid().ToString('N'))
 try {
     $vssAsciiTemp = Join-Path $vssWorkDirRoot 'AsciiTemp'
     $vssFakeSystemRoot = Join-Path $vssWorkDirRoot 'FakeWindows'
