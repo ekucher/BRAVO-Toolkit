@@ -44,7 +44,8 @@ powershell.exe -NoProfile -File .\BRAVO_INSTALLER.ps1 [-RuntimeRoot <шлях>] 
 
 | Параметр | Значення |
 |---|---|
-| `-Action` | `State`, `Preflight`, `Plan`, `Install`, `Update`, `Repair`, `Recover`, `Diagnose`; `Execute` — службова дія worker-а (див. 3.5) |
+| `-Action` | `State`, `Preflight`, `Plan`, `Install`, `Update`, `Repair`, `Recover`, `Diagnose`, `Initialize` (первинне створення захищених каталогів стану, потребує прав адміністратора); `Execute` — службова дія worker-а (див. 3.5) |
+| `-RecoveryId` | Службовий GUID, яким неелевований CLI зв'язує elevated Recover із його `Operations\<RecoveryId>\result.json`; вручну не задається |
 | `-Operation` | `Install`, `Update`, `Repair` — для `-Action Plan` (обов'язковий) і `Preflight` (необов'язковий) |
 | `-RuntimeRoot` | Каталог встановлення; потрібен, якщо встановлень кілька або жодного |
 | `-SourcePath` | Офлайн-джерело: шлях до `BRAVO-Toolkit-<версія>.zip` |
