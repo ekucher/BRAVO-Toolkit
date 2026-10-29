@@ -223,6 +223,85 @@ function Invoke-BRAVOUpdateChildProcess {
     }
 }
 
+function Import-BRAVOUpdateTrustedGuardFunctions {
+    <#
+    .SYNOPSIS
+        Єдиний канонічний завантажувач довірених функцій BRAVO_RUNTIME_GUARD.ps1
+        в область модуля BRAVO.Update (ConvertTo-/Compare-BRAVOComparableVersion,
+        Test-BRAVORuntimeManifestIntegrity, Get-BRAVORuntimeFileHash).
+    .DESCRIPTION
+        Guard — виконуваний скрипт із param-блоком і головним блоком, тому
+        dot-source засмічував би область викликача param-змінними
+        ($RuntimeRoot/$Mode/...). Натомість через AST витягаємо лише тексти
+        потрібних FunctionDefinitionAst і оголошуємо їх як script:-функції
+        модуля: політика SemVer та перевірка manifest лишаються в одному місці
+        (guard комплекту ІНСТАЛЯТОРА, а не цільового/staged дерева, яке ще не
+        довірене). Ідемпотентно: якщо всі функції вже оголошені в цьому модулі,
+        файл не читається (-Force примусово перечитує). Відсутній, нечитабельний
+        або пошкоджений guard -> виняток; викликач перетворює його на Blocker/
+        Warning finding. Часткове оголошення неможливе: спершу розбираємо й
+        перевіряємо ВСІ визначення, лише потім оголошуємо.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$GuardPath = '',
+        [switch]$Force
+    )
+
+    # Get-BRAVORuntimeFileHash — приватна залежність Test-BRAVORuntimeManifestIntegrity
+    # (потрібна під час виклику, не оголошення).
+    $required = @('Get-BRAVORuntimeFileHash', 'Test-BRAVORuntimeManifestIntegrity',
+        'ConvertTo-BRAVOComparableVersion', 'Compare-BRAVOComparableVersion')
+
+    if (-not $Force) {
+        $allLoaded = $true
+        foreach ($name in $required) {
+            $existing = Get-Command -Name $name -CommandType Function -ErrorAction SilentlyContinue
+            # Глобальна функція з тим самим іменем не рахується: довіряємо лише
+            # визначенню, яке модуль завантажив із guard комплекту.
+            if ($null -eq $existing -or [string]$existing.ModuleName -ne 'BRAVO.Update') { $allLoaded = $false; break }
+        }
+        if ($allLoaded) { return }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($GuardPath)) {
+        $GuardPath = Join-Path $script:BRAVOUpdateToolkitRoot 'BRAVO_RUNTIME_GUARD.ps1'
+    }
+    if (-not [System.IO.File]::Exists($GuardPath)) {
+        throw ('BRAVO.Update: довірений BRAVO_RUNTIME_GUARD.ps1 не знайдено: {0}' -f $GuardPath)
+    }
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($GuardPath, [ref]$tokens, [ref]$parseErrors)
+    if ($null -ne $parseErrors -and @($parseErrors).Count -gt 0) {
+        throw ('BRAVO.Update: BRAVO_RUNTIME_GUARD.ps1 має синтаксичні помилки: {0}' -f @($parseErrors)[0].Message)
+    }
+
+    $definitions = @{}
+    foreach ($name in $required) {
+        $wanted = $name
+        $node = $ast.Find({
+                param($candidate)
+                ($candidate -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($candidate.Name -eq $wanted)
+            }, $true)
+        if ($null -eq $node) {
+            throw ('BRAVO.Update: BRAVO_RUNTIME_GUARD.ps1 не містить функції {0}.' -f $name)
+        }
+        # 'function Name' -> 'function script:Name': у dot-source-ному блоці
+        # всередині функції це оголошує функцію в області модуля, а не в
+        # локальній області завантажувача.
+        $text = $node.Extent.Text
+        $prefix = 'function ' + $name
+        if (-not $text.StartsWith($prefix, [System.StringComparison]::Ordinal)) {
+            throw ('BRAVO.Update: неочікуваний вигляд визначення {0} у BRAVO_RUNTIME_GUARD.ps1.' -f $name)
+        }
+        $definitions[$name] = [scriptblock]::Create('function script:' + $name + $text.Substring($prefix.Length))
+    }
+    foreach ($name in $required) {
+        . $definitions[$name]
+    }
+}
+
 function New-BRAVOUpdateDefaultAdapter {
     <#
     .SYNOPSIS

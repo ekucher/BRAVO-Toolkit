@@ -4,8 +4,9 @@
 # Контракт: docs\installer\CONTRACTS.md §4 (PreflightResult) і §2 (Finding).
 #
 # Інваріанти частини:
-#   * Preflight ЛИШЕ ЧИТАЄ: не пише файлів, не бере locks (тільки peek: спроба
-#     відкрити з FileShare.None і негайне закриття), нікого не завершує.
+#   * Preflight ЛИШЕ ЧИТАЄ: не пише файлів, не бере locks (лише канонічна
+#     проба Test-BRAVOUpdateOperationLockActive: відкриття без запису й негайне
+#     закриття), нікого не завершує.
 #   * Жодного виводу в консоль: результат — об'єкти.
 #   * Fail closed: те, що неможливо довести (журнал, lock, диск, шлях), —
 #     Blocker, а не припущення «все гаразд». Виняток — операція Diagnose:
@@ -42,24 +43,6 @@ $script:BRAVOPreflightMaxLocalConfigBytes = 1048576
 # Операторські runbook-и міграції (джерело правила INS-022).
 $script:BRAVOPreflightMigrationRunbook = 'docs\BRAVO_CONFIG_V2_PILOT_RUNBOOK.md (ручний fallback: docs\BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md)'
 
-function New-BRAVOPreflightFinding {
-    # Єдина точка виклику конструктора Finding (W1: New-BRAVOUpdateFinding),
-    # щоб зміна його сигнатури правилась в одному місці.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)][string]$Id,
-        [Parameter(Mandatory = $true)][ValidateSet('Ok', 'Warning', 'Blocker', 'NotApplicable')][string]$Severity,
-        [Parameter(Mandatory = $true)][string]$Title,
-        [string]$Meaning = '',
-        [string]$Action = '',
-        [string]$Details = '',
-        [AllowNull()][object]$ExitCodeHint = $null
-    )
-
-    return New-BRAVOUpdateFinding -Id $Id -Severity $Severity -Title $Title -Meaning $Meaning `
-        -Action $Action -Details $Details -ExitCodeHint $ExitCodeHint
-}
-
 function Add-BRAVOPreflightFinding {
     # Додає Finding у колекцію. Для Diagnose Blocker знижується до Warning:
     # діагностичний звіт не має блокуватись нічим — оператору потрібна
@@ -85,7 +68,7 @@ function Add-BRAVOPreflightFinding {
         $effectiveHint = $null
         $effectiveDetails = ("$Details (Diagnose: лише звіт, блокування не застосовується)").Trim()
     }
-    [void]$List.Add((New-BRAVOPreflightFinding -Id $Id -Severity $effectiveSeverity -Title $Title `
+    [void]$List.Add((New-BRAVOUpdateFinding -Id $Id -Severity $effectiveSeverity -Title $Title `
             -Meaning $Meaning -Action $Action -Details $effectiveDetails -ExitCodeHint $effectiveHint))
 }
 
@@ -243,31 +226,18 @@ function Get-BRAVOPreflightSystemPathProblem {
 
 function Get-BRAVOPreflightFreeBytes {
     # Вільне місце тому для шляху (шлях може ще не існувати — береться
-    # корінь диска). Якщо є W2 Get-BRAVOUpdateFreeSpace ({Volume,
-    # AvailableFreeBytes, Error}) — вона авторитетна: $null/Error означає
-    # «невідомо» (fail closed у викликача), без мовчазного fallback.
-    # Без W2 — DriveInfo. $null — не вдалося визначити.
+    # корінь диска) через канонічний Get-BRAVOUpdateFreeSpace (Staging):
+    # {Volume, AvailableFreeBytes, Error}. $null/Error означає «невідомо»
+    # (fail closed у викликача: DiskSpace = Blocker); іншого джерела немає.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Path)
 
     $full = Get-BRAVOPreflightFullPath -Path $Path
     if ($null -eq $full) { return $null }
-    if ($null -ne (Get-Command -Name 'Get-BRAVOUpdateFreeSpace' -CommandType Function -ErrorAction SilentlyContinue)) {
-        try {
-            $value = Get-BRAVOUpdateFreeSpace -Path $full
-            $bytes = Get-BRAVOPreflightProperty -InputObject $value -Name 'AvailableFreeBytes'
-            if ($null -eq $bytes) { return $null }
-            return [decimal]$bytes
-        } catch {
-            return $null
-        }
-    }
-    try {
-        $drive = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($full))
-        return [decimal]$drive.AvailableFreeSpace
-    } catch {
-        return $null
-    }
+    $value = Get-BRAVOUpdateFreeSpace -Path $full
+    $bytes = Get-BRAVOPreflightProperty -InputObject $value -Name 'AvailableFreeBytes'
+    if ($null -eq $bytes) { return $null }
+    return [decimal]$bytes
 }
 
 function Get-BRAVOUpdatePreflightEnvironment {
@@ -326,77 +296,19 @@ function Get-BRAVOUpdatePreflightEnvironment {
     }
 }
 
-function Get-BRAVOUpdateLockPeek {
-    # Peek lock-файлу БЕЗ захоплення: спроба відкрити з FileShare.None і
-    # негайне закриття. Відкритий хендл власника (FileShare.None або Read)
-    # дає sharing violation => Held. Файл без хендла (залишок від попереднього
-    # власника) — не активний lock, навіть із застарілим JSON усередині.
-    # Held = $null — прочитати стан неможливо (ACL тощо): викликач вирішує
-    # fail-closed. Запису у файл тут немає ні в якому разі.
+function Format-BRAVOPreflightLockHolder {
+    # Опис власника lock-а для оператора — лише operation/pid/startedAt, без
+    # решти полів holder-а (вони можуть містити зайве). Holder — результат
+    # Test-BRAVOUpdateOperationLockActive (може бути $null).
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([AllowNull()][object]$Holder)
 
-    $result = [pscustomobject]@{ Exists = $false; Held = $false; Holder = ''; Problem = '' }
-    if (-not [System.IO.File]::Exists($Path)) { return $result }
-    $result.Exists = $true
-    try {
-        $probe = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
-        $probe.Dispose()
-        $result.Held = $false
-    } catch [System.IO.FileNotFoundException] {
-        $result.Exists = $false
-    } catch [System.IO.DirectoryNotFoundException] {
-        $result.Exists = $false
-    } catch [System.UnauthorizedAccessException] {
-        # Windows іноді повертає «доступ заборонено» замість sharing
-        # violation, коли власник тримає файл на запис. Розрізняємо: якщо
-        # файл читається з повним спільним доступом, ACL ні до чого —
-        # отже файл тримає інший процес (Held). Якщо й так не читається —
-        # стан невідомий (fail closed у викликача).
-        $result.Held = $null
-        $result.Problem = 'недостатньо прав для перевірки lock-файлу'
-        try {
-            $aclProbe = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
-            $aclProbe.Dispose()
-            $result.Held = $true
-            $result.Problem = ''
-        } catch {
-            $result.Held = $null
-        }
-    } catch [System.IO.IOException] {
-        $result.Held = $true
-    } catch {
-        $result.Held = $null
-        $result.Problem = $_.Exception.Message
+    if ($null -eq $Holder) { return '' }
+    $parts = foreach ($field in @('operation', 'pid', 'startedAt')) {
+        $value = Get-BRAVOPreflightProperty -InputObject $Holder -Name $field
+        "$field=$(if ($null -ne $value) { $value } else { '?' })"
     }
-
-    if ($result.Held -eq $true) {
-        # Опис власника — best-effort: лише operation/pid/startedAt, без
-        # решти полів JSON.
-        try {
-            $peek = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-            try {
-                $reader = New-Object System.IO.StreamReader($peek, [System.Text.Encoding]::UTF8)
-                $text = $reader.ReadToEnd()
-            } finally {
-                $peek.Dispose()
-            }
-            if (-not [string]::IsNullOrWhiteSpace($text)) {
-                $holder = $text | ConvertFrom-Json
-                $parts = foreach ($field in @('operation', 'pid', 'startedAt')) {
-                    $value = Get-BRAVOPreflightProperty -InputObject $holder -Name $field
-                    "$field=$(if ($null -ne $value) { $value } else { '?' })"
-                }
-                $result.Holder = (@($parts) -join '; ')
-            }
-        } catch {
-            $result.Holder = ''
-        }
-    }
-    return $result
+    return (@($parts) -join '; ')
 }
 
 function Read-BRAVOUpdateLocalConfigData {
@@ -506,7 +418,7 @@ function Test-BRAVOConfigMigrationBlocker {
         if (-not (Test-Path -LiteralPath $legacyPath)) { continue }
         $reason = "У runtime root є legacy-файл '$legacyName'; доказу завершеної міграції (видалення після паритету, Крок 6 runbook-а) немає."
         [void]$reasons.Add($reason)
-        [void]$findings.Add((New-BRAVOPreflightFinding -Id 'Preflight.LegacyConfig' -Severity 'Blocker' `
+        [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Preflight.LegacyConfig' -Severity 'Blocker' `
                 -Title "Знайдено legacy-конфігурацію '$legacyName'" `
                 -Meaning 'Версія 5.3 не читає і не виконує BRAVO.config. Поки site-значення не перенесено в BRAVO.local.config, оновлення чи відновлення може змінити ефективну конфігурацію.' `
                 -Action "Виконайте операторську міграцію Configuration v2 за $script:BRAVOPreflightMigrationRunbook, потім повторіть перевірку. Installer файл не змінює і не видаляє." `
@@ -785,38 +697,27 @@ function Test-BRAVODeploymentPreflight {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OperationLock' -Severity 'NotApplicable' `
             -Title 'Operation lock тримає поточний процес' -Meaning 'Повторний preflight виконується під власним lock.'
     } else {
-        $unknownSeverity = 'Warning'
-        if ($isAdmin) { $unknownSeverity = 'Blocker' }
-
-        $lifecyclePeek = Get-BRAVOUpdateLockPeek -Path $lifecycleLockPath
-        if ($null -eq $lifecyclePeek.Held) {
-            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.LifecycleLock' -Severity $unknownSeverity `
-                -Title 'Не вдалося перевірити lock оновлення' `
-                -Meaning 'Стан lock-файлу не доведено, тому безпечно продовжувати не можна.' `
-                -Action 'Повторіть перевірку від імені адміністратора.' -Details $lifecyclePeek.Problem -ExitCodeHint 20
-        } elseif ($lifecyclePeek.Held) {
+        # Канонічна проба Lock-частини (fail closed: будь-яка непередбачена
+        # помилка відкриття дає Active = $true, тобто Blocker).
+        $lifecycleProbe = Test-BRAVOUpdateOperationLockActive -OperationLockPath $lifecycleLockPath
+        if ($lifecycleProbe.Active) {
             Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.LifecycleLock' -Severity 'Blocker' `
                 -Title 'Інша операція Installer уже виконується' `
                 -Meaning 'Одночасно може працювати лише одна операція встановлення/оновлення.' `
                 -Action 'Дочекайтеся завершення поточної операції й повторіть перевірку. Процес не завершуйте примусово.' `
-                -Details "lock=$lifecycleLockPath; $($lifecyclePeek.Holder)" -ExitCodeHint 20
+                -Details "lock=$lifecycleLockPath; $(Format-BRAVOPreflightLockHolder -Holder $lifecycleProbe.Holder)" -ExitCodeHint 20
         } else {
             Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.LifecycleLock' -Severity 'Ok' `
                 -Title 'Lock оновлення вільний' -Meaning 'Інша операція Installer не виконується.'
         }
 
-        $operationPeek = Get-BRAVOUpdateLockPeek -Path $OperationLockPath
-        if ($null -eq $operationPeek.Held) {
-            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OperationLock' -Severity $unknownSeverity `
-                -Title 'Не вдалося перевірити lock операцій BRAVO' `
-                -Meaning 'Не доведено, що архівація чи обслуговування не виконуються.' `
-                -Action 'Повторіть перевірку від імені адміністратора.' -Details $operationPeek.Problem -ExitCodeHint 20
-        } elseif ($operationPeek.Held) {
+        $operationProbe = Test-BRAVOUpdateOperationLockActive -OperationLockPath $OperationLockPath
+        if ($operationProbe.Active) {
             Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OperationLock' -Severity 'Blocker' `
                 -Title 'Виконується операція BRAVO (архівація або обслуговування)' `
                 -Meaning 'Зміна файлів посеред архівації чи обслуговування може пошкодити їхній результат.' `
                 -Action 'Дочекайтеся завершення операції й повторіть перевірку. Процес не завершуйте примусово.' `
-                -Details "lock=$OperationLockPath; $($operationPeek.Holder)" -ExitCodeHint 20
+                -Details "lock=$OperationLockPath; $(Format-BRAVOPreflightLockHolder -Holder $operationProbe.Holder)" -ExitCodeHint 20
         } else {
             Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OperationLock' -Severity 'Ok' `
                 -Title 'Архівація та обслуговування не виконуються' -Meaning 'Lock операцій BRAVO вільний.'
@@ -862,17 +763,18 @@ function Test-BRAVODeploymentPreflight {
     if ($AllowOpenJournal) {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OpenJournal' -Severity 'NotApplicable' `
             -Title 'Відкритий журнал не блокує відновлення' -Meaning 'Режим recovery саме обробляє незавершену операцію.'
-    } elseif ($null -eq (Get-Command -Name 'Get-BRAVOUpdateOpenJournal' -CommandType Function -ErrorAction SilentlyContinue)) {
-        Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OpenJournal' -Severity 'Blocker' `
-            -Title 'Не вдалося перевірити журнал операцій' -Meaning 'Модуль журналу недоступний, тож незавершену операцію не виключено.' `
-            -Action 'Перевстановіть комплект або зверніться до підтримки.' -Details 'Get-BRAVOUpdateOpenJournal недоступна'
     } else {
         try {
+            # Канонічний Get-BRAVOUpdateOpenJournal: Open АБО пошкоджені журнали
+            # (пошкоджений = Blocker, fail closed).
             $openJournals = @(Get-BRAVOUpdateOpenJournal -StateRoot $StateRoot | Where-Object { $null -ne $_ })
             if ($openJournals.Count -gt 0) {
                 $journalIds = New-Object System.Collections.Generic.List[string]
                 foreach ($journal in $openJournals) {
-                    [void]$journalIds.Add([string](Get-BRAVOPreflightProperty -InputObject $journal -Name 'operationId' -Default '?'))
+                    $journalId = [string](Get-BRAVOPreflightProperty -InputObject $journal -Name 'OperationId' -Default '')
+                    if ([string]::IsNullOrEmpty($journalId)) { $journalId = '?' }
+                    if ([bool](Get-BRAVOPreflightProperty -InputObject $journal -Name 'IsCorrupt' -Default $false)) { $journalId = 'corrupt:' + $journalId }
+                    [void]$journalIds.Add($journalId)
                 }
                 Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OpenJournal' -Severity 'Blocker' `
                     -Title 'Є незавершена операція оновлення' `
@@ -891,7 +793,6 @@ function Test-BRAVODeploymentPreflight {
                 -Details $_.Exception.Message
         }
     }
-
     # ---- Ціль розгортання (Install/Update/Repair) ------------------------
     $targetMarkers = New-Object System.Collections.Generic.List[string]
     $targetExists = [System.IO.Directory]::Exists($RuntimeRoot)

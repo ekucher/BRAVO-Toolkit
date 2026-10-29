@@ -5,6 +5,9 @@
 # Побудова команд — чисті функції (тестуються без процесів); запуск — тонкий.
 # Секретів у аргументах немає за конструкцією: жоден параметр їх не приймає.
 
+# Корінь комплекту: <toolkit>\modules\BRAVO.Installer.UI\<ця частина>.
+$script:BRAVOInstallerToolkitRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
 function ConvertTo-BRAVOInstallerQuotedArgument {
     # Один аргумент командного рядка Windows. Шлях з пробілами/кирилицею
     # береться в лапки; лапка всередині недопустима (fail closed — нема
@@ -185,7 +188,8 @@ function Start-BRAVOInstallerEngineJob {
         $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
         $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
         $process = [System.Diagnostics.Process]::Start($psi)
-        # stdin не перенаправляємо (governance); -NonInteractive не дає engine чекати на запит.
+        # stdin не перенаправляємо (governance: лише через BomFree-helper); engine
+        # запускається з -NonInteractive, тож на запиті зависнути не може.
         [pscustomobject]@{
             Action       = $Action
             Process      = $process
@@ -260,33 +264,14 @@ function Get-BRAVOInstallerEngineJobStatus {
 function Read-BRAVOInstallerProgress {
     <#
     .SYNOPSIS
-        Читає progress.jsonl (лише читання). Основний шлях — канонічний
-        Read-BRAVOUpdateProgressEvents з BRAVO.Update, якщо модуль завантажено;
-        інакше — мінімальний толерантний data-only розбір JSONL (без політики).
+        Читає progress.jsonl (лише читання) ЛИШЕ канонічним
+        Read-BRAVOUpdateProgressEvents з BRAVO.Update через read-only міст
+        Invoke-BRAVOInstallerUpdateRead (WizardEngine). Власного запасного
+        читача JSONL немає: недоступний модуль engine = виняток (fail closed).
+        Нечитабельні/«рвані» рядки пропускає сам канонічний читач.
     #>
     [CmdletBinding()]
-    param([AllowNull()][string]$Path, [string]$ToolkitRoot = '')
+    param([AllowNull()][string]$Path, [string]$ToolkitRoot = $script:BRAVOInstallerToolkitRoot)
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-    # Канонічний читач engine (через read-only міст); недоступний модуль або
-    # будь-яка помилка = толерантний data-only розбір нижче.
-    if (-not [string]::IsNullOrWhiteSpace($ToolkitRoot) -and ($null -ne (Get-BRAVOInstallerUpdateModule -ToolkitRoot $ToolkitRoot))) {
-        try { return @(Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $ToolkitRoot -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $Path }) } catch { $null = $_ }
-    }
-    $events = @()
-    $stream = $null
-    $reader = $null
-    try {
-        # Engine пише в цей файл паралельно: відкриваємо з FileShare.ReadWrite.
-        $stream = New-Object System.IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
-        $reader = New-Object System.IO.StreamReader($stream, [Text.Encoding]::UTF8)
-        while ($null -ne ($line = $reader.ReadLine())) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            try { $events += ($line | ConvertFrom-Json) } catch { $null = $_ }   # частково записаний останній рядок ігноруємо
-        }
-    } catch {
-        return @()
-    } finally {
-        if ($null -ne $reader) { $reader.Dispose() } elseif ($null -ne $stream) { $stream.Dispose() }
-    }
-    @($events)
+    return @(Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $ToolkitRoot -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $Path })
 }

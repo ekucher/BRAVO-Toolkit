@@ -12,52 +12,6 @@
         Import-Module (Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.psm1') -Force -DisableNameChecking
         $pfTModule = Get-Module BRAVO.Update
 
-        # --- TEST SHIM: W1-функції (контракти), якщо ще не інтегровані. ----
-        # Лише в тестовому harness-і; production-файл їх не дублює.
-        & $pfTModule {
-            if ($null -eq (Get-Command -Name New-BRAVOUpdateFinding -CommandType Function -ErrorAction SilentlyContinue)) {
-                function script:New-BRAVOUpdateFinding {
-                    param([string]$Id, [string]$Severity, [string]$Title, [string]$Meaning, [string]$Action, [string]$Details, $ExitCodeHint)
-                    [pscustomobject]@{ schemaVersion = 1; id = $Id; severity = $Severity; title = $Title; meaning = $Meaning
-                        action = $Action; details = $Details; exitCodeHint = $ExitCodeHint }
-                }
-                function script:Get-BRAVOUpdateCanonicalJson {
-                    param($InputObject)
-                    ConvertTo-Json -InputObject $InputObject -Depth 10 -Compress
-                }
-                function script:Get-BRAVOUpdateSha256Text {
-                    param([string]$Text)
-                    $sha = [System.Security.Cryptography.SHA256]::Create()
-                    try {
-                        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text))
-                    } finally { $sha.Dispose() }
-                    ([System.BitConverter]::ToString($bytes)).Replace('-', '')
-                }
-                function script:New-BRAVOUpdatePreflightResult {
-                    param([string]$Operation, [string]$RuntimeRoot, $Findings, [string]$Fingerprint)
-                    $blockers = 0; $warnings = 0
-                    foreach ($f in $Findings) {
-                        if ($f.severity -eq 'Blocker') { $blockers++ }
-                        if ($f.severity -eq 'Warning') { $warnings++ }
-                    }
-                    [pscustomobject]@{ schemaVersion = 1; generatedUtc = (Get-Date).ToUniversalTime().ToString('o')
-                        operation = $Operation; runtimeRoot = $RuntimeRoot; findings = $Findings
-                        canProceed = ($blockers -eq 0); blockerCount = $blockers; warningCount = $warnings; fingerprint = $Fingerprint }
-                }
-            }
-            if ($null -eq (Get-Command -Name Get-BRAVOUpdateOpenJournal -CommandType Function -ErrorAction SilentlyContinue)) {
-                function script:Get-BRAVOUpdateOpenJournal {
-                    param([string]$StateRoot)
-                    $dir = Join-Path $StateRoot 'Journal'
-                    if (-not (Test-Path -LiteralPath $dir)) { return }
-                    foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.json' -File) {
-                        $j = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json
-                        if ($j.state -eq 'Open') { $j }
-                    }
-                }
-            }
-        }
-
         $pfTBase = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_UPDATE_SELF_TEST_PREFLIGHT_' + [guid]::NewGuid().ToString('N'))
         $pfTSite = Join-Path $pfTBase 'Сервер BRAVO тест'
         [void](New-Item -ItemType Directory -Path $pfTSite -Force)
@@ -102,9 +56,9 @@
             param([string]$Dir)
             $lines = New-Object System.Collections.Generic.List[string]
             foreach ($f in (Get-ChildItem -LiteralPath $Dir -Recurse -Force)) {
-                $h = ''
-                if (-not $f.PSIsContainer) { $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash }
-                [void]$lines.Add("$($f.FullName)|$($f.Length)|$h")
+                $h = ''; $len = 0
+                if (-not $f.PSIsContainer) { $h = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash; $len = $f.Length }
+                [void]$lines.Add("$($f.FullName)|$len|$h")
             }
             ($lines.ToArray() | Sort-Object) -join "`n"
         }
@@ -309,19 +263,21 @@
         & {
             $journalDir = Join-Path $st 'Journal'
             [void](New-Item -ItemType Directory -Path $journalDir -Force)
-            $jPath = Join-Path $journalDir 'aaaaaaaa-0000-4000-8000-000000000001.json'
-            [System.IO.File]::WriteAllText($jPath, '{"schemaVersion":1,"operationId":"aaaaaaaa-0000-4000-8000-000000000001","state":"Open","mutationStarted":false}')
+            # Валідні журнали створюють канонічні конструктори Journal (форма контракту).
+            $journal = & $pfTModule { param($s, $r) New-BRAVOUpdateJournal -StateRoot $s -Action 'Update' -RuntimeRoot $r } $st $rt
+            $jPath = Join-Path $journalDir ($journal.operationId + '.json')
             $r = & $call $null
             $f = & $find $r 'Preflight.OpenJournal'
-            Test-BRAVOCondition -Condition ($f.severity -eq 'Blocker' -and $f.details -like '*aaaaaaaa-0000*') -Name 'UpdatePreflight/OpenJournalBlocks' -Failure 'Відкритий журнал має блокувати'
+            Test-BRAVOCondition -Condition ($f.severity -eq 'Blocker' -and $f.details -like ('*' + $journal.operationId + '*')) -Name 'UpdatePreflight/OpenJournalBlocks' -Failure 'Відкритий журнал має блокувати'
             $r = & $call @{ AllowOpenJournal = $true }
             Test-BRAVOCondition -Condition ((& $find $r 'Preflight.OpenJournal').severity -eq 'NotApplicable') -Name 'UpdatePreflight/RecoveryAllowsOpenJournal' -Failure 'Recovery не блокується журналом'
-            [System.IO.File]::WriteAllText($jPath, '{"schemaVersion":1,"operationId":"aaaaaaaa-0000-4000-8000-000000000001","state":"Committed"}')
+            [void](& $pfTModule { param($j, $s) Set-BRAVOUpdateJournalState -Journal $j -State 'Committed' -StateRoot $s } $journal $st)
             $r = & $call $null
             Test-BRAVOCondition -Condition ((& $find $r 'Preflight.OpenJournal').severity -eq 'Ok') -Name 'UpdatePreflight/CommittedJournalOk' -Failure 'Committed журнал не блокує'
             [System.IO.File]::WriteAllText($jPath, '{ це не json')
             $r = & $call $null
-            Test-BRAVOCondition -Condition ((& $find $r 'Preflight.OpenJournal').severity -eq 'Blocker') -Name 'UpdatePreflight/CorruptJournalBlocks' -Failure 'Пошкоджений журнал — fail closed'
+            $f = & $find $r 'Preflight.OpenJournal'
+            Test-BRAVOCondition -Condition ($f.severity -eq 'Blocker' -and $f.details -like '*corrupt:*') -Name 'UpdatePreflight/CorruptJournalBlocks' -Failure 'Пошкоджений журнал — fail closed'
             Remove-Item -LiteralPath $jPath -Force
             $r = & $call $null
             Test-BRAVOCondition -Condition ((& $find $r 'Preflight.OpenJournal').severity -eq 'Ok') -Name 'UpdatePreflight/NoJournalOk' -Failure 'Без журналів має бути Ok'

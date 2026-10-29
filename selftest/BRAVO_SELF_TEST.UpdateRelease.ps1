@@ -204,7 +204,7 @@ try {
         $r = Test-BRAVOReleaseArtifact -ZipPath $fxRc.Zip -ChecksumPath $fxRc.Sha -ManifestPath $fxRc.Manifest -ExpectedTag 'v5.3.0-rc.1'
         Test-BRAVOCondition -Condition (-not $r.IsValid -and (Get-RelBlockerIds $r) -contains 'Release.Channel' -and (Get-RelBlockerIds $r) -contains 'Release.PrereleaseTag') -Name 'UpdateRelease/Prerelease-NoAuthorization' -Failure 'Prerelease без дозволу — Blocker.'
         $r = Test-BRAVOReleaseArtifact -ZipPath $fxRc.Zip -ChecksumPath $fxRc.Sha -ManifestPath $fxRc.Manifest -ExpectedTag 'v5.3.0-rc.1' -AllowPrerelease
-        Test-BRAVOCondition -Condition ($r.IsValid -and $r.Severity -eq 'Warning' -and (Get-RelBlockerIds $r).Count -eq 0) -Name 'UpdateRelease/Prerelease-Authorized' -Failure 'Prerelease з дозволом — Warning без Blocker.'
+        Test-BRAVOCondition -Condition ($r.IsValid -and $r.Severity -eq 'Warning' -and @(Get-RelBlockerIds $r).Count -eq 0) -Name 'UpdateRelease/Prerelease-Authorized' -Failure 'Prerelease з дозволом — Warning без Blocker.'
 
         $r = Test-BRAVOReleaseArtifact -ZipPath $fxStable.Zip -ChecksumPath $fxStable.Sha -ManifestPath $fxStable.Manifest -ExpectedTag 'v5.4.0'
         Test-BRAVOCondition -Condition (-not $r.IsValid -and (Get-RelBlockerIds $r) -contains 'Release.VersionTag') -Name 'UpdateRelease/WrongTag' -Failure 'Тег, що не відповідає VERSION.json, — Blocker.'
@@ -314,7 +314,7 @@ try {
         # --- Test-BRAVOStagedRuntime ----------------------------------------------
         $fxS = New-RelFixture -Base (New-RelCaseDir)
         $s = Test-BRAVOStagedRuntime -StagedRoot $fxS.Stage -ExpectedVersion '5.3.0'
-        Test-BRAVOCondition -Condition ($s.IsValid -and (Get-RelBlockerIds $s).Count -eq 0) -Name 'UpdateRelease/Staged-Valid' -Failure ('Валідний staged-комплект: {0}' -f ((Get-RelBlockerIds $s) -join ','))
+        Test-BRAVOCondition -Condition ($s.IsValid -and @(Get-RelBlockerIds $s).Count -eq 0) -Name 'UpdateRelease/Staged-Valid' -Failure ('Валідний staged-комплект: {0}' -f ((Get-RelBlockerIds $s) -join ','))
         $s = Test-BRAVOStagedRuntime -StagedRoot $fxS.Stage -ExpectedVersion '5.4.0'
         Test-BRAVOCondition -Condition (-not $s.IsValid -and (Get-RelBlockerIds $s) -contains 'Staged.VersionMismatch') -Name 'UpdateRelease/Staged-VersionMismatch' -Failure 'Версія staged має збігатись.'
         $s = Test-BRAVOStagedRuntime -StagedRoot (Join-Path $fxS.Base 'absent') -ExpectedVersion '5.3.0'

@@ -45,7 +45,7 @@ try {
                 Expected      = (Join-Path $root1 'y')
             }
         } $updSandbox
-        Test-BRAVOCondition -Condition ($facts.PathKeys -eq 'BackupRoot,LockRoot,OperationLockPath,RuntimeRoot,StagingRoot,StateRoot') -Name 'UpdateContracts/DefaultPathsShape' -Failure 'Get-BRAVOUpdateDefaultPaths має повертати рівно 6 полів контракту'
+        Test-BRAVOCondition -Condition ($facts.PathKeys -eq 'BackupRoot,LockRoot,OperationLockPath,RuntimeRoot,StagingRoot,StateRoot,VersionStatePath') -Name 'UpdateContracts/DefaultPathsShape' -Failure 'Get-BRAVOUpdateDefaultPaths має повертати рівно 7 полів контракту (разом із VersionStatePath)'
         Test-BRAVOCondition -Condition ($facts.StateTail -and $facts.LockTail -and $facts.RuntimeTail) -Name 'UpdateContracts/DefaultPathsValues' -Failure 'default-шляхи мають відповідати CONTRACTS §1'
         Test-BRAVOCondition -Condition (($facts.MissingKeys -eq 0) -and ($facts.NotBlocks -eq 0) -and $facts.ExtraKeys) -Name 'UpdateContracts/AdapterShape' -Failure 'adapter має містити рівно 9 ключів-scriptblock'
         Test-BRAVOCondition -Condition ($facts.NowKind -eq 'DateTime') -Name 'UpdateContracts/AdapterNow' -Failure 'adapter.Now має повертати DateTime'
@@ -415,7 +415,45 @@ try {
         Test-BRAVOCondition -Condition (($facts.AtomicText -eq 'друга версія') -and (-not $facts.AtomicBom) -and ($facts.AtomicLeft -eq 0)) -Name 'UpdateContracts/AtomicWriteReplacesExisting' -Failure 'атомарний запис поверх наявного: нова версія, без BOM, без .tmp/.bak'
         Test-BRAVOCondition -Condition ($facts.AtomicFailThrows) -Name 'UpdateContracts/AtomicWriteFailureThrows' -Failure 'збій запису має кидати виняток, а не мовчати'
     }
-} finally {
+
+    # ===== Trusted guard loader (єдиний канонічний, Paths) =====
+    & {
+        $bad = Join-Path $updSandbox 'guard-bad'
+        [void][IO.Directory]::CreateDirectory($bad)
+        $syntaxBad = Join-Path $bad 'syntax.ps1'
+        [IO.File]::WriteAllText($syntaxBad, "function ConvertTo-BRAVOComparableVersion { param( `n", (New-Object Text.UTF8Encoding $true))
+        $missingFn = Join-Path $bad 'missing.ps1'
+        [IO.File]::WriteAllText($missingFn, "function Get-BRAVORuntimeFileHash { }`n", (New-Object Text.UTF8Encoding $true))
+        $facts = & $updModule {
+            param($syntaxBad, $missingFn, $nowhere)
+            $f = @{}
+            Import-BRAVOUpdateTrustedGuardFunctions -Force
+            $names = @('Get-BRAVORuntimeFileHash', 'Test-BRAVORuntimeManifestIntegrity', 'ConvertTo-BRAVOComparableVersion', 'Compare-BRAVOComparableVersion')
+            $f.AllDefined = (@($names | Where-Object { $null -ne (Get-Command -Name $_ -CommandType Function -ErrorAction SilentlyContinue) }).Count -eq 4)
+            $f.OwnedByModule = (@($names | Where-Object { (Get-Command -Name $_ -CommandType Function).ModuleName -eq 'BRAVO.Update' }).Count -eq 4)
+            $left = ConvertTo-BRAVOComparableVersion -Text '5.2.6'
+            $right = ConvertTo-BRAVOComparableVersion -Text '5.3.0'
+            $f.Compare = [int](Compare-BRAVOComparableVersion -Left $left -Right $right)
+            $f.GuardParamNotLeaked = ($null -eq (Get-Variable -Name 'ManifestContent' -ErrorAction SilentlyContinue))
+            Import-BRAVOUpdateTrustedGuardFunctions
+            $f.IdempotentNoThrow = $true
+            # Повторний виклик без -Force не читає файл: неіснуючий шлях ігнорується, функції лишаються.
+            Import-BRAVOUpdateTrustedGuardFunctions -GuardPath $nowhere
+            $f.IdempotentSkipsRead = $true
+            $f.MissingThrows = $false
+            try { Import-BRAVOUpdateTrustedGuardFunctions -Force -GuardPath $nowhere } catch { $f.MissingThrows = $true }
+            $f.SyntaxThrows = $false
+            try { Import-BRAVOUpdateTrustedGuardFunctions -Force -GuardPath $syntaxBad } catch { $f.SyntaxThrows = $true }
+            $f.MissingFunctionThrows = $false
+            try { Import-BRAVOUpdateTrustedGuardFunctions -Force -GuardPath $missingFn } catch { $f.MissingFunctionThrows = $true }
+            # Невдале перезавантаження не руйнує вже завантажені довірені функції.
+            $f.StillWorksAfterFailures = ([int](Compare-BRAVOComparableVersion -Left $left -Right $right) -eq -1)
+            $f
+        } $syntaxBad $missingFn (Join-Path $bad 'nowhere.ps1')
+        Test-BRAVOCondition -Condition ($facts.AllDefined -and $facts.OwnedByModule -and $facts.Compare -eq -1 -and $facts.GuardParamNotLeaked) -Name 'UpdateContracts/TrustedGuardLoaderDefinesFunctions' -Failure ($facts | Out-String)
+        Test-BRAVOCondition -Condition ($facts.IdempotentNoThrow -and $facts.IdempotentSkipsRead -and $facts.StillWorksAfterFailures) -Name 'UpdateContracts/TrustedGuardLoaderIdempotent' -Failure ($facts | Out-String)
+        Test-BRAVOCondition -Condition ($facts.MissingThrows -and $facts.SyntaxThrows -and $facts.MissingFunctionThrows) -Name 'UpdateContracts/TrustedGuardLoaderFailsClosed' -Failure 'відсутній/пошкоджений/неповний guard має кидати виняток'
+    }} finally {
     # Видаляємо лише каталог, створений цим фрагментом, перевіривши префікс.
     $updTempPrefix = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_UPDATE_SELF_TEST_'
     if ($updTempBase.StartsWith($updTempPrefix, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $updTempBase)) {

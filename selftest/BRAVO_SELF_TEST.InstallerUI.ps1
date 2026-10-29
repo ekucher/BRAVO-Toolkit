@@ -166,6 +166,29 @@
         }
     }
 
+    # --- Прогрес: лише канонічний читач BRAVO.Update (через read-only міст), без власного запасного ---
+    & {
+        $tmpP = Join-Path ([IO.Path]::GetTempPath()) ('INSTALLERUI_TEST_' + [guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Path $tmpP -Force)
+        try {
+            $jsonlP = Join-Path $tmpP 'progress.jsonl'
+            [IO.File]::WriteAllText($jsonlP, ('{"sequence":1,"phase":"Preflight","status":"Started","percent":null,"message":"a"}' + "`n" + '{"sequence":2,"phase":"Stage","status":"Running","percent":40,"message":"b"}' + "`n"), (New-Object Text.UTF8Encoding $false))
+            $viaUi = @(Read-BRAVOInstallerProgress -Path $jsonlP -ToolkitRoot $root)
+            $direct = @(& (Get-Module BRAVO.Installer.UI) { param($r, $x) Invoke-BRAVOInstallerUpdateRead -ToolkitRoot $r -Name 'Read-BRAVOUpdateProgressEvents' -Argument @{ Path = $x } } $root $jsonlP)
+            Test-BRAVOCondition -Condition ($viaUi.Count -eq 2 -and $viaUi.Count -eq $direct.Count -and [long]$viaUi[1].sequence -eq 2) `
+                -Name 'InstallerUI/Progress/UsesCanonicalReader' -Failure "UI=$($viaUi.Count) canonical=$($direct.Count)"
+            $hasOwnReader = ((Get-Content -LiteralPath (Join-Path $root 'modules\BRAVO.Installer.UI\BRAVO.Installer.UI.Engine.ps1') -Raw) -match 'StreamReader')
+            Test-BRAVOCondition -Condition (-not $hasOwnReader) -Name 'InstallerUI/Progress/NoOwnJsonlReader' -Failure 'у Engine-частині UI лишився власний читач JSONL'
+            # Fail closed: корінь без BRAVO.Update — виняток, а не мовчазний fallback на власний розбір.
+            $thrown = $false
+            try { [void](Read-BRAVOInstallerProgress -Path $jsonlP -ToolkitRoot $tmpP) } catch { $thrown = $true }
+            Test-BRAVOCondition -Condition $thrown -Name 'InstallerUI/Progress/FailsClosedWithoutUpdateModule' -Failure 'відсутній BRAVO.Update має давати виняток'
+        } finally {
+            if ($tmpP.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $tmpP -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
     # --- Головна форма без ShowDialog ---
     $formResult = $null
     $formError = ''
