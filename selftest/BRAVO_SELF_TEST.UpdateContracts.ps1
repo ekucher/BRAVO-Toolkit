@@ -434,7 +434,9 @@ try {
             $left = ConvertTo-BRAVOComparableVersion -Text '5.2.6'
             $right = ConvertTo-BRAVOComparableVersion -Text '5.3.0'
             $f.Compare = [int](Compare-BRAVOComparableVersion -Left $left -Right $right)
-            $f.GuardParamNotLeaked = ($null -eq (Get-Variable -Name 'ManifestContent' -ErrorAction SilentlyContinue))
+            # Лише область модуля (-Scope Script): повний прогін BRAVO_SELF_TEST.ps1 dot-source-ить
+            # guard у глобальну область, і його параметр $ManifestContent лишається там легітимно.
+            $f.GuardParamNotLeaked = ($null -eq (Get-Variable -Name 'ManifestContent' -Scope Script -ErrorAction SilentlyContinue))
             Import-BRAVOUpdateTrustedGuardFunctions
             $f.IdempotentNoThrow = $true
             # Повторний виклик без -Force не читає файл: неіснуючий шлях ігнорується, функції лишаються.
