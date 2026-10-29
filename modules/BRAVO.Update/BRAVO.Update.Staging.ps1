@@ -46,6 +46,34 @@ function Test-BRAVOUpdatePathHasReparsePoint {
     }
 }
 
+function Get-BRAVOUpdateDirectoryAclProblem {
+    # Проблеми приватності каталогу (порожній масив = приватний): DACL
+    # захищений; власник і КОЖЕН ACE (Allow чи Deny) належать лише довіреним
+    # SID: BUILTIN\Administrators, NT AUTHORITY\SYSTEM, поточний користувач;
+    # успадкованих правил немає. Помилка читання -> проблема (fail closed).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $problems = @()
+    try {
+        $trusted = @('S-1-5-32-544', 'S-1-5-18', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        $acl = Get-Acl -LiteralPath $Path
+        if (-not $acl.AreAccessRulesProtected) { $problems += 'успадкування прав не вимкнено' }
+        $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($trusted -notcontains $ownerSid) { $problems += ('власник ' + $ownerSid + ' не з довіреного списку') }
+        foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+            $ruleSid = [string]$rule.IdentityReference.Value
+            if ($rule.IsInherited) { $problems += ('успадковане правило ' + $ruleSid) }
+            if ($trusted -notcontains $ruleSid) {
+                $problems += ('ACE для недовіреного ' + $ruleSid + ' (' + [string]$rule.FileSystemRights + ')')
+            }
+        }
+    } catch {
+        $problems += ('ACL не прочитано: ' + $_.Exception.Message)
+    }
+    return @($problems)
+}
+
 function New-BRAVOUpdatePrivateDirectory {
     # Створює каталог із захищеним DACL (патерн
     # deploy\Install-BRAVOServer.ps1 New-BRAVOInstallPrivateDirectory, який
@@ -118,6 +146,8 @@ function New-BRAVOUpdatePrivateDirectory {
 
         $actual = Get-Acl -LiteralPath $fullPath
         if (-not $actual.AreAccessRulesProtected) { $problems += 'успадкування прав не вимкнено' }
+        $ownerValue = [string]$actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($allowedValues -notcontains $ownerValue) { $problems += ('власник ' + $ownerValue + ' не з довіреного списку') }
         $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
         foreach ($rule in $rules) {
             $ruleSid = [string]$rule.IdentityReference.Value
@@ -200,16 +230,17 @@ function ConvertTo-BRAVOUpdateZipEntryPathProblem {
     return @($problems)
 }
 
-function Test-BRAVOUpdateZipEntries {
-    # Перевіряє ZIP, нічого не розпаковуючи: архів відкривається лише на
-    # читання (ZipFile.OpenRead). Повертає { IsValid; Problems[]; Entries[]
+function Test-BRAVOUpdateZipArchiveObject {
+    # Перевіряє вже відкритий ZipArchive (щоб Expand перевіряв і розпаковував
+    # ТОЙ САМИЙ handle: інакше між перевіркою і розпакуванням файл можна
+    # підмінити — TOCTOU). Повертає { IsValid; Problems[]; Entries[]
     # {FullName; Length}; TotalUncompressedBytes }. Будь-яка помилка читання
     # архіва -> IsValid=$false (fail closed). Ліміти: розмір, кількість,
     # коефіцієнт стиснення (zip-bomb). Length у заголовку може брехати —
     # Expand-BRAVOUpdateArchiveSafe додатково обмежує фактично записане.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [Parameter(Mandatory = $true)][System.IO.Compression.ZipArchive]$Archive,
         [long]$MaxTotalBytes = 2147483648,
         [int]$MaxEntries = 20000,
         [long]$RatioCheckMinBytes = 10485760,
@@ -219,13 +250,9 @@ function Test-BRAVOUpdateZipEntries {
     $problems = New-Object System.Collections.Generic.List[string]
     $entries = New-Object System.Collections.Generic.List[object]
     $totalBytes = [long]0
-    $archive = $null
     try {
-        if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw ('ZIP не знайдено: ' + $ZipPath) }
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
         $zipEntries = New-Object System.Collections.Generic.List[object]
-        foreach ($archiveEntry in $archive.Entries) { $zipEntries.Add($archiveEntry) }
+        foreach ($archiveEntry in $Archive.Entries) { $zipEntries.Add($archiveEntry) }
         if ($zipEntries.Count -gt $MaxEntries) {
             $problems.Add('забагато entry: ' + $zipEntries.Count + ' (ліміт ' + $MaxEntries + ')')
         } else {
@@ -258,14 +285,46 @@ function Test-BRAVOUpdateZipEntries {
         }
     } catch {
         $problems.Add('ZIP не вдалося прочитати: ' + $_.Exception.Message)
-    } finally {
-        if ($null -ne $archive) { $archive.Dispose() }
     }
     return [pscustomobject]@{
         IsValid                 = ($problems.Count -eq 0)
         Problems                = $problems.ToArray()
         Entries                 = $entries.ToArray()
         TotalUncompressedBytes  = $totalBytes
+    }
+}
+
+function Test-BRAVOUpdateZipEntries {
+    # Перевіряє ZIP за шляхом, нічого не розпаковуючи: файл відкривається
+    # один раз із FileShare.Read (ніхто не може записати/видалити/підмінити
+    # його, поки йде перевірка). Ліміти й правила імен — у
+    # Test-BRAVOUpdateZipArchiveObject. Будь-яка помилка -> IsValid=$false.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ZipPath,
+        [long]$MaxTotalBytes = 2147483648,
+        [int]$MaxEntries = 20000,
+        [long]$RatioCheckMinBytes = 10485760,
+        [int]$MaxCompressionRatio = 200
+    )
+
+    $zipStream = $null
+    $archive = $null
+    try {
+        Add-Type -AssemblyName System.IO.Compression
+        $zipStream = New-Object System.IO.FileStream($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $archive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+        return (Test-BRAVOUpdateZipArchiveObject -Archive $archive -MaxTotalBytes $MaxTotalBytes -MaxEntries $MaxEntries -RatioCheckMinBytes $RatioCheckMinBytes -MaxCompressionRatio $MaxCompressionRatio)
+    } catch {
+        return [pscustomobject]@{
+            IsValid                = $false
+            Problems               = @('ZIP не вдалося прочитати: ' + $_.Exception.Message)
+            Entries                = @()
+            TotalUncompressedBytes = [long]0
+        }
+    } finally {
+        if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $zipStream) { $zipStream.Dispose() }
     }
 }
 
@@ -306,17 +365,29 @@ function Expand-BRAVOUpdateArchiveSafe {
     $createdFiles = New-Object System.Collections.Generic.List[string]
     $createdDirectories = New-Object System.Collections.Generic.List[string]
     $archive = $null
+    $zipStream = $null
     $rootFull = $DestinationRoot
     $fileCount = 0
     try {
+        # ZIP відкривається ОДИН раз із FileShare.Read (без write/delete): цей
+        # handle живе крізь SHA256, перевірку entries і розпакування над тим
+        # самим потоком — підміна файла між кроками неможлива (TOCTOU).
+        Add-Type -AssemblyName System.IO.Compression
+        $zipStream = New-Object System.IO.FileStream($ZipPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
         if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
-            if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw ('ZIP не знайдено: ' + $ZipPath) }
-            $actualHash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash
+            $hasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $actualHash = ([System.BitConverter]::ToString($hasher.ComputeHash($zipStream))).Replace('-', '')
+            } finally {
+                $hasher.Dispose()
+            }
+            $zipStream.Position = 0
             if (-not [string]::Equals($actualHash, $ExpectedSha256.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw ('SHA256 архіва не збігається з очікуваним (' + $actualHash + ').')
             }
         }
-        $validation = Test-BRAVOUpdateZipEntries -ZipPath $ZipPath -MaxTotalBytes $MaxTotalBytes -MaxEntries $MaxEntries
+        $archive = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Read, $true)
+        $validation = Test-BRAVOUpdateZipArchiveObject -Archive $archive -MaxTotalBytes $MaxTotalBytes -MaxEntries $MaxEntries
         if (-not $validation.IsValid) {
             return [pscustomobject]@{ Success = $false; Problems = @($validation.Problems); FileCount = 0; Root = $DestinationRoot }
         }
@@ -325,11 +396,13 @@ function Expand-BRAVOUpdateArchiveSafe {
         if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) { throw 'каталог призначення не існує (створіть New-BRAVOUpdatePrivateDirectory).' }
         if (Test-BRAVOUpdatePathHasReparsePoint -Path $rootFull) { throw 'каталог призначення є reparse point або має його серед предків.' }
         if (@(Get-ChildItem -LiteralPath $rootFull -Force).Count -gt 0) { throw 'каталог призначення не порожній.' }
-        if (-not (Get-Acl -LiteralPath $rootFull).AreAccessRulesProtected) { throw 'каталог призначення не приватний (успадкування прав не вимкнено).' }
+        # Захищений DACL сам по собі не доказ приватності (явний ACE для
+        # Users/Everyone на порожньому каталозі проходить): кожен ACE і
+        # власник мають бути лише з довіреного списку.
+        $aclProblems = @(Get-BRAVOUpdateDirectoryAclProblem -Path $rootFull)
+        if ($aclProblems.Count -gt 0) { throw ('каталог призначення не приватний: ' + ($aclProblems -join '; ')) }
         $rootPrefix = $rootFull + '\'
 
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
         foreach ($zipEntry in $archive.Entries) {
             $name = [string]$zipEntry.FullName
             $isDirectory = ($name.EndsWith('/') -or $name.EndsWith('\'))
@@ -351,6 +424,12 @@ function Expand-BRAVOUpdateArchiveSafe {
             foreach ($missingDirectory in $missing) {
                 [void][System.IO.Directory]::CreateDirectory($missingDirectory)
                 $createdDirectories.Add($missingDirectory)
+            }
+            # Інший користувач міг підмінити щойно створений підкаталог на
+            # junction між кроками: перед записом перевіряємо ланцюг від
+            # каталогу entry до кореня (корінь уже перевірено).
+            if (Test-BRAVOUpdatePathHasReparsePoint -Path $directoryToEnsure -StopAt $rootFull) {
+                throw ('entry "' + $name + '": каталог призначення став reparse point.')
             }
             if ($isDirectory) { continue }
 
@@ -379,10 +458,12 @@ function Expand-BRAVOUpdateArchiveSafe {
         return [pscustomobject]@{ Success = $true; Problems = @(); FileCount = $fileCount; Root = $rootFull }
     } catch {
         if ($null -ne $archive) { $archive.Dispose(); $archive = $null }
+        if ($null -ne $zipStream) { $zipStream.Dispose(); $zipStream = $null }
         Remove-BRAVOUpdateCreatedStagingItem -Files $createdFiles.ToArray() -Directories $createdDirectories.ToArray()
         return [pscustomobject]@{ Success = $false; Problems = @('Розпакування скасовано: ' + $_.Exception.Message); FileCount = 0; Root = $rootFull }
     } finally {
         if ($null -ne $archive) { $archive.Dispose() }
+        if ($null -ne $zipStream) { $zipStream.Dispose() }
     }
 }
 

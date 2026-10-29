@@ -203,6 +203,65 @@ try {
         $plainResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $plain
         Test-BRAVOCondition -Condition (-not $plainResult.Success -and @(Get-ChildItem -LiteralPath $plain -Force).Count -eq 0) -Name 'UpdateStaging/ExpandNonPrivateRefused' -Failure 'неприватний каталог має відхилятися'
 
+        # Регресія P1: захищений DACL із явним ACE для Users — не приватний.
+        $leaky = Join-Path $updStagingTempPrefix 'leaky dest'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $leaky)
+        $leakyInfo = New-Object System.IO.DirectoryInfo($leaky)
+        $leakyAcl = $leakyInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+        $usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $leakyAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, [System.Security.AccessControl.FileSystemRights]::Modify, ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit), [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+        $leakyInfo.SetAccessControl($leakyAcl)
+        $aclProblems = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateDirectoryAclProblem -Path $p } $leaky)
+        Test-BRAVOCondition -Condition ((Get-Acl -LiteralPath $leaky).AreAccessRulesProtected -and $aclProblems.Count -gt 0) -Name 'UpdateStaging/AclAllowlistDetectsUsersAce' -Failure 'ACE для Users у захищеному DACL має виявлятися'
+        $leakyResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $leaky
+        Test-BRAVOCondition -Condition (-not $leakyResult.Success -and @(Get-ChildItem -LiteralPath $leaky -Force).Count -eq 0) -Name 'UpdateStaging/ExpandAclViolationRefused' -Failure 'каталог з ACE для Users має відхилятися без файлів'
+        $cleanAcl = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateDirectoryAclProblem -Path $p } $dest2)
+        Test-BRAVOCondition -Condition ($cleanAcl.Count -eq 0) -Name 'UpdateStaging/AclAllowlistAcceptsPrivateDir' -Failure ('приватний каталог не має давати проблем: ' + ($cleanAcl -join '; '))
+
+        # Регресія P1 (TOCTOU): ZIP відкривається з FileShare.Read — поки handle
+        # тримається, запис/видалення/підміна файла неможливі; читач не заважає.
+        $held = Join-Path $updStagingTempPrefix 'held.zip'
+        New-UpdStagingTestZip -Path $held -Items @(@{ Name = 'h.txt'; Text = 'held' })
+        $holdStream = New-Object System.IO.FileStream($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $replaced = $true
+        try { [System.IO.File]::WriteAllText($held, 'replacement') } catch { $replaced = $false }
+        $deleted = $true
+        try { [System.IO.File]::Delete($held) } catch { $deleted = $false }
+        Test-BRAVOCondition -Condition (-not $replaced -and -not $deleted -and (Test-Path -LiteralPath $held)) -Name 'UpdateStaging/ZipHandleBlocksReplaceDelete' -Failure 'файл під handle FileShare.Read не можна підмінити/видалити'
+        $dest4 = Join-Path $updStagingTempPrefix 'dest4'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest4)
+        $withReader = Expand-BRAVOUpdateArchiveSafe -ZipPath $held -DestinationRoot $dest4 -ExpectedSha256 ((Get-FileHash -LiteralPath $held -Algorithm SHA256).Hash)
+        $holdStream.Dispose()
+        Test-BRAVOCondition -Condition ($withReader.Success -and $withReader.FileCount -eq 1) -Name 'UpdateStaging/ExpandWorksWithConcurrentReader' -Failure 'розпакування має працювати, поки інший читач тримає файл'
+        # Файл, відкритий на запис іншим handle, не розпаковується (незмінність не гарантована).
+        $writeStream = New-Object System.IO.FileStream($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $dest5 = Join-Path $updStagingTempPrefix 'dest5'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest5)
+        $withWriter = Expand-BRAVOUpdateArchiveSafe -ZipPath $held -DestinationRoot $dest5
+        $writeStream.Dispose()
+        Test-BRAVOCondition -Condition (-not $withWriter.Success -and @(Get-ChildItem -LiteralPath $dest5 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandRefusesZipOpenForWrite' -Failure 'ZIP, відкритий на запис, має відхилятися'
+
+        # Регресія P1: junction як корінь призначення відхиляється; підкаталог,
+        # підмінений на junction, виявляється ланцюгом -StopAt (його викликає
+        # Expand перед записом у кожен каталог).
+        $jTarget = Join-Path $updStagingTempPrefix 'jt target'
+        $jLink = Join-Path $updStagingTempPrefix 'jt link'
+        [void](New-Item -ItemType Directory -Path $jTarget -Force)
+        $null = & cmd.exe /c mklink /J ('"' + $jLink + '"') ('"' + $jTarget + '"') 2>&1
+        if (Test-Path -LiteralPath $jLink) {
+            $viaLink = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $jLink
+            Test-BRAVOCondition -Condition (-not $viaLink.Success -and @(Get-ChildItem -LiteralPath $jTarget -Force).Count -eq 0) -Name 'UpdateStaging/ExpandJunctionRootRefused' -Failure 'junction як призначення має відхилятися, ціль лишається порожньою'
+            $swapRoot = Join-Path $updStagingTempPrefix 'swap root'
+            [void](New-BRAVOUpdatePrivateDirectory -Path $swapRoot)
+            $swapLink = Join-Path $swapRoot 'sub'
+            $null = & cmd.exe /c mklink /J ('"' + $swapLink + '"') ('"' + $jTarget + '"') 2>&1
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path $swapLink -StopAt $swapRoot) -Name 'UpdateStaging/SwappedSubdirJunctionDetected' -Failure 'підкаталог-junction усередині кореня має виявлятися'
+            [System.IO.Directory]::Delete($swapLink)
+            [System.IO.Directory]::Delete($jLink)
+        } else {
+            Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateStaging/ExpandJunction' -Failure 'junction створити не вдалося'
+        }
+
         # Відсутнє призначення.
         $missingDest = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot (Join-Path $updStagingTempPrefix 'no such dest')
         Test-BRAVOCondition -Condition (-not $missingDest.Success) -Name 'UpdateStaging/ExpandMissingDestRefused' -Failure 'відсутнє призначення має відхилятися'
