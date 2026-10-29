@@ -172,7 +172,7 @@
     $archiveUnguardedStatusCount = 0
     foreach ($archiveRawStatusIndex in $archiveRawStatusIndexes) {
         $archiveGuardIndex = $archiveStatusText.LastIndexOf($archiveSyncBazaGuardText, $archiveRawStatusIndex)
-        if ($archiveGuardIndex -lt 0 -or ($archiveRawStatusIndex - $archiveGuardIndex) -gt 800) {
+        if ($archiveGuardIndex -lt 0 -or ($archiveRawStatusIndex - $archiveGuardIndex) -gt 1500) {
             $archiveUnguardedStatusCount++
         }
     }
@@ -383,32 +383,59 @@
         )
         foreach ($statusEarlyCase in $statusEarlyCases) {
             $statusEarlyResults = @()
-            foreach ($statusEarlyMode in 'valid', 'unwritable', 'undefined') {
+            foreach ($statusEarlyMode in 'valid', 'locked', 'unwritable', 'undefined') {
                 $statusEarlyStateRoot = Join-Path $statusEarlyBehaviorRoot ("{0}-{1}" -f $statusEarlyCase.Label, $statusEarlyMode)
                 $statusEarlyScriptPath = Join-Path $statusEarlyBehaviorRoot ("early-{0}-{1}.ps1" -f $statusEarlyCase.Label, $statusEarlyMode)
+                # ARCH-001: спільний operation lock (файл; Open ReadWrite/FileShare.Read,
+                # як в Enter-*OperationLock). 'locked' — його утримує цей (інший) процес.
+                $statusEarlyLockDirectory = Join-Path $statusEarlyBehaviorRoot ("lock-{0}-{1}" -f $statusEarlyCase.Label, $statusEarlyMode)
+                [void](New-Item -ItemType Directory -Path $statusEarlyLockDirectory -Force)
+                $statusEarlyLockPath = Join-Path $statusEarlyLockDirectory 'BRAVO_OPERATION.lock'
                 $statusEarlyStateLine = switch ($statusEarlyMode) {
                     'valid' { '$stateRoot = ''{0}''' -f $statusEarlyStateRoot }
+                    'locked' { '$stateRoot = ''{0}''' -f $statusEarlyStateRoot }
                     'unwritable' { '$stateRoot = ''{0}''' -f $statusEarlyFileRoot }
                     default { '' }
+                }
+                $statusEarlyLockLine = '$operationLockSettings = @{{ Path = ''{0}'' }}' -f $statusEarlyLockPath
+                $statusEarlyHeldLock = $null
+                $statusEarlyBytesBefore = $null
+                if ($statusEarlyMode -eq 'locked') {
+                    # Існуючий статус "працюючого" екземпляра + утримуваний ним lock.
+                    Write-BRAVOOperationStatus -StateRoot $statusEarlyStateRoot -Operation $statusEarlyCase.Operation `
+                        -ExitCode 0 -ExitCodeName 'Success' -StartedAt (Get-Date).AddMinutes(-1)
+                    $statusEarlyBytesBefore = [IO.File]::ReadAllBytes((Get-BRAVOOperationStatusPath -StateRoot $statusEarlyStateRoot -Operation $statusEarlyCase.Operation))
+                    $statusEarlyHeldLock = [System.IO.File]::Open($statusEarlyLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
                 }
                 $statusEarlyScript = @(
                     'Set-StrictMode -Version 2.0',
                     ('Import-Module -Name ''{0}'' -ErrorAction Stop' -f (Join-Path $root 'modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1')),
                     ('Import-Module -Name ''{0}'' -ErrorAction Stop' -f (Join-Path $root 'modules\BRAVO.Status\BRAVO.Status.psd1')),
                     $statusEarlyStateLine,
+                    $statusEarlyLockLine,
                     $statusEarlyCase.Functions,
                     $statusEarlyCase.Call
                 ) -join "`r`n"
                 [IO.File]::WriteAllText($statusEarlyScriptPath, $statusEarlyScript, (New-Object Text.UTF8Encoding($true)))
-                [void](& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $statusEarlyScriptPath 2>&1)
-                $statusEarlyExit = $LASTEXITCODE
+                try {
+                    [void](& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $statusEarlyScriptPath 2>&1)
+                    $statusEarlyExit = $LASTEXITCODE
+                } finally {
+                    if ($null -ne $statusEarlyHeldLock) { $statusEarlyHeldLock.Dispose() }
+                }
+                $statusEarlyUnchanged = $true
+                if ($statusEarlyMode -eq 'locked') {
+                    $statusEarlyBytesAfter = [IO.File]::ReadAllBytes((Get-BRAVOOperationStatusPath -StateRoot $statusEarlyStateRoot -Operation $statusEarlyCase.Operation))
+                    $statusEarlyUnchanged = ([Convert]::ToBase64String($statusEarlyBytesBefore) -ceq [Convert]::ToBase64String($statusEarlyBytesAfter))
+                }
                 $statusEarlyFile = Get-BRAVOOperationStatusPath -StateRoot $statusEarlyStateRoot -Operation $statusEarlyCase.Operation
                 $statusEarlyParsed = if ([IO.File]::Exists($statusEarlyFile)) { Get-BRAVOOperationStatus -Path $statusEarlyFile } else { $null }
                 $statusEarlyResults += [pscustomobject]@{
                     Mode = $statusEarlyMode
+                    Unchanged = $statusEarlyUnchanged
                     Exit = $statusEarlyExit
                     Status = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { [string]$statusEarlyParsed.State.status } else { '' }
-                    Early = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { [bool]$statusEarlyParsed.State.details.earlyTermination } else { $false }
+                    Early = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { ($null -ne $statusEarlyParsed.State.details.PSObject.Properties['earlyTermination']) } else { $false }
                     Schema = if ($null -ne $statusEarlyParsed -and -not $statusEarlyParsed.Corrupt) { [int]$statusEarlyParsed.State.schemaVersion } else { 0 }
                 }
             }
@@ -416,7 +443,9 @@
             Test-BRAVOCondition `
                 -Condition (
                     @($statusEarlyResults | Where-Object { $_.Exit -ne $statusEarlyCase.Code }).Count -eq 0 -and
-                    $statusEarlyValid.Status -ceq 'ERROR' -and $statusEarlyValid.Early -and $statusEarlyValid.Schema -eq 1
+                    $statusEarlyValid.Status -ceq 'ERROR' -and $statusEarlyValid.Early -and $statusEarlyValid.Schema -eq 1 -and
+                    # ARCH-001: lock утримує інший процес -> існуючий статус не змінено (байти до == після).
+                    [bool]($statusEarlyResults | Where-Object { $_.Mode -eq 'locked' }).Unchanged
                 ) `
                 -Name "Status/EarlyExitHelperBehavior[$($statusEarlyCase.Label)]" `
                 -Failure "$($statusEarlyCase.Label): helper раннього виходу має записати ERROR/schema 1 (valid) і зберегти exit code $($statusEarlyCase.Code) також при недоступному/невизначеному stateRoot; факт: $(($statusEarlyResults | ForEach-Object { '{0}:exit={1},status={2}' -f $_.Mode, $_.Exit, $_.Status }) -join '; ')"

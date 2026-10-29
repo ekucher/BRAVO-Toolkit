@@ -100,13 +100,27 @@ $writeArchiveEarlyExitStatus = {
         # перезаписує (як і Write-BRAVOArchiveOperationStatus).
         if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
         $earlyStartedAtVariable = Get-Variable -Name scriptStartTime -ErrorAction SilentlyContinue
-        Write-BRAVOOperationStatus `
-            -StateRoot $stateRoot `
-            -Operation Archive `
-            -ExitCode $ExitCode `
-            -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
-            -StartedAt $(if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) { $earlyStartedAtVariable.Value } else { Get-Date }) `
-            -Details @{ earlyTermination = $true; earlyExitReason = $EarlyExitReason }
+        # ARCH-001: ранній вихід іде ДО Enter-BRAVOArchiveProcessLock — статус
+        # пишемо лише коли спільний operation lock вільний (короткочасно
+        # захоплюємо той самий файл тими ж Open-параметрами). Зайнятий або
+        # невизначений стан — fail-closed: не пишемо, лише лог.
+        $earlyLockStream = $null
+        try {
+            $earlyLockStream = [System.IO.File]::Open([string]$operationLockSettings.Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        } catch {
+            throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        try {
+            Write-BRAVOOperationStatus `
+                -StateRoot $stateRoot `
+                -Operation Archive `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -StartedAt $(if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) { $earlyStartedAtVariable.Value } else { Get-Date }) `
+                -Details @{ earlyTermination = $true; earlyExitReason = $EarlyExitReason }
+        } finally {
+            $earlyLockStream.Dispose()
+        }
     } catch {
         try {
             Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"

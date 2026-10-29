@@ -145,14 +145,36 @@ function Write-BRAVOMaintenanceEarlyExitStatus {
         } else {
             Get-Date
         }
-        # Без сирих повідомлень, шляхів чи секретів — лише маркери.
-        Write-BRAVOOperationStatus `
-            -StateRoot $earlyStateRoot `
-            -Operation Maintenance `
-            -ExitCode $ExitCode `
-            -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
-            -StartedAt $earlyStartedAt `
-            -Details @{ earlyTermination = $true; earlyExitReason = $Reason }
+        # ARCH-001: ранні виходи йдуть ДО Enter-BRAVOMaintenanceOperationLock,
+        # тож другий екземпляр міг би затерти статус того, що працює (і пізніше
+        # його успішний фінальний запис). Статус пишеться лише коли спільний
+        # operation lock (Maintenance і Archive) вільний: короткочасно
+        # захоплюємо той самий lock-файл (ті ж Open-параметри, що в
+        # Enter-BRAVOMaintenanceOperationLock) на час запису. Зайнятий або
+        # невизначений стан — fail-closed: не пишемо, лише лог із причиною.
+        $earlyLockSettingsVariable = Get-Variable -Name operationLockSettings -ErrorAction SilentlyContinue
+        $earlyLockPath = if ($null -ne $earlyLockSettingsVariable -and $null -ne $earlyLockSettingsVariable.Value) { [string]$earlyLockSettingsVariable.Value.Path } else { '' }
+        if ([string]::IsNullOrWhiteSpace($earlyLockPath)) {
+            throw 'шлях operation lock невідомий — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        $earlyLockStream = $null
+        try {
+            $earlyLockStream = [System.IO.File]::Open($earlyLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        } catch {
+            throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        try {
+            # Без сирих повідомлень, шляхів чи секретів — лише маркери.
+            Write-BRAVOOperationStatus `
+                -StateRoot $earlyStateRoot `
+                -Operation Maintenance `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -StartedAt $earlyStartedAt `
+                -Details @{ earlyTermination = $true; earlyExitReason = $Reason }
+        } finally {
+            $earlyLockStream.Dispose()
+        }
     } catch {
         $earlyStatusFailureMessage = "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance ($Reason): $($_.Exception.Message)"
         try {
