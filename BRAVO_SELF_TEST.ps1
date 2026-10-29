@@ -1438,6 +1438,63 @@ function Write-BRAVOSelfTestTimingSummary {
     }
     Write-Host "------------------------------------------------------------------------"
     Write-BRAVOResultBlankLine
+
+    # OPT-02: opt-in профіль (BRAVO_SELFTEST_PROFILE=1), лише ПІСЛЯ незмінного
+    # блоку вище; без змінної середовища друкується тільки він. Нічого не
+    # обгортає й не збирає під час прогону: працює над вже накопиченими
+    # секціями ($script:BRAVOSelfTestSections) і процесними лічильниками
+    # ОС/CLR, тому не впливає ні на тривалість, ні на результат перевірок.
+    # Лічильники ParseFile/читань/дочірніх процесів/Start-Sleep навмисно НЕ
+    # збираються: це потребувало б обгортання сотень викликів або підміни
+    # вбудованих команд, які ізоляційні перевірки (#337) вважають забрудненням.
+    if ($env:BRAVO_SELFTEST_PROFILE -eq '1') {
+        $profileSections = $script:BRAVOSelfTestSections.ToArray()
+        $profileChildMs = @{}
+        $profileTopLevelMs = 0.0
+        foreach ($profileSection in $profileSections) {
+            if ([string]::IsNullOrEmpty($profileSection.Parent)) {
+                $profileTopLevelMs += $profileSection.DurationMs
+            } else {
+                if (-not $profileChildMs.ContainsKey($profileSection.Parent)) { $profileChildMs[$profileSection.Parent] = 0.0 }
+                $profileChildMs[$profileSection.Parent] += $profileSection.DurationMs
+            }
+        }
+        $profileRows = @(foreach ($profileSection in $profileSections) {
+                $profileChild = 0.0
+                if ($profileChildMs.ContainsKey($profileSection.Name)) { $profileChild = $profileChildMs[$profileSection.Name] }
+                [pscustomobject]@{
+                    Name   = $profileSection.Name
+                    Suite  = $profileSection.Suite
+                    Status = $profileSection.Status
+                    Checks = $profileSection.ChecksExecuted
+                    WallMs = $profileSection.DurationMs
+                    SelfMs = $profileSection.DurationMs - $profileChild
+                }
+            })
+        $profileTotalMs = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds
+        Write-Host "Profile (BRAVO_SELFTEST_PROFILE=1): top 20 sections by self time"
+        Write-Host "Self = wall секції мінус wall вкладених секцій; час поза секціями не входить."
+        Write-Host "------------------------------------------------------------------------"
+        Write-Host ("{0,-58} {1,-11} {2,7} {3,9} {4,9}" -f 'Section', 'Suite', 'Checks', 'Wall(s)', 'Self(s)')
+        Write-Host "------------------------------------------------------------------------"
+        foreach ($profileRow in @($profileRows | Sort-Object -Property SelfMs -Descending | Select-Object -First 20)) {
+            Write-Host ("{0,-58} {1,-11} {2,7} {3,9:N1} {4,9:N1}" -f `
+                $profileRow.Name, $profileRow.Suite, $profileRow.Checks, ($profileRow.WallMs / 1000.0), ($profileRow.SelfMs / 1000.0))
+        }
+        Write-Host "------------------------------------------------------------------------"
+        Write-Host ("Sections: {0}; top-level sections wall: {1:N1}s of {2:N1}s total; outside sections: {3:N1}s" -f `
+            $profileRows.Count, ($profileTopLevelMs / 1000.0), ($profileTotalMs / 1000.0), (($profileTotalMs - $profileTopLevelMs) / 1000.0))
+        try {
+            $profileProcess = [Diagnostics.Process]::GetCurrentProcess()
+            Write-Host ("Process: peak working set {0:N0} MB; cpu {1:N1}s; managed heap {2:N0} MB; GC gen0/1/2 {3}/{4}/{5}" -f `
+                ($profileProcess.PeakWorkingSet64 / 1MB), $profileProcess.TotalProcessorTime.TotalSeconds,
+                ([GC]::GetTotalMemory($false) / 1MB), [GC]::CollectionCount(0), [GC]::CollectionCount(1), [GC]::CollectionCount(2))
+        } catch {
+            Write-Host ("Process: лічильники недоступні: {0}" -f $_.Exception.Message)
+        }
+        Write-Host "Parse/read/child-process/Start-Sleep лічильники не збираються (див. docs/engineering/selftest-performance/baseline.md)."
+        Write-BRAVOResultBlankLine
+    }
 }
 
 # P0 fail-fast/telemetry: канонічний ЄДИНИЙ фінальний reporting/exit
@@ -35075,6 +35132,134 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework' -DependsOn 'Tail/Isolation
         -Name "Framework/TotalStopwatchBoundaryIsStable.DynamicFrozenElapsed" `
         -Failure ("Elapsed зупиненого Stopwatch не лишився стабільним: right-after-stop=$elapsedRightAfterStop " +
             "after-delay=$elapsedAfterDelay after-second-stop=$elapsedAfterSecondStop")
+}
+
+# Framework/TimingSummaryProfile* (OPT-02): opt-in профіль секцій у Timing
+# summary. Реальна Write-BRAVOSelfTestTimingSummary береться AST-екстракцією
+# з цього файлу й виконується в ізольованому динамічному модулі на
+# СИНТЕТИЧНИХ секціях (Write-Host/Write-BRAVOResultBlankLine там — локальні
+# стаби, що збирають рядки): жива телеметрія головного процесу не чіпається.
+# Доводить: (1) без BRAVO_SELFTEST_PROFILE=1 (і з '0') профільних рядків немає;
+# (2) з =1 вивід лише ДОДАЄТЬСЯ до незмінного блоку (префікс збігається);
+# (3) секції впорядковано за self-часом, self = wall мінус вкладені секції;
+# (4) підсумок секцій і процесні лічильники друкуються; (5) fixture нічого не
+# лишив (функція відновлена, змінну середовища повернуто).
+# Fixture shadow-ить Write-BRAVOSelfTestTimingSummary у Function:-drive (див.
+# коментар вище про New-Module), тому відновлення ScriptBlock — у finally.
+& {
+    $profileProbeRealSummaryScriptBlock = (Get-Item -Path function:Write-BRAVOSelfTestTimingSummary).ScriptBlock
+    $profileProbeEnvBefore = [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', 'Process')
+    $profileProbeModule = $null
+    $profileProbeResult = $null
+    $profileProbeFixtureError = $null
+    try {
+        $profileProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText (Get-BRAVOSelfTestOwnSourceText) `
+            -FunctionNames @('Write-BRAVOSelfTestTimingSummary')
+        $profileProbeResult = & $profileProbeModule {
+            $script:profileProbeLines = New-Object System.Collections.Generic.List[string]
+            function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$Parts) [void]$script:profileProbeLines.Add([string]($Parts -join ' ')) }
+            function Write-BRAVOResultBlankLine { }
+            $script:suiteDurationTotals = [ordered]@{ 'ProbeSuite' = 5000.0 }
+            $script:testTimings = New-Object System.Collections.Generic.List[object]
+            [void]$script:testTimings.Add([pscustomobject]@{
+                    Name = 'Probe/A'; Suite = 'ProbeSuite'; Result = 'PASS'
+                    LeadDurationMs = 1.0; AssertionDurationMs = 1.0; IntervalMs = 2.0
+                })
+            $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
+            $script:selfTestTotalStopwatch.Stop()
+            $script:BRAVOSelfTestSections = New-Object System.Collections.Generic.List[object]
+            foreach ($probeSectionSpec in @(
+                    @('P/Parent', '', 4000.0), @('P/ChildA', 'P/Parent', 1000.0),
+                    @('P/ChildB', 'P/Parent', 2500.0), @('P/Solo', '', 600.0))) {
+                [void]$script:BRAVOSelfTestSections.Add([pscustomobject]@{
+                        Name = $probeSectionSpec[0]; Parent = $probeSectionSpec[1]; Suite = 'ProbeSuite'
+                        Status = 'Completed'; DurationMs = $probeSectionSpec[2]; ChecksExecuted = 1
+                    })
+            }
+            $probeRuns = [ordered]@{}
+            foreach ($probeMode in @('unset', '0', '1')) {
+                $script:profileProbeLines.Clear()
+                if ($probeMode -eq 'unset') {
+                    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $null, 'Process')
+                } else {
+                    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $probeMode, 'Process')
+                }
+                Write-BRAVOSelfTestTimingSummary
+                $probeRuns[$probeMode] = $script:profileProbeLines.ToArray()
+            }
+            [pscustomobject]@{ Unset = $probeRuns['unset']; Zero = $probeRuns['0']; On = $probeRuns['1'] }
+        }
+    } catch {
+        $profileProbeFixtureError = $_.Exception.Message
+    } finally {
+        [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $profileProbeEnvBefore, 'Process')
+        Set-Item -Path function:Write-BRAVOSelfTestTimingSummary -Value $profileProbeRealSummaryScriptBlock -Force
+        Clear-BRAVOSelfTestOwnedRuntimeModules
+    }
+
+    if ($null -ne $profileProbeFixtureError) {
+        Test-BRAVOCondition -Condition $false -Name "Framework/TimingSummaryProfileFixtureExecution" `
+            -Failure "не вдалося виконати isolated profile-probe fixture: $profileProbeFixtureError"
+    } else {
+        $profileOffLines = @($profileProbeResult.Unset)
+        $profileZeroLines = @($profileProbeResult.Zero)
+        $profileOnLines = @($profileProbeResult.On)
+        $profileOffIsBaseline = (
+            $profileOffLines.Count -gt 0 -and
+            @($profileOffLines | Where-Object { $_ -match '^Total wall-clock: ' }).Count -eq 1 -and
+            @($profileOffLines | Where-Object { $_ -eq 'Top 20 longest assertion intervals' }).Count -eq 1 -and
+            @($profileOffLines | Where-Object { $_ -match '^(Profile|Sections:|Process:)' }).Count -eq 0
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $profileOffIsBaseline -and
+                [string]::Join("`n", $profileZeroLines) -ceq [string]::Join("`n", $profileOffLines)
+            ) `
+            -Name "Framework/TimingSummaryProfileOffByDefault" `
+            -Failure "без BRAVO_SELFTEST_PROFILE=1 (і з '0') Timing summary має лишатись без профільних рядків: off=$($profileOffLines.Count) рядків, zero=$($profileZeroLines.Count)"
+
+        $profilePrefixMatches = (
+            $profileOnLines.Count -gt $profileOffLines.Count -and
+            [string]::Join("`n", @($profileOnLines | Select-Object -First $profileOffLines.Count)) -ceq [string]::Join("`n", $profileOffLines)
+        )
+        Test-BRAVOCondition `
+            -Condition $profilePrefixMatches `
+            -Name "Framework/TimingSummaryProfileOnlyAddsLines" `
+            -Failure "профіль мав лише дописати рядки ПІСЛЯ незмінного Timing summary: off=$($profileOffLines.Count) on=$($profileOnLines.Count)"
+
+        $profileOnlyLines = if ($profilePrefixMatches) { @($profileOnLines | Select-Object -Skip $profileOffLines.Count) } else { @() }
+        $profileRowNames = @(foreach ($profileLine in $profileOnlyLines) {
+                if ($profileLine -match '^(P/\S+)\s+ProbeSuite\s') { $Matches[1] }
+            })
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::Join(',', $profileRowNames) -ceq 'P/ChildB,P/ChildA,P/Solo,P/Parent' -and
+                @($profileOnlyLines | Where-Object { $_ -match '^P/Parent\s+ProbeSuite\s+1\s+4[.,]0\s+0[.,]5$' }).Count -eq 1 -and
+                @($profileOnlyLines | Where-Object { $_ -match '^P/ChildB\s+ProbeSuite\s+1\s+2[.,]5\s+2[.,]5$' }).Count -eq 1
+            ) `
+            -Name "Framework/TimingSummaryProfileRanksSectionsBySelfTime" `
+            -Failure ("секції мають бути впорядковані за self-часом (wall мінус вкладені): отримано '" +
+                [string]::Join(',', $profileRowNames) + "'")
+
+        Test-BRAVOCondition `
+            -Condition (
+                @($profileOnlyLines | Where-Object { $_ -match '^Sections: 4; top-level sections wall: 4[.,]6s of ' }).Count -eq 1 -and
+                @($profileOnlyLines | Where-Object { $_ -match '^Process: peak working set \d.*GC gen0/1/2 \d+/\d+/\d+$' }).Count -eq 1
+            ) `
+            -Name "Framework/TimingSummaryProfileReportsCoverageAndProcess" `
+            -Failure "профіль має друкувати підсумок секцій (4; top-level 4.6s) і процесні лічильники"
+    }
+
+    $profileProbeCurrentCommand = Get-Command -Name 'Write-BRAVOSelfTestTimingSummary' -ErrorAction SilentlyContinue
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $profileProbeCurrentCommand -and
+            [string]::IsNullOrEmpty($profileProbeCurrentCommand.ModuleName) -and
+            $profileProbeCurrentCommand.ScriptBlock.ToString() -ceq $profileProbeRealSummaryScriptBlock.ToString() -and
+            [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', 'Process') -ceq $profileProbeEnvBefore
+        ) `
+        -Name "Framework/TimingSummaryProfileProbeCleanedUp" `
+        -Failure "profile-probe не відновив Write-BRAVOSelfTestTimingSummary і/або змінну BRAVO_SELFTEST_PROFILE"
 }
 
 # Framework/BootstrapIntegrityCheckedBeforeManifestCoveredImports (P1-A

@@ -14,6 +14,7 @@
 | `docs/engineering/testing-validation.md` | Тестування, контракт self-test, безпека production-стану |
 | `docs/engineering/configuration.md` | Правила конфігурації й сумісність `BRAVO.config` |
 | `docs/engineering/documentation-language.md` | Мовна політика документації |
+| `docs/engineering/selftest-performance/baseline.md` | Baseline продуктивності SELF_TEST і opt-in профіль секцій (`BRAVO_SELFTEST_PROFILE=1`) |
 
 ## Що це за проект
 
