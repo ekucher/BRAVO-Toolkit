@@ -49,14 +49,17 @@ function Test-BRAVOUpdatePathHasReparsePoint {
 function Get-BRAVOUpdateDirectoryAclProblem {
     # Проблеми приватності каталогу (порожній масив = приватний): DACL
     # захищений; власник і КОЖЕН ACE (Allow чи Deny) належать лише довіреним
-    # SID: BUILTIN\Administrators, NT AUTHORITY\SYSTEM, поточний користувач;
-    # успадкованих правил немає. Помилка читання -> проблема (fail closed).
+    # SID: BUILTIN\Administrators, NT AUTHORITY\SYSTEM і — ТІЛЬКИ для процесу без
+    # прав адміністратора — поточний користувач (H1: під UAC особистий SID
+    # оператора доступний неелевованому коду того ж облікового запису, тому
+    # елевований процес йому не довіряє); успадкованих правил немає. Помилка
+    # читання -> проблема (fail closed).
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([Parameter(Mandatory = $true)][string]$Path, [scriptblock]$AdminCheck = $null)
 
     $problems = @()
     try {
-        $trusted = @('S-1-5-32-544', 'S-1-5-18', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        $trusted = @(Get-BRAVOUpdateTrustedSid -AdminCheck $AdminCheck)
         $acl = Get-Acl -LiteralPath $Path
         if (-not $acl.AreAccessRulesProtected) { $problems += 'успадкування прав не вимкнено' }
         $ownerSid = [string]$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
@@ -75,103 +78,21 @@ function Get-BRAVOUpdateDirectoryAclProblem {
 }
 
 function New-BRAVOUpdatePrivateDirectory {
-    # Створює каталог із захищеним DACL (патерн
-    # deploy\Install-BRAVOServer.ps1 New-BRAVOInstallPrivateDirectory, який
-    # не змінюємо): успадкування вимкнено; FullControl лише для
-    # BUILTIN\Administrators, NT AUTHORITY\SYSTEM і ПОТОЧНОГО користувача.
-    # Поточний користувач у списку, щоб неелевовані тести й dry-run працювали;
-    # у production worker запускається елевованим, тож поточний користувач =
-    # адміністратор (або SYSTEM) і додатковий довірений принципал не з'являється.
-    # Власника не міняємо (неелевований процес не може призначити
-    # Administrators власником). Результат перечитується Get-Acl. Наявний
-    # каталог допустимий лише порожній і не reparse point (тоді DACL
-    # застосовується до нього); інакше — відмова. Повертає
-    # { Success; Path; Problems[] }, не кидає виняток.
+    # Створює приватний каталог: FullControl лише для BUILTIN\Administrators і
+    # NT AUTHORITY\SYSTEM (+ поточний користувач лише коли процес не адміністратор:
+    # неелевовані тести/dry-run; див. Get-BRAVOUpdateTrustedSid). Реалізація —
+    # єдина New-BRAVOUpdateProtectedDirectory (Paths); при елевації власник
+    # Administrators. Наявний каталог допустимий лише порожній і не reparse point.
+    # Повертає { Success; Path; Problems[] }, не кидає виняток.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([Parameter(Mandatory = $true)][string]$Path, [scriptblock]$AdminCheck = $null)
 
-    $problems = @()
     try {
-        $fullPath = [System.IO.Path]::GetFullPath($Path)
-        $exists = Test-Path -LiteralPath $fullPath
-        if ($exists) {
-            $item = Get-Item -LiteralPath $fullPath -Force
-            if (-not $item.PSIsContainer) { throw 'шлях існує і не є каталогом.' }
-            if (Test-BRAVOUpdatePathHasReparsePoint -Path $fullPath) { throw 'шлях є reparse point або має його серед предків.' }
-            if (@(Get-ChildItem -LiteralPath $fullPath -Force).Count -gt 0) { throw 'каталог уже існує і не порожній.' }
-        }
-
-        $administratorsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-        $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $trustedSids = @($administratorsSid, $systemSid)
-        if ($currentSid.Value -ne $administratorsSid.Value -and $currentSid.Value -ne $systemSid.Value) { $trustedSids += $currentSid }
-        $allowedValues = @($trustedSids | ForEach-Object { $_.Value })
-
-        $security = New-Object System.Security.AccessControl.DirectorySecurity
-        $security.SetAccessRuleProtection($true, $false)
-        foreach ($trustedSid in $trustedSids) {
-            $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                $trustedSid,
-                [System.Security.AccessControl.FileSystemRights]::FullControl,
-                ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
-                [System.Security.AccessControl.PropagationFlags]::None,
-                [System.Security.AccessControl.AccessControlType]::Allow)))
-        }
-        if ($exists) {
-            # Set-Acl тут не годиться: він записує всі секції дескриптора і
-            # вимагає SeSecurityPrivilege (немає в неелевованому процесі).
-            # Змінюємо лише DACL через DirectoryInfo.SetAccessControl.
-            $directoryInfo = New-Object System.IO.DirectoryInfo($fullPath)
-            $existingAcl = $directoryInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-            $existingAcl.SetAccessRuleProtection($true, $false)
-            foreach ($oldRule in @($existingAcl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-                [void]$existingAcl.RemoveAccessRuleSpecific($oldRule)
-            }
-            foreach ($newRule in @($security.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
-                $existingAcl.AddAccessRule($newRule)
-            }
-            $directoryInfo.SetAccessControl($existingAcl)
-        } else {
-            # Windows PowerShell 5.1 (.NET Framework): Directory.CreateDirectory(path, DirectorySecurity);
-            # PowerShell 7 (.NET): FileSystemAclExtensions.CreateDirectory.
-            $createWithSecurity = [System.IO.Directory].GetMethod('CreateDirectory',
-                [Type[]]@([string], [System.Security.AccessControl.DirectorySecurity]))
-            if ($null -ne $createWithSecurity) {
-                [void][System.IO.Directory]::CreateDirectory($fullPath, $security)
-            } else {
-                [void][System.IO.FileSystemAclExtensions]::CreateDirectory($security, $fullPath)
-            }
-        }
-
-        $actual = Get-Acl -LiteralPath $fullPath
-        if (-not $actual.AreAccessRulesProtected) { $problems += 'успадкування прав не вимкнено' }
-        $ownerValue = [string]$actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
-        if ($allowedValues -notcontains $ownerValue) { $problems += ('власник ' + $ownerValue + ' не з довіреного списку') }
-        $rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
-        foreach ($rule in $rules) {
-            $ruleSid = [string]$rule.IdentityReference.Value
-            if ($rule.IsInherited -or $allowedValues -notcontains $ruleSid -or
-                $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
-                ($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
-                $problems += ('зайве правило ' + $ruleSid + ' ' + [string]$rule.AccessControlType + ' ' + [string]$rule.FileSystemRights)
-            }
-        }
-        foreach ($allowedValue in $allowedValues) {
-            if (@($rules | Where-Object { [string]$_.IdentityReference.Value -eq $allowedValue }).Count -eq 0) {
-                $problems += ('немає правила для ' + $allowedValue)
-            }
-        }
-        if (@(Get-ChildItem -LiteralPath $fullPath -Force).Count -gt 0) { $problems += 'каталог не порожній' }
-        if ($problems.Count -gt 0) {
-            # Створений нами каталог із хибним DACL не лишаємо.
-            if (-not $exists) { Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue }
-            return [pscustomobject]@{ Success = $false; Path = $fullPath; Problems = @($problems) }
-        }
-        return [pscustomobject]@{ Success = $true; Path = $fullPath; Problems = @() }
+        $includeCurrent = Test-BRAVOUpdateTrustCurrentUser -AdminCheck $AdminCheck
+        $rule = @(Get-BRAVOUpdateWorkerAclRule -Kind Private -IncludeCurrentUser:$includeCurrent)
+        return (New-BRAVOUpdateProtectedDirectory -Path $Path -Rule $rule -AdminCheck $AdminCheck)
     } catch {
-        $problems += ('Приватний каталог ' + $Path + ' не створено: ' + $_.Exception.Message)
-        return [pscustomobject]@{ Success = $false; Path = $Path; Problems = @($problems) }
+        return [pscustomobject]@{ Success = $false; Path = $Path; Problems = @('Приватний каталог ' + $Path + ' не створено: ' + $_.Exception.Message) }
     }
 }
 

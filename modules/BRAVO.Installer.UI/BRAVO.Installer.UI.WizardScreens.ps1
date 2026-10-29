@@ -772,6 +772,19 @@ function Start-BRAVOInstallerExecution {
             -PrereleaseAuthorized ([bool]$source.PrereleaseEffective) -RunSelfTest ([bool]$w.RunSelfTest) -BackupDestination $backup -SourcePath $sourcePath
         $requestPath = Write-BRAVOInstallerExecutionRequest -Request $request -StateRoot $stateRoot -ToolkitRoot $Context.ToolkitRoot
     } catch {
+        $preparationError = $_.Exception
+        if ($preparationError.Data.Contains('BRAVOInstallerKind') -and ([string]$preparationError.Data['BRAVOInstallerKind'] -ceq 'StateNotInitialized')) {
+            # H1: каталоги стану створює лише елевований engine; пропонуємо його первинне налаштування.
+            Show-BRAVOInstallerError -Context $Context -Summary 'Потрібне первинне налаштування з правами адміністратора. Нічого не змінено.' -Technical $preparationError.Message
+            $initAnswer = [System.Windows.Forms.MessageBox]::Show($Context.Controls['Screen.Home'].FindForm(),
+                ('Каталоги стану engine ще не створено. Їх створює лише engine з правами адміністратора: з''явиться одне підтвердження UAC і окреме вікно.' +
+                    [Environment]::NewLine + 'Після завершення повторіть виконання операції.'),
+                'BRAVO Installer', [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Information)
+            if ($initAnswer -eq [System.Windows.Forms.DialogResult]::OK) {
+                [void](Start-BRAVOInstallerElevatedCommand -Command (New-BRAVOInstallerInitializeCommand -ToolkitRoot $Context.ToolkitRoot))
+            }
+            return
+        }
         Show-BRAVOInstallerError -Context $Context -Summary 'Не вдалося підготувати запит на виконання. Нічого не змінено.' -Technical $_.Exception.ToString()
         return
     }

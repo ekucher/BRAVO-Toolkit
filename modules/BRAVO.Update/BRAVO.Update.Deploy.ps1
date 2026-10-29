@@ -340,16 +340,25 @@ function Remove-BRAVOUpdateOperationDirectory {
         Видаляє каталог операції <ExpectedParent>\<OperationId> і лише його.
     .DESCRIPTION
         Захист: OperationId — GUID; leaf шляху == OperationId; батько == очікуваний
-        корінь; сам корінь не reparse point. Обхід НЕ заходить у reparse point:
-        junction/symlink видаляється як посилання, ціль лишається недоторканою
-        (інакше підміна всередині staging знищила б чужі дані). Порушення гарду —
-        виняток; збій видалення окремого елемента — у Problems без винятку.
+        корінь; жоден предок кореня (разом із ним) не reparse point; (H1) корінь
+        належить довіреному власнику й не доступний на запис недовіреним
+        (Get-BRAVOUpdateProtectedRootProblem -Lenient): інакше підміна всередині
+        дерева могла б спрямувати рекурсивне видалення на чужі дані. -AllowedRoot —
+        явний перелік коренів engine (production: StagingRoot/BackupRoot/Operations);
+        якщо задано, ExpectedParent мусить дорівнювати одному з них. Обхід НЕ заходить
+        у reparse point і ПЕРЕД перелічуванням кожного каталогу заново перевіряє його
+        атрибут (замінений на junction після додавання в чергу — пропускається з
+        записом у Problems); junction/symlink видаляється як посилання, ціль лишається
+        недоторканою. Порушення гарду — виняток; збій видалення окремого елемента — у
+        Problems без винятку.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$ExpectedParent,
-        [Parameter(Mandatory = $true)][string]$OperationId
+        [Parameter(Mandatory = $true)][string]$OperationId,
+        [string[]]$AllowedRoot = @(),
+        [scriptblock]$AdminCheck = $null
     )
 
     if (-not (Test-BRAVOUpdateGuidText -Value $OperationId)) { throw "BRAVO.Update: некоректний operationId '$OperationId' для видалення каталогу." }
@@ -361,13 +370,44 @@ function Remove-BRAVOUpdateOperationDirectory {
     if (-not [string]::Equals([IO.Path]::GetDirectoryName($fullPath), $fullParent, [StringComparison]::OrdinalIgnoreCase)) {
         throw "BRAVO.Update: каталог '$fullPath' лежить не в очікуваному корені '$fullParent'; видалення відхилено."
     }
+    if (@($AllowedRoot).Count -gt 0) {
+        $listed = $false
+        foreach ($allowed in @($AllowedRoot)) {
+            if ((-not [string]::IsNullOrWhiteSpace($allowed)) -and (Test-BRAVOUpdateWorkerSamePath -Left $allowed -Right $fullParent)) { $listed = $true }
+        }
+        if (-not $listed) { throw "BRAVO.Update: корінь '$fullParent' не входить до дозволених коренів engine; видалення відхилено." }
+    }
     $attributesOf = {
         param([string]$Target)
         try { return [IO.File]::GetAttributes($Target) } catch [System.IO.FileNotFoundException] { return $null } catch [System.IO.DirectoryNotFoundException] { return $null }
     }
+    # Корінь і ВСІ його предки: reparse на будь-якому рівні перенаправив би видалення.
+    if (Test-BRAVOUpdatePathHasReparsePoint -Path $fullParent) {
+        throw "BRAVO.Update: очікуваний корінь '$fullParent' (або його предок) є reparse point; видалення відхилено."
+    }
     $parentAttributes = & $attributesOf $fullParent
-    if (($null -ne $parentAttributes) -and (($parentAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-        throw "BRAVO.Update: очікуваний корінь '$fullParent' є reparse point; видалення відхилено."
+    # Перевірка власника/прав — коли викликач задав -AllowedRoot (production: корені engine, які
+    # Initialize-BRAVOUpdateProtectedRoots уже довів до захищеного стану). Без -AllowedRoot
+    # лишається лише reparse/leaf/parent-гард (сумісність викликачів поза H1, напр. Recovery).
+    if (($null -ne $parentAttributes) -and (@($AllowedRoot).Count -gt 0)) {
+        $rootProblem = @(Get-BRAVOUpdateProtectedRootProblem -Path $fullParent -Kind ReadOnly -Lenient -AdminCheck $AdminCheck)
+        if ($rootProblem.Count -gt 0) {
+            throw ("BRAVO.Update: корінь '$fullParent' не пройшов перевірку власника/прав (" + ($rootProblem -join '; ') + '); видалення відхилено.')
+        }
+    }
+    return (Remove-BRAVOUpdateDirectoryTreeNoFollow -FullPath $fullPath)
+}
+
+function Remove-BRAVOUpdateDirectoryTreeNoFollow {
+    # Ядро guarded-видалення (без перевірки кореня: гарди — у викликача). Не заходить у
+    # reparse point, атрибут кожного каталогу перевіряється ПЕРЕД перелічуванням.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$FullPath)
+
+    $fullPath = $FullPath
+    $attributesOf = {
+        param([string]$Target)
+        try { return [IO.File]::GetAttributes($Target) } catch [System.IO.FileNotFoundException] { return $null } catch [System.IO.DirectoryNotFoundException] { return $null }
     }
     $problems = New-Object 'System.Collections.Generic.List[string]'
     $rootAttributes = & $attributesOf $fullPath
@@ -392,6 +432,14 @@ function Remove-BRAVOUpdateOperationDirectory {
     $pending.Push($fullPath)
     while ($pending.Count -gt 0) {
         $current = $pending.Pop()
+        # Атрибут перевіряється ПЕРЕД перелічуванням: між додаванням у чергу й заходом
+        # каталог могли замінити junction-ом (TOCTOU) — тоді не заходимо, лише фіксуємо.
+        $currentAttributes = & $attributesOf $current
+        if ($null -eq $currentAttributes) { continue }
+        if (($currentAttributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $problems.Add(('каталог ' + $current + ' став reparse point під час видалення; пропущено'))
+            continue
+        }
         $visited.Add($current)
         $children = @()
         try { $children = [IO.Directory]::GetFileSystemEntries($current) } catch { $problems.Add(('не вдалося прочитати ' + $current + ': ' + $_.Exception.Message)); continue }
@@ -1021,6 +1069,10 @@ function Invoke-BRAVOUpdateAcquireStage {
                 if ($null -ne $Downloader) { $saveArgs['Downloader'] = $Downloader }
                 $acquired = Save-BRAVOReleaseArtifact @saveArgs
             }
+            if ((-not $acquired.Success) -and (@(@($acquired.Problems) | Where-Object { ([string]$_) -match '^Не знайдено release-manifest\.json' }).Count -gt 0)) {
+                # Відсутній release-manifest — це збій перевірки артефакта (як у конвеєрі плану: 42), а не транспортний збій.
+                throw (New-BRAVOUpdateTypedException -Message ('Відсутній release-manifest.json: ' + (@($acquired.Problems) -join '; ')) -Kind Verification -FindingId 'Release.ManifestMissing' -ExitCodeHint 42 -Action 'Отримайте повний артефакт (архів, .sha256, release-manifest.json) з довіреного джерела.')
+            }
             if (-not $acquired.Success) { throw (New-BRAVOUpdateTypedException -Message ('Не вдалося отримати артефакт: ' + (@($acquired.Problems) -join '; ')) -Kind Error -FindingId 'Acquire.Failed' -Action 'Перевірте джерело артефакта і повторіть.') }
             $Context.Data['Payload'] = $acquired
         })
@@ -1239,7 +1291,7 @@ function Invoke-BRAVOUpdatePreMutationCleanup {
     }
     foreach ($pair in @(@($Context.Paths.StagingRoot, 'staging'), @($Context.Paths.BackupRoot, 'backup'))) {
         try {
-            $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $pair[0] $Context.OperationId) -ExpectedParent $pair[0] -OperationId $Context.OperationId
+            $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $pair[0] $Context.OperationId) -ExpectedParent $pair[0] -OperationId $Context.OperationId -AllowedRoot @([string]$Context.Paths.StagingRoot, [string]$Context.Paths.BackupRoot)
             if (@($removal.Problems).Count -gt 0) {
                 $Context.Findings.Add((New-BRAVOUpdateFinding -Id ('Cleanup.' + $pair[1] + 'Incomplete') -Severity Warning -Title ('Каталог ' + $pair[1] + ' операції видалено не повністю') `
                             -Meaning 'Залишки можна видалити вручну після перевірки.' -Details ((@($removal.Problems) | Select-Object -First 5) -join '; ')))
@@ -1556,7 +1608,7 @@ function Invoke-BRAVODeployment {
             [void](Set-BRAVOUpdateJournalState -Journal $context.Journal -State Committed -StateRoot $paths.StateRoot)
             Close-BRAVOUpdateOperationHandles -Context $context
             try {
-                $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $paths.StagingRoot $context.OperationId) -ExpectedParent $paths.StagingRoot -OperationId $context.OperationId
+                $removal = Remove-BRAVOUpdateOperationDirectory -Path (Join-Path $paths.StagingRoot $context.OperationId) -ExpectedParent $paths.StagingRoot -OperationId $context.OperationId -AllowedRoot @([string]$paths.StagingRoot, [string]$paths.BackupRoot)
                 if (@($removal.Problems).Count -gt 0) {
                     Add-BRAVOUpdateContextFinding -Context $context -Finding (New-BRAVOUpdateFinding -Id 'Commit.StagingNotRemoved' -Severity Warning -Title 'Staging операції видалено не повністю' `
                             -Meaning 'Залишки не впливають на роботу; їх можна видалити вручну.' -Details ((@($removal.Problems) | Select-Object -First 5) -join '; '))

@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('State', 'Preflight', 'Plan', 'Execute', 'Install', 'Update', 'Repair', 'Recover', 'Diagnose')]
+    [ValidateSet('State', 'Preflight', 'Plan', 'Execute', 'Install', 'Update', 'Repair', 'Recover', 'Diagnose', 'Initialize')]
     [string]$Action,
     [ValidateSet('', 'Install', 'Update', 'Repair')]
     [string]$Operation = '',
@@ -15,6 +15,8 @@ param(
     [string]$PlanPath = '',
     [string]$RequestPath = '',
     [string]$ConfirmPlanId = '',
+    # Ідентифікатор каталогу результату елевованого Recover: Operations/<RecoveryId>/result.json під StateRoot (H1).
+    [string]$RecoveryId = '',
     [switch]$AsJson,
     [string]$ResultPath = '',
     [switch]$NonInteractive,
@@ -113,6 +115,7 @@ $dispatch = @{
     PlanPath          = $PlanPath
     RequestPath       = $RequestPath
     ConfirmPlanId     = $ConfirmPlanId
+    RecoveryId        = $RecoveryId
     ScriptPath        = $PSCommandPath
     CandidateRoots    = @($PSScriptRoot)
     # З -AsJson інтерактивне введення неможливе: підтвердження лише -PlanPath + -ConfirmPlanId.

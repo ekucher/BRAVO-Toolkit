@@ -244,41 +244,19 @@ function Get-BRAVOUpdateWorkerAclRule {
 function Initialize-BRAVOUpdateStateDirectories {
     <#
     .SYNOPSIS
-        Створює відсутні каталоги протоколу в StateRoot із належними ACL:
-        Requests (Users лише створюють), Operations (Users читають),
-        ConsumedPlans (лише Administrators/SYSTEM). Наявні не чіпає.
+        Обгортка сумісності над Initialize-BRAVOUpdateProtectedRoots (Paths, H1)
+        лише для піддерева StateRoot: Journal, Operations (Users читають), Requests
+        (Users лише створюють), ConsumedPlans (Administrators/SYSTEM).
     .DESCRIPTION
-        Потребує прав на запис у StateRoot (production — адміністратор).
-        Повертає { Success, Created[], Problems[] } і не кидає.
+        Єдина реалізація створення/перевірки власника й ACL — у Paths. Наявний
+        каталог із довіреним власником отримує DACL заново; з чужим власником —
+        відмова (Problems). Повертає { Success, Created[], Problems[] } і не кидає.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$StateRoot)
-    $created = New-Object System.Collections.Generic.List[string]
-    $problems = New-Object System.Collections.Generic.List[string]
-    $includeCurrent = -not (Test-BRAVOUpdateWorkerIsAdministrator)
-    try {
-        if (Test-BRAVOUpdatePathHasReparsePoint -Path $StateRoot) { throw 'StateRoot є reparse point або має його серед предків.' }
-        [void][System.IO.Directory]::CreateDirectory($StateRoot)
-        $plan = @(
-            @{ Name = 'Requests'; Kind = 'Requests' },
-            @{ Name = 'Operations'; Kind = 'Operation' },
-            @{ Name = 'ConsumedPlans'; Kind = 'Private' }
-        )
-        foreach ($item in $plan) {
-            $path = Join-Path $StateRoot $item.Name
-            if ([System.IO.Directory]::Exists($path)) { continue }
-            [void][System.IO.Directory]::CreateDirectory($path)
-            $applied = Set-BRAVOUpdateDirectoryAcl -Path $path -Rule (Get-BRAVOUpdateWorkerAclRule -Kind $item.Kind -IncludeCurrentUser:$includeCurrent)
-            if (-not $applied.Success) {
-                foreach ($problem in $applied.Problems) { $problems.Add($problem) }
-            } else {
-                $created.Add($path)
-            }
-        }
-    } catch {
-        $problems.Add('Каталоги протоколу не створено: ' + $_.Exception.Message)
-    }
-    return [pscustomobject]@{ Success = ($problems.Count -eq 0); Created = @($created.ToArray()); Problems = @($problems.ToArray()) }
+    $pathsLike = [pscustomobject]@{ StateRoot = $StateRoot; LockRoot = $StateRoot; StagingRoot = $StateRoot; BackupRoot = $StateRoot }
+    $outcome = Initialize-BRAVOUpdateProtectedRoots -Paths $pathsLike -Only @('StateRoot', 'Journal', 'Operations', 'ConsumedPlans', 'Requests')
+    return [pscustomobject]@{ Success = [bool]$outcome.Success; Created = @($outcome.Created); Problems = @($outcome.Problems) }
 }
 
 function New-BRAVOUpdateOperationDirectory {
@@ -596,8 +574,9 @@ function Invoke-BRAVOUpdateWorker {
     $startedUtc = Get-BRAVOUpdateUtcNowText
     $useDefaultAdapter = ($null -eq $Adapter)
     if ($null -eq $Paths) { $Paths = Get-BRAVOUpdateDefaultPaths }
-    if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter }
+    if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter -StagingRoot ([string]$Paths.StagingRoot) }
     $stateRoot = [string]$Paths.StateRoot
+    $attestation = ''
 
     $finish = {
         param($Result, [string]$OperationDirectory)
@@ -607,7 +586,7 @@ function Invoke-BRAVOUpdateWorker {
                 $resultPath = Join-Path $OperationDirectory 'result.json'
             }
         }
-        [pscustomobject]@{ ExitCode = [int]$Result.exitCode; Result = $Result; OperationId = [string]$Result.operationId; ResultPath = $resultPath }
+        [pscustomobject]@{ ExitCode = [int]$Result.exitCode; Result = $Result; OperationId = [string]$Result.operationId; ResultPath = $resultPath; Attestation = $attestation }
     }
     $fail = {
         param([object[]]$Findings, [string]$Reason, $Plan, [string]$OperationDirectory, [string]$ResultAction)
@@ -635,6 +614,14 @@ function Invoke-BRAVOUpdateWorker {
                     -Meaning 'Дозвіл відкату версії несумісний з операціями Installer.' -Action 'Приберіть змінну BRAVO_ALLOW_DOWNGRADE зі середовища й повторіть.' -Hint 35) 'Blocked' $null '' 'Update')
     }
 
+    # H1: корені engine створюються/перевіряються (власник, ACL, reparse) ДО читання будь-якого
+    # запиту чи журналу: ProgramData дозволяє будь-кому підкласти каталог, а запит і журнал —
+    # вхід для привілейованих дій. Недовірений корінь = Blocked без жодних записів.
+    $protectedRoots = Initialize-BRAVOUpdateProtectedRoots -Paths $Paths
+    if (-not $protectedRoots.Success) {
+        return (& $fail @($protectedRoots.Findings) 'Blocked' $null '' 'Update')
+    }
+
     # 2-3. Запит: шлях, розмір, схема, секрети, короткий id.
     $read = Read-BRAVOUpdateRequestFile -RequestPath $RequestPath -StateRoot $stateRoot
     if (-not $read.IsValid) { return (& $fail @($read.Finding) 'Blocked' $null '' 'Update') }
@@ -650,6 +637,17 @@ function Invoke-BRAVOUpdateWorker {
     $operationId = [string](Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'operationId')
     $planId = [string](Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'planId')
     $planRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'runtimeRoot')
+    # Прийняті залишкові ризики v1 (DECISIONS-стиль, H1/6): (1) офлайн-реліз самоатестований
+    # (немає ключа підпису: SHA-256 архіва ловить пошкодження, не підміну разом із manifest);
+    # (2) запит, який неелевований код того ж облікового запису може переписати після згоди
+    # UAC (UAC-згода стосується запуску, не вмісту файлу). Пом'якшення v1, не жорстке
+    # виправлення: елевований консольний лог і результат показують короткий id плану,
+    # цільову версію й sha256 джерела, щоб оператор побачив розбіжність із підтвердженим.
+    $planSourceInfo = Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'source'
+    $attestationSha = [string](Get-BRAVOUpdatePropertyValue -InputObject $planSourceInfo -Name 'artifactSha256' -Default '')
+    if ($attestationSha.Length -gt 16) { $attestationSha = $attestationSha.Substring(0, 16) }
+    $attestation = ('Елевований engine виконує план ' + $planId.Substring(0, [Math]::Min(8, $planId.Length)) + ' (' + $action + '), цільова версія ' +
+        [string](Get-BRAVOUpdatePropertyValue -InputObject $planSourceInfo -Name 'packageVersion' -Default '?') + ', sha256 джерела ' + $attestationSha + '...')
 
     # 4. Корені не беруться на віру з запиту.
     $rootProblems = New-Object System.Collections.Generic.List[string]
@@ -806,7 +804,9 @@ function Remove-BRAVOUpdateWorkerPlanWorkDirectory {
         if (-not (Test-BRAVOUpdateWorkerSamePath -Left $parent -Right $WorkRoot)) { return }
         if (-not [System.IO.Directory]::Exists($fullPath)) { return }
         if (Test-BRAVOUpdatePathHasReparsePoint -Path $fullPath -StopAt $WorkRoot) { return }
-        Remove-Item -LiteralPath $fullPath -Recurse -Force -ErrorAction SilentlyContinue
+        # H1: без Remove-Item -Recurse (слідує за junction у дереві, яке може змінювати неелевований код):
+        # обхід no-follow, атрибут кожного каталогу перевіряється перед перелічуванням.
+        [void](Remove-BRAVOUpdateDirectoryTreeNoFollow -FullPath $fullPath)
     } catch {
         $null = $_
     }
@@ -1106,8 +1106,19 @@ function New-BRAVOUpdateCliUsageResult {
 }
 
 function Invoke-BRAVOUpdateElevatedRecover {
+    <#
+    .SYNOPSIS
+        Recover без прав: перезапуск елевованого BRAVO_UPDATE.ps1 -Action Recover
+        -RecoveryId <guid>; результат читається з <StateRoot>\Operations\<id>\result.json.
+    .DESCRIPTION
+        H1: елевований процес НЕ пише у шлях, який задав неелевований викликач
+        (раніше -ResultPath у користувацькому temp: підміна каталогу junction-ом
+        спрямувала б привілейований запис на чужий шлях). Каталог результату створює
+        елевований engine у захищеному дереві стану (Users лише читають).
+        -WorkRoot залишено лише для сумісності підпису: більше не використовується.
+    #>
     [CmdletBinding()]
-    param([string]$ScriptPath = '', [string]$WorkRoot = '', [scriptblock]$ElevatedLauncher)
+    param([string]$ScriptPath = '', [string]$StateRoot = '', [string]$WorkRoot = '', [scriptblock]$ElevatedLauncher)
     $problem = {
         param([string]$Id, [string]$Title, [string]$Details, [int]$Code)
         $hint = $null
@@ -1116,25 +1127,19 @@ function Invoke-BRAVOUpdateElevatedRecover {
         [pscustomobject]@{ ExitCode = $Code; Result = (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($finding)) }
     }
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return (& $problem 'Cli.NoScript' 'Не вказано шлях BRAVO_UPDATE.ps1 для підвищення прав' '' 36) }
-    if ([string]::IsNullOrWhiteSpace($WorkRoot)) { $WorkRoot = [System.IO.Path]::GetTempPath() }
-    $workDirectory = Join-Path $WorkRoot ($script:BRAVOUpdateWorkerPlanWorkPrefix + [guid]::NewGuid().ToString('N'))
-    $private = New-BRAVOUpdatePrivateDirectory -Path $workDirectory
-    if (-not $private.Success) { return (& $problem 'Cli.WorkDirectory' 'Не вдалося створити робочий каталог' ($private.Problems -join '; ') 80) }
-    try {
-        $resultFile = Join-Path $workDirectory 'recover-result.json'
-        $launched = Invoke-BRAVOUpdateElevatedProcess -ScriptPath $ScriptPath -ElevatedLauncher $ElevatedLauncher `
-            -ScriptArgument @('-Action', 'Recover', '-ResultPath', $resultFile, '-NoPause')
-        if (-not $launched.Launched) { return (& $problem 'Worker.PrivilegeRequired' 'Підвищення прав не підтверджено' ([string]$launched.Error) 36) }
-        $read = Read-BRAVOUpdateContractFile -Path $resultFile -Kind DeploymentResult
-        if (-not $read.IsValid) {
-            $code = [int]$launched.ExitCode
-            if ($code -le 0) { $code = 80 }
-            return (& $problem 'Cli.NoResult' 'Елевований процес не залишив результату' (($read.Problems) -join '; ') $code)
-        }
-        return [pscustomobject]@{ ExitCode = [int]$read.Contract.exitCode; Result = $read.Contract }
-    } finally {
-        Remove-BRAVOUpdateWorkerPlanWorkDirectory -Path $workDirectory -WorkRoot $WorkRoot
+    if ([string]::IsNullOrWhiteSpace($StateRoot)) { $StateRoot = [string](Get-BRAVOUpdateDefaultPaths).StateRoot }
+    $recoveryId = [guid]::NewGuid().ToString()
+    $launched = Invoke-BRAVOUpdateElevatedProcess -ScriptPath $ScriptPath -ElevatedLauncher $ElevatedLauncher `
+        -ScriptArgument @('-Action', 'Recover', '-RecoveryId', $recoveryId, '-NoPause')
+    if (-not $launched.Launched) { return (& $problem 'Worker.PrivilegeRequired' 'Підвищення прав не підтверджено' ([string]$launched.Error) 36) }
+    $resultFile = Join-Path (Join-Path (Join-Path $StateRoot 'Operations') $recoveryId) 'result.json'
+    $read = Read-BRAVOUpdateContractFile -Path $resultFile -Kind DeploymentResult
+    if (-not $read.IsValid) {
+        $code = [int]$launched.ExitCode
+        if ($code -le 0) { $code = 80 }
+        return (& $problem 'Cli.NoResult' 'Елевований процес не залишив результату' (($read.Problems) -join '; ') $code)
     }
+    return [pscustomobject]@{ ExitCode = [int]$read.Contract.exitCode; Result = $read.Contract }
 }
 
 function Invoke-BRAVOUpdateCliMutation {
@@ -1224,7 +1229,12 @@ function Invoke-BRAVOUpdateCliMutation {
 
     # 3. Запит. Каталоги протоколу створює лише процес з правами.
     $stateRoot = [string]$Paths.StateRoot
-    if ($IsAdministrator) { [void](Initialize-BRAVOUpdateStateDirectories -StateRoot $stateRoot) }
+    if ($IsAdministrator) {
+        $initialized = Initialize-BRAVOUpdateProtectedRoots -Paths $Paths
+        if (-not $initialized.Success) {
+            return (& $refuse 'State.RootUnsafe' 'Каталоги стану engine не пройшли перевірку власника/прав' (@($initialized.Problems) -join '; ') $plan $null 'Blocked')
+        }
+    }
     $changes = Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'changes'
     $scheduler = Get-BRAVOUpdatePropertyValue -InputObject $changes -Name 'scheduler'
     $activation = [string](Get-BRAVOUpdatePropertyValue -InputObject $scheduler -Name 'activationPolicy' -Default '')
@@ -1294,7 +1304,7 @@ function Invoke-BRAVOUpdateCliAction {
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Plan', 'Execute', 'Install', 'Update', 'Repair', 'Recover', 'Diagnose')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('State', 'Preflight', 'Plan', 'Execute', 'Install', 'Update', 'Repair', 'Recover', 'Diagnose', 'Initialize')][string]$Action,
         [ValidateSet('', 'Install', 'Update', 'Repair')][string]$Operation = '',
         [string]$RuntimeRoot = '',
         [string]$SourcePath = '',
@@ -1305,6 +1315,7 @@ function Invoke-BRAVOUpdateCliAction {
         [string]$PlanPath = '',
         [string]$RequestPath = '',
         [string]$ConfirmPlanId = '',
+        [string]$RecoveryId = '',
         [switch]$NonInteractive,
         [string[]]$CandidateRoots = @(),
         $Paths = $null,
@@ -1322,7 +1333,7 @@ function Invoke-BRAVOUpdateCliAction {
     )
     $useDefaultAdapter = ($null -eq $Adapter)
     if ($null -eq $Paths) { $Paths = Get-BRAVOUpdateDefaultPaths }
-    if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter }
+    if ($null -eq $Adapter) { $Adapter = New-BRAVOUpdateDefaultAdapter -StagingRoot ([string]$Paths.StagingRoot) }
     $isAdmin = $IsAdministrator
     if ($null -eq $isAdmin) { $isAdmin = Test-BRAVOUpdateWorkerIsAdministrator }
     $isAdmin = [bool]$isAdmin
@@ -1396,13 +1407,61 @@ function Invoke-BRAVOUpdateCliAction {
             if ($null -ne $Operations) { $workerArguments['Operations'] = $Operations }
             if ($null -ne $Now) { $workerArguments['Now'] = $Now }
             $worker = Invoke-BRAVOUpdateWorker @workerArguments
-            return (& $done ([int]$worker.ExitCode) $worker.Result)
+            $executed = & $done ([int]$worker.ExitCode) $worker.Result
+            # H1/6: короткий id плану, версія й sha джерела — на початок елевованого консольного підсумку.
+            if (-not [string]::IsNullOrEmpty([string]$worker.Attestation)) { $executed.Lines = @([string]$worker.Attestation) + @($executed.Lines) }
+            return $executed
+        }
+        'Initialize' {
+            # Первинне налаштування каталогів стану: лише з правами адміністратора (GUI їх не створює).
+            if (-not $isAdmin) {
+                $finding = New-BRAVOUpdateWorkerFinding -Id 'Worker.PrivilegeRequired' -Title 'Для первинного налаштування потрібні права адміністратора' -Action 'Запустіть від імені адміністратора (підтвердіть UAC).' -Hint 36
+                return (& $done 36 (New-BRAVOUpdatePreflightResult -Operation 'Diagnose' -Findings @($finding)))
+            }
+            $initialized = Initialize-BRAVOUpdateProtectedRoots -Paths $Paths
+            if (-not $initialized.Success) { return (& $done 80 (New-BRAVOUpdatePreflightResult -Operation 'Diagnose' -Findings @($initialized.Findings))) }
+            $okFinding = New-BRAVOUpdateFinding -Id 'State.RootsReady' -Severity Ok -Title 'Каталоги стану engine готові' -Details ('створено: ' + @($initialized.Created).Count + '; оновлено права: ' + @($initialized.Reapplied).Count)
+            return (& $done 0 (New-BRAVOUpdatePreflightResult -Operation 'Diagnose' -Findings @($okFinding)))
         }
         'Recover' {
             $target = 'Invoke-BRAVORecovery'
             if (($null -ne $Operations) -and $Operations.ContainsKey('Recover')) { $target = $Operations['Recover'] }
             if ($isAdmin) {
+                # H1: корені engine перевіряються ДО читання журналів відновлення.
+                $recoverRoots = Initialize-BRAVOUpdateProtectedRoots -Paths $Paths
+                if (-not $recoverRoots.Success) {
+                    return (& $done 80 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($recoverRoots.Findings)))
+                }
                 $recoveryArguments = @{ StateRoot = [string]$Paths.StateRoot; LockRoot = [string]$Paths.LockRoot; OperationLockPath = [string]$Paths.OperationLockPath; Adapter = $Adapter; VersionStatePath = [string]$Paths.VersionStatePath }
+                # Контракт E5: Recovery для Update/Repair вимагає знайдений корінь установки й корені staging/backup engine
+                # (journal.stagingRoot має дорівнювати StagingRoot engine); викликається ПІСЛЯ перевірки захищених коренів.
+                # Корінь установки визначається НЕЗАЛЕЖНИМ виявленням (Get-BRAVOInstallationState); явний -RuntimeRoot
+                # приймається лише якщо його знайшло виявлення. Валідатор Recovery не послаблюється.
+                $recoverRuntime = ''
+                $recoverCandidates = @()
+                try {
+                    # Без явного RuntimeRoot: виявлення незалежне від того, що вказав викликач.
+                    $independentArguments = @{}
+                    foreach ($argumentKey in $stateArguments.Keys) { $independentArguments[$argumentKey] = $stateArguments[$argumentKey] }
+                    $independentArguments['RuntimeRoot'] = ''
+                    $recoverState = Get-BRAVOUpdateCliState @independentArguments
+                    $recoverRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'runtimeRoot' -Default '')
+                    $recoverCandidates = @(@(Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'candidateRoots' -Default @()) | ForEach-Object { [string]$_ })
+                } catch { $recoverRuntime = ''; $recoverCandidates = @() }
+                if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+                    $explicitFound = @($recoverCandidates | Where-Object { Test-BRAVOUpdateWorkerSamePath -Left $_ -Right $RuntimeRoot })
+                    if (($explicitFound.Count -eq 0) -and -not (Test-BRAVOUpdateWorkerSamePath -Left $recoverRuntime -Right $RuntimeRoot)) {
+                        $foreignRecover = New-BRAVOUpdateWorkerFinding -Id 'Cli.RecoverRuntimeRoot' -Title 'Вказаний -RuntimeRoot не є знайденим встановленням BRAVO' -Details $RuntimeRoot -Action 'Не вказуйте -RuntimeRoot або вкажіть каталог, який знайшов engine.'
+                        return (& $done 80 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($foreignRecover)))
+                    }
+                    $recoverRuntime = $RuntimeRoot
+                }
+                $recoveryArguments['StagingRoot'] = [string]$Paths.StagingRoot
+                $recoveryArguments['BackupRoot'] = [string]$Paths.BackupRoot
+                if (-not [string]::IsNullOrWhiteSpace($recoverRuntime)) { $recoveryArguments['RuntimeRoot'] = $recoverRuntime }
+                foreach ($optionalName in @('RuntimeRoot', 'StagingRoot', 'BackupRoot')) {
+                    if ($recoveryArguments.ContainsKey($optionalName) -and -not (Test-BRAVOUpdateWorkerAcceptsParameter -Operation $target -Name $optionalName)) { $recoveryArguments.Remove($optionalName) }
+                }
                 $outcome = $null
                 try {
                     $outcome = @(& $target @recoveryArguments) | Where-Object { ($null -ne $_) -and ($null -ne $_.PSObject.Properties['status']) -and ($null -ne $_.PSObject.Properties['operationId']) } | Select-Object -Last 1
@@ -1411,10 +1470,17 @@ function Invoke-BRAVOUpdateCliAction {
                     return (& $done 82 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Status Critical -Finding @($recoverFinding)))
                 }
                 if ($null -eq $outcome) { return (& $usage 'Відновлення не повернуло результат' '') }
+                # H1/5: результат елевованого Recover — лише у Operations/<recoveryId>/result.json під StateRoot
+                # (захищене дерево; неелевований викликач читає його звідти), а не у шлях, заданий викликачем.
+                if (-not [string]::IsNullOrWhiteSpace($RecoveryId)) {
+                    if (-not (Test-BRAVOUpdateGuidText -Value $RecoveryId)) { return (& $usage 'RecoveryId має бути GUID' '') }
+                    $recoveryOperation = New-BRAVOUpdateOperationDirectory -StateRoot ([string]$Paths.StateRoot) -OperationId $RecoveryId -LauncherSid ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+                    if ($recoveryOperation.Success) { [void](Write-BRAVOUpdateWorkerResultFile -OperationDirectory ([string]$recoveryOperation.Path) -Result $outcome) }
+                }
                 return (& $done ([int]$outcome.exitCode) $outcome)
             }
             # Без прав: перезапуск процесом з правами; результат — через тимчасовий файл.
-            $elevated = Invoke-BRAVOUpdateElevatedRecover -ScriptPath $ScriptPath -WorkRoot $WorkRoot -ElevatedLauncher $ElevatedLauncher
+            $elevated = Invoke-BRAVOUpdateElevatedRecover -ScriptPath $ScriptPath -StateRoot ([string]$Paths.StateRoot) -ElevatedLauncher $ElevatedLauncher
             return (& $done ([int]$elevated.ExitCode) $elevated.Result)
         }
         default {

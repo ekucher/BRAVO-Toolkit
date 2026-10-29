@@ -20,7 +20,10 @@
         $lk = Join-Path $pfTSite 'Locks'
         $sg = Join-Path $pfTSite 'Staging'
         $bk = Join-Path $pfTSite 'Backup'
-        foreach ($dir in @($rt, $st, $lk, $sg, $bk)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        [void](New-Item -ItemType Directory -Path $rt -Force)
+        # H1: корені engine створюються канонічним Initialize (захищений DACL/власник): звичайний New-Item
+        # успадкував би ACL temp, який Preflight справедливо вважає небезпечним.
+        $null = & $pfTModule { param($x) Initialize-BRAVOUpdateProtectedRoots -Paths $x } ([pscustomobject]@{ StateRoot = $st; LockRoot = $lk; StagingRoot = $sg; BackupRoot = $bk })
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
         [System.IO.File]::WriteAllText((Join-Path $rt 'VERSION.json'), '{"packageVersion":"5.3.0"}', $utf8Bom)
         [System.IO.File]::WriteAllText((Join-Path $rt 'RUNTIME_MANIFEST.json'), '{}', $utf8Bom)
@@ -66,6 +69,7 @@
         # ---- Базовий сценарій ----------------------------------------------
         & {
             $r = & $call $null
+            Test-BRAVOCondition -Condition (@(@($r.findings) | Where-Object { $_.id -ceq 'Preflight.StateRoots' -and $_.severity -ceq 'Ok' }).Count -eq 1) -Name 'UpdatePreflight/StateRootsValidatedOk' -Failure 'Захищені корені мають давати Ok-finding Preflight.StateRoots'
             Test-BRAVOCondition -Condition ($r.canProceed -and $r.blockerCount -eq 0) -Name 'UpdatePreflight/HealthyUpdateProceeds' -Failure 'Здорове оновлення має проходити без blocker-ів'
             Test-BRAVOCondition -Condition ($r.operation -eq 'Update' -and $r.runtimeRoot -eq $rt) -Name 'UpdatePreflight/ResultShape' -Failure 'operation/runtimeRoot не відображено'
             $allPrefixed = $true; $blockerActionOk = $true

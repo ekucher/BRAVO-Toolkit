@@ -759,6 +759,31 @@ function Test-BRAVODeploymentPreflight {
             -Action 'Перевірку задач буде повторено перед змінами.'
     }
 
+    # ---- Власник і права коренів engine (H1; лише перевірка, нічого не створюється) ----
+    # Наявний корінь із чужим власником/правами Users на запис/успадкуванням або reparse point —
+    # Blocker для mutation (Warning для Diagnose: Add-BRAVOPreflightFinding знижує). Відсутні
+    # корені не помилка: їх створює елевований engine; GUI їх не створює. Неелевований
+    # процес довіряє особистому SID (див. Get-BRAVOUpdateTrustedSid), елевований engine
+    # перевіряє суворіше й підтвердить або заблокує остаточно.
+    try {
+        $rootCheck = Initialize-BRAVOUpdateProtectedRoots -Validate -Paths ([pscustomobject]@{ StateRoot = $StateRoot; LockRoot = $LockRoot; StagingRoot = $StagingRoot; BackupRoot = $BackupRoot })
+        if ($rootCheck.Success) {
+            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.StateRoots' -Severity 'Ok' `
+                -Title 'Каталоги стану engine мають довіреного власника й права' -Meaning 'Перевірено власника, успадкування, права Users і reparse points наявних каталогів.' `
+                -Details ('відсутні (створить engine): ' + @($rootCheck.Missing).Count)
+        } else {
+            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.StateRoots' -Severity 'Blocker' `
+                -Title 'Каталоги стану engine не пройшли перевірку власника/прав' `
+                -Meaning 'Каталог могли створити або змінити непривілейовані користувачі; довіряти журналам і запитам у ньому не можна.' `
+                -Action 'Адміністратор має вручну перевірити й прибрати зазначені каталоги; engine не перезаписує права каталогів із чужим власником.' `
+                -Details ([string]::Join('; ', @($rootCheck.Problems)))
+        }
+    } catch {
+        Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.StateRoots' -Severity 'Blocker' `
+            -Title 'Каталоги стану engine не вдалося перевірити' -Meaning 'Не доведено, що каталоги стану безпечні.' `
+            -Action 'Повторіть перевірку; якщо помилка зберігається, зверніться до адміністратора.' -Details $_.Exception.Message
+    }
+
     # ---- Відкритий журнал -------------------------------------------------
     if ($AllowOpenJournal) {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.OpenJournal' -Severity 'NotApplicable' `
