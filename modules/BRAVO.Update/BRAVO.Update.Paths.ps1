@@ -110,27 +110,35 @@ function Invoke-BRAVOUpdateChildProcess {
     <#
     .SYNOPSIS
         Запускає powershell.exe -NoProfile -NonInteractive -File <Script> ...
-        і повертає { ExitCode, Output, TimedOut }.
+        і повертає { ExitCode, Output, TimedOut, LogPath }.
     .DESCRIPTION
         Секрети в аргументи НЕ передаються (лише шляхи та імена компонентів).
         Завершується лише власний дочірній процес (за об'єктом Process, що
-        створив цей виклик) і лише після таймауту.
+        створив цей виклик, тобто за його handle, а не за ім'ям чи віком) і
+        лише після таймауту.
+        -ExecutionPolicy RemoteSigned (не Bypass): політика машини не
+        послаблюється до повного обходу (ENGINE_DESIGN §6).
+        Вивід ЗАВЖДИ проходить Protect-BRAVOLogSecret перед поверненням і
+        записом у -LogPath; якщо маскувальник недоступний, вивід не
+        повертається (fail closed).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ScriptPath,
         [string[]]$ScriptArgument = @(),
-        [int]$TimeoutSeconds = 600
+        [int]$TimeoutSeconds = 600,
+        [string]$WorkingDirectory = '',
+        [string]$LogPath = ''
     )
 
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
-        return [pscustomobject]@{ ExitCode = -1; Output = "Скрипт не знайдено: $ScriptPath"; TimedOut = $false }
+        return [pscustomobject]@{ ExitCode = -1; Output = "Скрипт не знайдено: $ScriptPath"; TimedOut = $false; LogPath = $null }
     }
     $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powershellPath -PathType Leaf)) { $powershellPath = 'powershell.exe' }
 
     $parts = New-Object System.Collections.Generic.List[string]
-    foreach ($fixed in @('-NoProfile', '-NonInteractive', '-File')) { $parts.Add($fixed) }
+    foreach ($fixed in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File')) { $parts.Add($fixed) }
     $parts.Add((ConvertTo-BRAVOUpdateQuotedArgument -Value $ScriptPath))
     foreach ($argument in @($ScriptArgument)) {
         # Перемикачі й імена параметрів (-NoPause, -Action) не лапкуємо;
@@ -145,6 +153,36 @@ function Invoke-BRAVOUpdateChildProcess {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) { $startInfo.WorkingDirectory = $WorkingDirectory }
+
+    # Маскування секретів ДО повернення й запису в лог. Модуль BRAVO.Logging
+    # підключає Initialize-BRAVOUpdateDiagLogging (частина Diagnostics).
+    $maskingAvailable = $true
+    try {
+        Initialize-BRAVOUpdateDiagLogging
+    } catch {
+        $maskingAvailable = $false
+    }
+    $mask = {
+        param([string]$Raw)
+        if (-not $maskingAvailable) { return '[вивід приховано: маскування секретів недоступне]' }
+        return [string](Protect-BRAVOLogSecret -Text $Raw)
+    }
+    $writeLog = {
+        param([string]$MaskedText)
+        if ([string]::IsNullOrWhiteSpace($LogPath)) { return $null }
+        try {
+            $logDirectory = Split-Path -Parent $LogPath
+            if (-not [string]::IsNullOrWhiteSpace($logDirectory) -and -not [IO.Directory]::Exists($logDirectory)) {
+                [void][IO.Directory]::CreateDirectory($logDirectory)
+            }
+            [IO.File]::WriteAllText($LogPath, $MaskedText, (New-Object System.Text.UTF8Encoding($false)))
+            return $LogPath
+        } catch {
+            # Лог допоміжний: збій запису не має ховати код виходу дочірнього процесу.
+            return $null
+        }
+    }
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -153,14 +191,20 @@ function Invoke-BRAVOUpdateChildProcess {
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            # Лише власний об'єкт Process (handle, отриманий зі Start): PID міг
+            # би бути перевикористаний, handle — ні.
             try { $process.Kill() } catch { <# власний дочірній процес міг завершитись між WaitForExit і Kill — гонитва очікувана #> }
-            return [pscustomobject]@{ ExitCode = -1; Output = "Таймаут $TimeoutSeconds с: $ScriptPath"; TimedOut = $true }
+            $timeoutText = & $mask "Таймаут $TimeoutSeconds с: $ScriptPath"
+            $timeoutLog = & $writeLog $timeoutText
+            return [pscustomobject]@{ ExitCode = -1; Output = $timeoutText; TimedOut = $true; LogPath = $timeoutLog }
         }
         $process.WaitForExit()
         $text = [string]$stdoutTask.Result
         $errText = [string]$stderrTask.Result
         if (-not [string]::IsNullOrWhiteSpace($errText)) { $text = $text + [Environment]::NewLine + $errText }
-        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = $text; TimedOut = $false }
+        $maskedText = & $mask $text
+        $writtenLog = & $writeLog $maskedText
+        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = $maskedText; TimedOut = $false; LogPath = $writtenLog }
     } finally {
         $process.Dispose()
     }
@@ -203,29 +247,32 @@ function New-BRAVOUpdateDefaultAdapter {
 
     $adapter = @{}
 
+    # Другий параметр $LogPath необов'язковий (Validation передає шлях логу в
+    # <opDir>\logs; stub-адаптери з одним параметром його ігнорують).
+    # Прямий запуск guard сам викликає Test-BRAVOVersionDowngrade -NoWrite (F5).
     $adapter.InvokeGuard = {
-        param([string]$RuntimeRoot)
+        param([string]$RuntimeRoot, [string]$LogPath)
         if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
         Invoke-BRAVOUpdateChildProcess -ScriptPath (Join-Path $RuntimeRoot 'BRAVO_RUNTIME_GUARD.ps1') `
-            -ScriptArgument @('-RuntimeRoot', $RuntimeRoot, '-Mode', 'Enforce') -TimeoutSeconds 300
+            -ScriptArgument @('-RuntimeRoot', $RuntimeRoot, '-Mode', 'Enforce') -TimeoutSeconds 300 -LogPath $LogPath
     }
     $adapter.InvokeSetupScheduler = {
-        param([string]$RuntimeRoot)
+        param([string]$RuntimeRoot, [string]$LogPath)
         if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
         Invoke-BRAVOUpdateChildProcess -ScriptPath (Join-Path $RuntimeRoot 'BRAVO_SETUP.ps1') `
-            -ScriptArgument @('-Action', 'Scheduler', '-NoPause') -TimeoutSeconds 900
+            -ScriptArgument @('-Action', 'Scheduler', '-SkipTestNotification', '-NoElevation', '-NoPause') -TimeoutSeconds 900 -LogPath $LogPath
     }
     $adapter.InvokeSetupValidate = {
-        param([string]$RuntimeRoot)
+        param([string]$RuntimeRoot, [string]$LogPath)
         if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
         Invoke-BRAVOUpdateChildProcess -ScriptPath (Join-Path $RuntimeRoot 'BRAVO_SETUP.ps1') `
-            -ScriptArgument @('-ValidateOnly', '-SkipAccessTest', '-SkipTestNotification', '-NoPause') -TimeoutSeconds 900
+            -ScriptArgument @('-ValidateOnly', '-SkipAccessTest', '-SkipTestNotification', '-NoElevation', '-NoPause') -TimeoutSeconds 900 -LogPath $LogPath
     }
     $adapter.InvokeSelfTest = {
-        param([string]$RuntimeRoot)
+        param([string]$RuntimeRoot, [string]$LogPath)
         if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) { $RuntimeRoot = $ToolkitRoot }
         Invoke-BRAVOUpdateChildProcess -ScriptPath (Join-Path $RuntimeRoot 'BRAVO_SELF_TEST.ps1') `
-            -ScriptArgument @('-NoPause') -TimeoutSeconds 3600
+            -ScriptArgument @('-NoPause') -TimeoutSeconds 3600 -LogPath $LogPath
     }
     # Посилання на фінальний (замкнений) adapter: GetManagedTasks/SetTaskEnabled
     # викликають його GetEffectiveConfiguration, щоб область задач (TaskPath +
