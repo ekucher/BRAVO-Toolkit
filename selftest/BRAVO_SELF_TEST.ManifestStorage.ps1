@@ -1051,6 +1051,88 @@ function Get-BRAVOFileHash {
             -Name "BackupConsistency/RelocatedUnavailableDestinationKeepsGeneration" `
             -Failure "якщо канонічний каталог компонента недоступний, generation не повинна видалятися (ні архіви, ні manifest): лише WARNING"
 
+        # 7c2: записані шляхи збігаються з канонічними (перебудови немає), але
+        # каталог компонента недоступний (відключений том). Відсутній файл
+        # не доводить, що його вже видалено: раніше такий компонент рахувався
+        # "уже видаленим", manifest зникав, а архіви інших компонентів
+        # лишались сиротами. Свіжі generation мають лише MODEL, тож BLOG
+        # прострочена generation є єдиною, що залежить від каталогу BLOG.
+        $savedSameRecordedEnableArchiveDeletion = $global:enableArchiveDeletion
+        $savedSameRecordedMinimumRetained = $global:minimumRetainedVerifiedBackups
+        $global:enableArchiveDeletion = $true
+        $global:minimumRetainedVerifiedBackups = 1
+        $sameRecordedOfflineRoot = Join-Path $retentionStatusTestRoot 'same-recorded-offline'
+        [void](New-BRAVORetentionComponentFixture -Root $sameRecordedOfflineRoot -GenerationId '20261001_230000' `
+            -StartedAt (Get-Date) -Components @('MODEL'))
+        [void](New-BRAVORetentionComponentFixture -Root $sameRecordedOfflineRoot -GenerationId '20260930_230000' `
+            -StartedAt (Get-Date).AddDays(-1) -Components @('MODEL'))
+        $sameRecordedOfflineManifest = New-BRAVORetentionComponentFixture -Root $sameRecordedOfflineRoot `
+            -GenerationId '20260301_230000' -StartedAt (Get-Date).AddDays(-200)
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath (Join-Path $sameRecordedOfflineRoot 'BLOG') -Recurse -Force
+        $sameRecordedOfflineOk = Invoke-BRAVORetentionFixtureCleanup -Root $sameRecordedOfflineRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $sameRecordedOfflineRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $sameRecordedOfflineOk -eq $true -and
+                (Test-Path -LiteralPath $sameRecordedOfflineManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $sameRecordedOfflineRoot 'MODEL') 'MODEL_20260301_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $sameRecordedOfflineRoot 'MODEL') 'MODEL_20260301_230000.mdz.sha512')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'каталог компонента недоступний')
+            ) `
+            -Name "BackupConsistency/SameRecordedPathUnavailableDestinationKeepsManifest" `
+            -Failure "якщо записаний шлях збігається з канонічним, а каталог компонента недоступний, відсутній файл не означає 'уже видалено': manifest і архіви інших компонентів мають лишитися, WARNING називає недоступний каталог"
+
+        # Регрес-захист: каталог компонента доступний, а файла справді немає
+        # (уже видалений) - generation видаляється як і раніше.
+        $sameRecordedMissingRoot = Join-Path $retentionStatusTestRoot 'same-recorded-missing-file'
+        [void](New-BRAVORetentionComponentFixture -Root $sameRecordedMissingRoot -GenerationId '20261001_230000' `
+            -StartedAt (Get-Date) -Components @('MODEL'))
+        [void](New-BRAVORetentionComponentFixture -Root $sameRecordedMissingRoot -GenerationId '20260930_230000' `
+            -StartedAt (Get-Date).AddDays(-1) -Components @('MODEL'))
+        $sameRecordedMissingManifest = New-BRAVORetentionComponentFixture -Root $sameRecordedMissingRoot `
+            -GenerationId '20260301_230000' -StartedAt (Get-Date).AddDays(-200)
+        $sameRecordedBlogDirectory = Join-Path $sameRecordedMissingRoot 'BLOG'
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath (Join-Path $sameRecordedBlogDirectory 'BLOG_20260301_230000.mdz') -Force
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath (Join-Path $sameRecordedBlogDirectory 'BLOG_20260301_230000.mdz.sha512') -Force
+        $sameRecordedMissingOk = Invoke-BRAVORetentionFixtureCleanup -Root $sameRecordedMissingRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $sameRecordedMissingRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $sameRecordedMissingOk -eq $true -and
+                (Test-Path -LiteralPath $sameRecordedBlogDirectory -PathType Container) -and
+                -not (Test-Path -LiteralPath $sameRecordedMissingManifest) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $sameRecordedMissingRoot 'MODEL') 'MODEL_20260301_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $sameRecordedMissingRoot 'MODEL') 'MODEL_20260930_230000.mdz'))
+            ) `
+            -Name "BackupConsistency/SameRecordedPathAvailableDestinationMissingFileStillDeletes" `
+            -Failure "якщо каталог компонента доступний, а файла за записаним (канонічним) шляхом немає, його вважають уже видаленим: прострочена generation має видалятися як і раніше"
+        $global:enableArchiveDeletion = $savedSameRecordedEnableArchiveDeletion
+        $global:minimumRetainedVerifiedBackups = $savedSameRecordedMinimumRetained
+
+        # 7c3: файл за записаним шляхом ІСНУЄ, але його ім'я належить іншій
+        # (поточній) generation. Підмінений manifest простроченої FAILED
+        # generation без identity gate видалив би чужий архів у обхід
+        # захищених і поточної.
+        $existingForeignRoot = Join-Path $retentionStatusTestRoot 'existing-foreign-name'
+        [void](New-BRAVORetentionComponentFixture -Root $existingForeignRoot -GenerationId '20261001_230000' -StartedAt (Get-Date))
+        $existingForeignManifest = New-BRAVORetentionComponentFixture -Root $existingForeignRoot `
+            -GenerationId '20250301_230000' -StartedAt (Get-Date).AddDays(-580) -Status 'FAILED'
+        [IO.File]::WriteAllText($existingForeignManifest, (
+            [IO.File]::ReadAllText($existingForeignManifest).Replace('MODEL_20250301_230000.mdz', 'MODEL_20261001_230000.mdz')
+        ))
+        $existingForeignOk = Invoke-BRAVORetentionFixtureCleanup -Root $existingForeignRoot `
+            -CurrentGenerationId '20261001_230000' -ArchiveDefinitions (Get-BRAVORetentionFixtureDefinitions -Root $existingForeignRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $existingForeignOk -eq $true -and
+                (Test-Path -LiteralPath $existingForeignManifest) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $existingForeignRoot 'MODEL') 'MODEL_20261001_230000.mdz')) -and
+                (Test-Path -LiteralPath (Join-Path (Join-Path $existingForeignRoot 'MODEL') 'MODEL_20261001_230000.mdz.sha512')) -and
+                (Test-BRAVORetentionLogged -Level 'WARNING' -Pattern 'не належить generation 20250301_230000')
+            ) `
+            -Name "ManifestStorage/ExistingRecordedPathStillChecksNameTemplate" `
+            -Failure "існуючий файл за записаним шляхом з ім'ям іншої generation не повинен видалятися: identity gate за NameTemplate діє і для записаного шляху, generation лишається з WARNING"
+
         # 7d: метадані архіву не читаються (файл зник після Test-Path, ACL).
         # Це проблема однієї generation: WARNING для неї, решта обробляється.
         $metadataRoot = Join-Path $retentionStatusTestRoot 'metadata'
