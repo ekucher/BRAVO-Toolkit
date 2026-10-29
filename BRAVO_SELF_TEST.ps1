@@ -34423,6 +34423,38 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdatePreflight' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateBackup') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateBackup'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateBackup') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateBackup.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateBackup' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateValidation') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateValidation'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateValidation') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateValidation.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateValidation' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRecovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateReconcile') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateReconcile'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateReconcile') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateReconcile.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateReconcile' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     # #219 (частина B): сюди доходять лише маркери глобальних меж і винятки
     # з коду МІЖ секціями. Register-BRAVOSelfTestGlobalFatal реєструє
