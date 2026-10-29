@@ -115,7 +115,7 @@ try {
         $owned = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVOUpdateSiteOwnedPaths'
         Test-BRAVOCondition -Condition (@($owned.Files).Count -eq 5 -and @($owned.Files) -contains 'BRAVO.local.config' -and @($owned.Files) -contains 'BRAVO_OPERATION.lock' -and @($owned.Files) -contains 'WinSCP.ini' -and @($owned.Files) -contains 'TOOLS_INTEGRITY.json' -and @($owned.Files) -contains 'BRAVO.config') `
             -Name 'UpdatePlan/SiteOwnedFiles' -Failure 'набір site-owned файлів мусить збігатися з robocopy /XF розгортання'
-        Test-BRAVOCondition -Condition (@($owned.Dirs).Count -eq 10 -and @($owned.Dirs) -contains 'artifacts' -and @($owned.Dirs) -contains 'LOGS' -and @($owned.Dirs) -contains 'BAZA_WWW' -and @($owned.Dirs) -contains 'local-backups' -and @($owned.Dirs) -contains '.git' -and @($owned.Dirs) -contains '.vscode') `
+        Test-BRAVOCondition -Condition (@($owned.Dirs).Count -eq 11 -and @($owned.Dirs) -contains '.claude' -and @($owned.Dirs) -contains 'artifacts' -and @($owned.Dirs) -contains 'LOGS' -and @($owned.Dirs) -contains 'BAZA_WWW' -and @($owned.Dirs) -contains 'local-backups' -and @($owned.Dirs) -contains '.git' -and @($owned.Dirs) -contains '.vscode') `
             -Name 'UpdatePlan/SiteOwnedDirs' -Failure 'набір site-owned каталогів мусить збігатися з robocopy /XD розгортання'
         $owned.Files[0] = 'змінено'
         $again = Invoke-BRAVOPlanTestCall -Name 'Get-BRAVOUpdateSiteOwnedPaths'

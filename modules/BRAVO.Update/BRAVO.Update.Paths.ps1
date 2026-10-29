@@ -155,14 +155,10 @@ function Invoke-BRAVOUpdateChildProcess {
     $startInfo.CreateNoWindow = $true
     if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) { $startInfo.WorkingDirectory = $WorkingDirectory }
 
-    # Маскування секретів ДО повернення й запису в лог. Модуль BRAVO.Logging
-    # підключає Initialize-BRAVOUpdateDiagLogging (частина Diagnostics).
-    $maskingAvailable = $true
-    try {
-        Initialize-BRAVOUpdateDiagLogging
-    } catch {
-        $maskingAvailable = $false
-    }
+    # Маскування секретів ДО повернення й запису в лог. BRAVO.Logging
+    # імпортується один раз у BRAVO.Update.psm1; немає Protect-BRAVOLogSecret —
+    # вивід не повертається (fail closed).
+    $maskingAvailable = ($null -ne (Get-Command -Name 'Protect-BRAVOLogSecret' -ErrorAction SilentlyContinue))
     $mask = {
         param([string]$Raw)
         if (-not $maskingAvailable) { return '[вивід приховано: маскування секретів недоступне]' }
