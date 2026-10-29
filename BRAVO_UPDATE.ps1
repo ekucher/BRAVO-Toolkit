@@ -12,6 +12,9 @@ param(
     [string]$BackupDestination = '',
     [ValidateSet('All', 'Runtime', 'Scheduler')]
     [string]$Scope = 'All',
+    # Вибір self-test входить у план, який підтверджує оператор (Default: Include для Install/Update, Skip для Repair).
+    [ValidateSet('Default', 'Include', 'Skip')]
+    [string]$SelfTest = 'Default',
     [string]$PlanPath = '',
     [string]$RequestPath = '',
     [string]$ConfirmPlanId = '',
@@ -184,10 +187,10 @@ $dispatch = @{
     ConfirmPlanId     = $ConfirmPlanId
     RecoveryId        = $RecoveryId
     ScriptPath        = $PSCommandPath
-    CandidateRoots    = @($PSScriptRoot)
     # З -AsJson інтерактивне введення неможливе: підтвердження лише -PlanPath + -ConfirmPlanId.
     NonInteractive    = ([bool]$NonInteractive -or [bool]$AsJson)
     AllowPrerelease   = [bool]$AllowPrerelease
+    SelfTest          = $SelfTest
 }
 if ($interactiveAllowed) {
     $dispatch['Prompt'] = { param([string]$Message) Read-Host -Prompt $Message }
