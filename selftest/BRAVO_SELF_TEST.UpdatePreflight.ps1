@@ -70,6 +70,19 @@
         & {
             $r = & $call $null
             Test-BRAVOCondition -Condition (@(@($r.findings) | Where-Object { $_.id -ceq 'Preflight.StateRoots' -and $_.severity -ceq 'Ok' }).Count -eq 1) -Name 'UpdatePreflight/StateRootsValidatedOk' -Failure 'Захищені корені мають давати Ok-finding Preflight.StateRoots'
+            # GetManagedTasks отримує ЦІЛЬОВИЙ RuntimeRoot (другий аргумент): RuntimeRoot-залежний stub бачить задачі лише для $rt.
+            $closureRt = $rt   # GetNewClosure захоплює лише локальні змінні поточної області
+            $taskSeen = @{ Roots = (New-Object System.Collections.Generic.List[string]) }
+            $rootAwareTasks = { param([string]$TaskPath, [string]$RuntimeRoot) $taskSeen.Roots.Add([string]$RuntimeRoot); if ($RuntimeRoot -ceq $closureRt) { @([pscustomobject]@{ name = 'BRAVO_Test'; state = 'Running'; enabled = $true }) } else { @() } }.GetNewClosure()
+            $rootAwareArgs = @{ Operation = 'Update'; RuntimeRoot = $rt; StateRoot = $st; LockRoot = $lk; OperationLockPath = $opLock
+                StagingRoot = $sg; BackupRoot = $bk; Adapter = @{ GetPreflightEnvironment = $envOk; GetManagedTasks = $rootAwareTasks } }
+            $rootAware = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $rootAwareArgs
+            $runningFinding = @(@($rootAware.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' -and $_.severity -cne 'Ok' })
+            Test-BRAVOCondition -Condition (($taskSeen.Roots.Count -ge 1) -and (@($taskSeen.Roots | Where-Object { $_ -cne $rt }).Count -eq 0) -and ($runningFinding.Count -ge 1)) -Name 'UpdatePreflight/ManagedTasksReceiveTargetRuntimeRoot' -Failure ('roots=' + ($taskSeen.Roots -join ',') + ' running=' + $runningFinding.Count)
+            $planSeen = @{ Roots = (New-Object System.Collections.Generic.List[string]) }
+            $planAdapter = @{ GetManagedTasks = { param([string]$TaskPath, [string]$RuntimeRoot) $planSeen.Roots.Add([string]$RuntimeRoot); @() }.GetNewClosure() }
+            $null = & $pfTModule { param($r, $s, $a) Get-BRAVODeploymentPreconditions -RuntimeRoot $r -StateRoot $s -Adapter $a } $rt $st $planAdapter
+            Test-BRAVOCondition -Condition (($planSeen.Roots.Count -ge 1) -and (@($planSeen.Roots | Where-Object { $_ -cne $rt }).Count -eq 0)) -Name 'UpdatePreflight/PlanPreconditionsPassTargetRuntimeRoot' -Failure ('roots=' + ($planSeen.Roots -join ','))
             # Відмова читання ACL кореня: неелевований процес -> Warning (перевірку виконає worker), елевований -> Blocker.
             $denyReader = { param($Path) throw (New-Object System.UnauthorizedAccessException('READ_CONTROL denied')) }
             foreach ($elevatedCase in @($false, $true)) {

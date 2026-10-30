@@ -72,12 +72,14 @@ function Get-BRAVOUpdatePlanManagedTaskList {
     # Повертає $null, якщо adapter відсутній або впав — "Unknown" не можна
     # плутати з "задач немає".
     [CmdletBinding()]
-    param([hashtable]$Adapter = $null)
+    param([hashtable]$Adapter = $null, [string]$RuntimeRoot = '')
     if ($null -eq $Adapter -or -not $Adapter.ContainsKey('GetManagedTasks') -or $null -eq $Adapter['GetManagedTasks']) {
         return $null
     }
     try {
-        $raw = @(& $Adapter['GetManagedTasks'])
+        # Другий аргумент - цільовий RuntimeRoot: типовий adapter визначає область задач з ефективної конфігурації САМЕ цього
+        # кореня, а не з кореня toolkit (перший - TaskPath, порожній = із конфігурації).
+        $raw = @(& $Adapter['GetManagedTasks'] '' $RuntimeRoot)
     } catch {
         return $null
     }
@@ -202,7 +204,7 @@ function Get-BRAVODeploymentPreconditions {
         [string]$ManifestSha256 = '',
         [hashtable]$Adapter = $null
     )
-    $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter
+    $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $RuntimeRoot
     $taskInputs = 'Unknown'
     if ($null -ne $tasks) {
         $taskInputs = @(foreach ($task in @($tasks)) { $task.name + '=' + $(if ($task.enabled) { 'enabled' } else { 'disabled' }) })
@@ -575,7 +577,7 @@ function New-BRAVODeploymentPlan {
     }
 
     # --- Керовані задачі (стан ДО операції) ---
-    $taskList = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter
+    $taskList = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $RuntimeRoot
     $planTasks = @()
     if ($null -ne $taskList) {
         $planTasks = @(foreach ($task in @($taskList)) { [pscustomobject][ordered]@{ name = $task.name; enabledBefore = $task.enabled } })

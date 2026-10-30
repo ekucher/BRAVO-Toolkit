@@ -727,7 +727,8 @@ function Test-BRAVODeploymentPreflight {
     # ---- Керовані задачі через adapter -----------------------------------
     if ($adapterTable.ContainsKey('GetManagedTasks') -and $adapterTable['GetManagedTasks'] -is [scriptblock]) {
         try {
-            $managedTasks = @(& $adapterTable['GetManagedTasks'])
+            # Цільовий RuntimeRoot - другим аргументом (перший - TaskPath, порожній = із конфігурації цього кореня).
+            $managedTasks = @(& $adapterTable['GetManagedTasks'] '' $RuntimeRoot)
             $runningNames = New-Object System.Collections.Generic.List[string]
             foreach ($task in $managedTasks) {
                 $taskState = [string](Get-BRAVOPreflightProperty -InputObject $task -Name 'state' -Default '')

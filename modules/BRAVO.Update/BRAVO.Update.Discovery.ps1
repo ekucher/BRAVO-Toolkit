@@ -289,7 +289,8 @@ function Get-BRAVOInstallationState {
                 -Action 'Повторіть discovery із робочим adapter-ом.'))
         } else {
             try {
-                $taskList = @(& $getTasks | Where-Object { $null -ne $_ })
+                # Явний цільовий RuntimeRoot (якщо заданий) визначає область задач; порожній = корінь toolkit (adapter).
+                $taskList = @(& $getTasks '' $RuntimeRoot | Where-Object { $null -ne $_ })
             } catch {
                 $taskList = $null
                 [void]$findings.Add((New-BRAVOUpdateFinding -Id 'Discovery.Scheduler' -Severity Warning `
