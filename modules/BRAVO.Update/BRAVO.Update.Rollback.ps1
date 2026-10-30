@@ -1178,6 +1178,7 @@ function Invoke-BRAVORollback {
                         return
                     }
                     $reconcile = Invoke-BRAVOSchedulerReconcile -Context $rb.Context -Snapshot $rb.SchedulerSnapshot
+                    if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $reconcile -Name 'TreeNotContained' -Default $false)) { $rb.TreeNotContained = $true; throw 'Process.TreeNotContained: дерево процесів setup (Rollback.Scheduler) не підтверджено завершеним.' }
                     if (([string]$reconcile.Verdict) -ceq 'FAIL') { throw ('Повторне налаштування scheduler зі старого runtime не вдалося: ' + (@($reconcile.Problems) -join '; ')) }
                 })
             }
@@ -1203,6 +1204,7 @@ function Invoke-BRAVORollback {
                 $setupBaseline = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'setupValidateExitCode'
                 if (($rb.Action -ceq 'Repair') -and ($null -ne $setupBaseline)) { $arguments.SetupValidateBaselineExitCode = [int]$setupBaseline }
                 $verdict = Test-BRAVODeploymentValidation @arguments
+                if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $verdict -Name 'TreeNotContained' -Default $false)) { $rb.TreeNotContained = $true; throw 'Process.TreeNotContained: дерево процесів валідації відкату не підтверджено завершеним.' }
                 foreach ($item in @(Get-BRAVOUpdatePropertyValue -InputObject $verdict -Name 'Items' -Default @())) {
                     [void]$rb.Validation.Add([pscustomobject][ordered]@{
                         name    = [string](Get-BRAVOUpdatePropertyValue -InputObject $item -Name 'Name' -Default '')
@@ -1247,7 +1249,10 @@ function Invoke-BRAVORollback {
 
     # Critical: задачі лишаються вимкненими, журнал Critical, backup і знімки зберігаються.
     $disableNote = ''
+    $treeNotContained = $rb.ContainsKey('TreeNotContained')
     try {
+        # TreeNotContained: вціліла копія setup/перевірки може перереєструвати задачі — задач не чіпаємо.
+        if ($treeNotContained) { throw 'Process.TreeNotContained: задачі не змінюються (невідомий процес міг би їх перереєструвати); потрібне ручне втручання.' }
         $criticalDisable = Disable-BRAVOAllManagedTasks -Adapter $Adapter
         if ($null -ne $criticalDisable -and $criticalDisable.PSObject.Properties['IsComplete'] -and -not $criticalDisable.IsComplete) {
             $disableNote = ' Не всі керовані задачі вдалося вимкнути.'

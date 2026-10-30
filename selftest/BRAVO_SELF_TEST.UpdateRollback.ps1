@@ -69,13 +69,13 @@ function Get-UpdRbTreeHash {
     function script:Invoke-BRAVOSchedulerReconcile {
         [CmdletBinding()] param($Context, $Snapshot)
         $script:UpdRbLog.Add('Reconcile')
-        [pscustomobject]@{ Verdict = [string]$script:UpdRbMode.ReconcileVerdict; ExitCode = 0; CreatedTasks = @(); RequiescedTasks = @(); Problems = @() }
+        [pscustomobject]@{ Verdict = [string]$script:UpdRbMode.ReconcileVerdict; ExitCode = 0; CreatedTasks = @(); RequiescedTasks = @(); Problems = @(); TreeNotContained = [bool]$script:UpdRbMode['ReconcileTree'] }
     }
     function script:Test-BRAVODeploymentValidation {
         [CmdletBinding()] param($Context, $Mode, $ExpectedVersion, $ExpectedManifestPath, $SiteBaseline, $GuardBaselineExitCode, $SetupValidateBaselineExitCode)
         $script:UpdRbLastValidate = @{ Guard = $GuardBaselineExitCode; Setup = $SetupValidateBaselineExitCode }
         $script:UpdRbLog.Add('Validate:' + $Mode)
-        [pscustomobject]@{ Status = [string]$script:UpdRbMode.ValidationStatus; Items = @([pscustomobject]@{ Name = 'RuntimeManifest'; Status = 'Pass'; Message = 'ok' }) }
+        [pscustomobject]@{ Status = [string]$script:UpdRbMode.ValidationStatus; Items = @([pscustomobject]@{ Name = 'RuntimeManifest'; Status = 'Pass'; Message = 'ok' }); TreeNotContained = [bool]$script:UpdRbMode['ValidateTree'] }
     }
 }
 function Reset-UpdRbStubs {
@@ -894,6 +894,26 @@ if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath(
         $direct = Invoke-UpdRbCall -Name 'Invoke-BRAVOInstallRollback' -Arguments @{ Journal = $s.Journal; Adapter = @{}; StateRoot = $s.State }
         Test-BRAVOCondition -Condition ((-not $direct.Success) -and @(Get-UpdRbLog).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $s.Runtime 'BRAVO_A.ps1'))) -Name 'UpdateRollback/Forged/InstallRollbackDirectUntrusted' -Failure 'Invoke-BRAVOInstallRollback сам перевіряє довіру до будь-якої дії'
     }
+    # --- TreeNotContained у відкаті: негайний Critical без змін задач і файлів ---
+    & {
+        # Rollback.Scheduler: setup не вдалося повністю завершити.
+        Reset-UpdRbStubs
+        & $updRbModule { $script:UpdRbMode['ReconcileTree'] = $true }
+        $s = New-UpdRbUpdateScenario -Name 'tree-scheduler' -ConfigureScheduler
+        $r = Invoke-UpdRbRollback -Scenario $s
+        $log = @(Get-UpdRbLog)
+        Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and $r.exitCode -eq 82 -and (Read-UpdRbJournal -Scenario $s).state -eq 'Critical' -and $log[$log.Count - 1] -eq 'Reconcile' -and $log -notcontains 'RestoreTasks' -and @($log | Where-Object { $_ -like 'Disable*' }).Count -eq 1 -and $r.rollback.message -like '*TreeNotContained*') -Name 'UpdateRollback/TreeNotContained/RollbackSchedulerCriticalNoTaskMutation' -Failure "після Reconcile жодних змін задач (лише quiesce до нього); status=$($r.status) log=$($log -join ',') $($r.rollback.message)"
+
+        # Rollback.Validate: дочірній процес перевірки не підтверджено завершеним.
+        Reset-UpdRbStubs
+        & $updRbModule { $script:UpdRbMode['ValidateTree'] = $true }
+        $s2 = New-UpdRbUpdateScenario -Name 'tree-validate'
+        $r2 = Invoke-UpdRbRollback -Scenario $s2
+        $log2 = @(Get-UpdRbLog)
+        Test-BRAVOCondition -Condition ($r2.status -eq 'Critical' -and (Read-UpdRbJournal -Scenario $s2).state -eq 'Critical' -and $log2[$log2.Count - 1] -eq 'Validate:Rollback' -and $log2 -notcontains 'RestoreTasks' -and @($log2 | Where-Object { $_ -like 'Disable*' }).Count -eq 1) -Name 'UpdateRollback/TreeNotContained/RollbackValidateCriticalNoTaskMutation' -Failure "Validate з TreeNotContained: Critical без Disable/RestoreTasks; status=$($r2.status) log=$($log2 -join ',')"
+        & $updRbModule { $script:UpdRbMode['ReconcileTree'] = $false; $script:UpdRbMode['ValidateTree'] = $false }
+    }
+
     # --- Реальна Test-BRAVODeploymentValidation: SetupValidate baseline-aware у Mode Rollback ---
     & {
         # Перезавантаження модуля скидає stub-и: далі працює справжня валідація.
@@ -924,6 +944,52 @@ if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath(
         Test-BRAVOCondition -Condition ((& $setupItem 1 $null) -eq 'Fail') -Name 'UpdateRollback/Validation/SetupFailWithoutBaselineIsFail' -Failure 'без baseline збій setup лишається Fail'
         Test-BRAVOCondition -Condition ((& $setupItem 2 1) -eq 'Fail') -Name 'UpdateRollback/Validation/SetupDifferentFromBaselineIsFail' -Failure 'код, відмінний від baseline, лишається Fail'
         Test-BRAVOCondition -Condition ((& $setupItem 0 1) -eq 'Pass') -Name 'UpdateRollback/Validation/SetupPassStillPass' -Failure 'код 0 лишається Pass'
+
+        # TreeNotContained з adapter-а: валідація повертає прапорець і Fail-елемент.
+        $treeContext = [pscustomobject]@{
+            Adapter = @{
+                InvokeGuard = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true; TreeNotContained = $true } }
+                InvokeSetupValidate = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false; TreeNotContained = $false } }
+            }
+            Paths = [pscustomobject]@{ RuntimeRoot = $vr }; OperationDirectory = ''; Plan = $null
+        }
+        $treeArguments = @{ Context = $treeContext; Mode = 'Deploy'; ExpectedVersion = '5.2.5'; ExpectedManifestPath = (Join-Path $vr 'RUNTIME_MANIFEST.json'); SiteBaseline = $null }
+        $treeResult = & $realModule { param($a) Test-BRAVODeploymentValidation @a } $treeArguments
+        Test-BRAVOCondition -Condition ([bool]$treeResult.TreeNotContained -and $treeResult.Status -eq 'Fail' -and @($treeResult.Items | Where-Object { $_.Name -eq 'Guard' -and $_.Message -like '*ProcessTreeNotContained*' }).Count -eq 1) -Name 'UpdateRollback/TreeNotContained/ValidationFlag' -Failure 'guard з TreeNotContained -> TreeNotContained=$true у результаті валідації'
+
+        # Реальний Invoke-BRAVOSchedulerReconcile: TreeNotContained -> FAIL, задачі не змінюються.
+        $schedulerCalls = New-Object System.Collections.Generic.List[string]
+        $reconcileContext = [pscustomobject]@{
+            Adapter = @{
+                InvokeSetupScheduler = { param($RuntimeRoot) [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true; TreeNotContained = $true } }
+                SetTaskEnabled = { param($TaskPath, $Name, $Enabled, $RuntimeRoot) $schedulerCalls.Add('SetTaskEnabled'); [pscustomobject]@{ Success = $true; Message = '' } }.GetNewClosure()
+                GetManagedTasks = { param($TaskPath, $RuntimeRoot) $schedulerCalls.Add('GetManagedTasks'); @() }.GetNewClosure()
+            }
+            Paths = [pscustomobject]@{ RuntimeRoot = $vr; StateRoot = (Join-Path $updRbTemp 'reconcile state') }
+            Journal = $null
+        }
+        $schedulerSnapshotObject = [pscustomobject]@{ schemaVersion = 1; capturedUtc = '2026-01-01T00:00:00.0000000Z'; taskPath = '\BRAVO\'; runtimeRoot = $vr; tasks = @([pscustomobject]@{ path = '\BRAVO\'; name = 'BRAVO_A'; exists = $true; enabled = $true; state = 'Ready'; isRunning = $false }) }
+        $reconcileResult = & $realModule { param($c, $s) Invoke-BRAVOSchedulerReconcile -Context $c -Snapshot $s } $reconcileContext $schedulerSnapshotObject
+        Test-BRAVOCondition -Condition ($reconcileResult.Verdict -eq 'FAIL' -and [bool]$reconcileResult.TreeNotContained -and (@($reconcileResult.Problems) -join ' ') -like '*Scheduler.ProcessTreeNotContained*' -and $schedulerCalls.Count -eq 0) -Name 'UpdateRollback/TreeNotContained/ReconcileFailsWithoutTaskMutation' -Failure "Reconcile: Verdict=$($reconcileResult.Verdict) tree=$($reconcileResult.TreeNotContained) calls=$($schedulerCalls -join ',') problems=$(@($reconcileResult.Problems) -join ';')"
+
+        # Orchestrator (Resolve-BRAVOUpdateOperationFailure): TreeNotContained після межі mutation ->
+        # Critical, журнал Critical, жодного відкату чи змін задач.
+        Set-Variable -Name updRbModule -Scope 1 -Value $realModule
+        $dealCalls = New-Object System.Collections.Generic.List[string]
+        $dealAdapter = @{
+            SetTaskEnabled = { param($TaskPath, $Name, $Enabled, $RuntimeRoot) $dealCalls.Add('SetTaskEnabled'); [pscustomobject]@{ Success = $true; Message = '' } }.GetNewClosure()
+            GetManagedTasks = { param($TaskPath, $RuntimeRoot) $dealCalls.Add('GetManagedTasks'); @() }.GetNewClosure()
+        }
+        $ds = New-UpdRbUpdateScenario -Name 'tree-deploy' -ConfigureScheduler
+        $dsCtx = Invoke-UpdRbCall -Name 'New-BRAVORollbackContext' -Arguments @{ Journal = $ds.Journal; Adapter = $dealAdapter; StateRoot = $ds.State; LockRoot = (Join-Path $ds.Base 'locks'); OperationLockPath = $ds.OpLock; VersionStatePath = $ds.VersionState; OperationDirectory = $ds.OpDir; FaultInjection = $null }
+        Add-Member -InputObject $dsCtx -MemberType NoteProperty -Name LastPhase -Value 'ConfigureScheduler'
+        $dsResult = & $realModule {
+            param($c)
+            try { throw (New-BRAVOUpdateTypedException -Message 'tree' -Kind ProcessTreeNotContained -FindingId 'Process.TreeNotContained' -Action 'manual') } catch { Resolve-BRAVOUpdateOperationFailure -Context $c -ErrorRecord $_ }
+        } $dsCtx
+        $dsJournal = Read-UpdRbJournal -Scenario $ds
+        $rollbackPhases = @($dsJournal.phases | Where-Object { [string]$_.phase -like 'Rollback.*' })
+        Test-BRAVOCondition -Condition ($dsResult.status -eq 'Critical' -and $dsResult.exitCode -eq 82 -and $dsJournal.state -eq 'Critical' -and $dealCalls.Count -eq 0 -and $rollbackPhases.Count -eq 0 -and @($dsResult.findings | Where-Object { $_.id -eq 'Process.TreeNotContained' }).Count -eq 1 -and (Get-UpdRbTreeHash -Root $ds.Runtime) -eq $ds.DeployedTree) -Name 'UpdateRollback/TreeNotContained/OrchestratorCriticalNoRollback' -Failure "orchestrator: Critical без відкату/змін; status=$($dsResult.status) journal=$($dsJournal.state) adapterCalls=$($dealCalls -join ',') rollbackPhases=$($rollbackPhases.Count)"
     }
 
 } finally {

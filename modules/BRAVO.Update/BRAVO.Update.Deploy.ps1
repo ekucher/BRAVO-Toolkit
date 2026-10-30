@@ -65,7 +65,7 @@ function New-BRAVOUpdateTypedException {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Message,
-        [Parameter(Mandatory = $true)][ValidateSet('Crash', 'Cancel', 'CancelAfterMutation', 'Blocked', 'Verification', 'PlanStale', 'Error')][string]$Kind,
+        [Parameter(Mandatory = $true)][ValidateSet('Crash', 'Cancel', 'CancelAfterMutation', 'Blocked', 'Verification', 'PlanStale', 'ProcessTreeNotContained', 'Error')][string]$Kind,
         [string]$FindingId = '',
         [AllowNull()][object]$ExitCodeHint = $null,
         [string]$Action = ''
@@ -1375,6 +1375,20 @@ function Resolve-BRAVOUpdateOperationFailure {
                 -LastPhase $Context.LastPhase -MutationStarted $false -JournalPath $journalPath -StartedUtc $StartedUtc)
     }
 
+    if ($info.Kind -ceq 'ProcessTreeNotContained') {
+        # Невідомий процес може ще змінювати встановлення (файли, реєстрацію задач): жодних
+        # подальших змін (ні quiesce, ні відкату, ні відновлення задач — вціліла копія могла б
+        # перереєструвати їх). Журнал Critical, результат Critical, ручне втручання.
+        try { [void](Set-BRAVOUpdateJournalState -Journal $Context.Journal -State Critical -StateRoot $Context.Paths.StateRoot) } catch { $null = $_ }
+        Add-BRAVOUpdateContextFinding -Context $Context -Finding (New-BRAVOUpdateFinding -Id 'Process.TreeNotContained' -Severity Blocker -Title 'Дочірній процес не вдалося завершити: потрібне ручне втручання' `
+                -Meaning 'Невідомий процес може й далі змінювати встановлення; автоматичний відкат не виконувався, щоб не змагатися з ним.' `
+                -Action 'Перезавантажте сервер або вручну переконайтесь, що процеси BRAVO_SETUP/guard/self-test завершено, потім виконайте відновлення з резервної копії операції.' -Details ([string]$info.Message))
+        return (New-BRAVOUpdateOperationResult -Plan $Context.Plan -Context $Context -Status Critical `
+                -Findings @($Context.Findings.ToArray()) -Validation @($Context.Validation.ToArray()) `
+                -Rollback ([pscustomobject][ordered]@{ attempted = $false; status = 'Failed'; message = 'Відкат не виконувався: дерево дочірнього процесу не підтверджено завершеним.' }) `
+                -LastPhase $Context.LastPhase -MutationStarted $true -JournalPath $journalPath -StartedUtc $StartedUtc)
+    }
+
     $rollbackResult = $null
     $rollbackFailure = $null
     try {
@@ -1561,6 +1575,9 @@ function Invoke-BRAVODeployment {
                     $Context.Data['SchedulerReconcile'] = $reconcile
                     $created = @(Get-BRAVOUpdateArrayProperty -InputObject $reconcile -Name 'CreatedTasks')
                     if ($created.Count -gt 0) { [void](Set-BRAVOUpdateJournalField -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot -Name 'createdTasks' -Value @($created)) }
+                    if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $reconcile -Name 'TreeNotContained' -Default $false)) {
+                        throw (New-BRAVOUpdateTypedException -Message 'Дерево процесів налаштування планувальника не підтверджено завершеним.' -Kind ProcessTreeNotContained -FindingId 'Process.TreeNotContained' -Action 'Потрібне ручне втручання: переконайтесь, що процеси BRAVO_SETUP/guard/self-test завершено (за потреби перезавантажте сервер), потім виконайте відновлення з резервної копії операції.')
+                    }
                     $verdict = [string](Get-BRAVOUpdatePropertyValue -InputObject $reconcile -Name 'Verdict' -Default 'FAIL')
                     if ($verdict -ceq 'FAIL') {
                         throw (New-BRAVOUpdateTypedException -Message ('Налаштування планувальника завершилось збоєм: ' + ((@(Get-BRAVOUpdateArrayProperty -InputObject $reconcile -Name 'Problems') | Select-Object -First 5) -join '; ')) -Kind Error -FindingId 'Scheduler.ReconcileFailed')
@@ -1579,6 +1596,11 @@ function Invoke-BRAVODeployment {
                     if ($null -ne $Context.Data['GuardBaselineExitCode']) { $validationArgs['GuardBaselineExitCode'] = [int]$Context.Data['GuardBaselineExitCode'] }
                     $validation = Test-BRAVODeploymentValidation @validationArgs
                     foreach ($item in @(Get-BRAVOUpdateArrayProperty -InputObject $validation -Name 'Items')) { $Context.Validation.Add($item) }
+                    # Дочірній процес перевірки (guard/setup/self-test) не підтверджено завершеним:
+                    # відкат файлів під можливо живим процесом небезпечний -> Critical одразу.
+                    if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $validation -Name 'TreeNotContained' -Default $false)) {
+                        throw (New-BRAVOUpdateTypedException -Message 'Дерево процесів валідації не підтверджено завершеним.' -Kind ProcessTreeNotContained -FindingId 'Process.TreeNotContained' -Action 'Потрібне ручне втручання: переконайтесь, що процеси BRAVO_SETUP/guard/self-test завершено (за потреби перезавантажте сервер), потім виконайте відновлення з резервної копії операції.')
+                    }
                     $validationStatus = [string](Get-BRAVOUpdatePropertyValue -InputObject $validation -Name 'Status' -Default 'Fail')
                     if ($validationStatus -ceq 'Warn') {
                         Add-BRAVOUpdateContextFinding -Context $Context -Finding (New-BRAVOUpdateFinding -Id 'Validate.Warnings' -Severity Warning -Title 'Валідація завершилась із попередженнями' -Meaning 'Деякі перевірки дали попередження; див. validation.')

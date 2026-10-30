@@ -38,18 +38,18 @@ function Get-BRAVOUpdateValidationAdapterCall {
 
     $block = Get-BRAVOUpdatePropertyValue -InputObject $Adapter -Name $Key
     if ($null -eq $block -or $block -isnot [scriptblock]) {
-        return [pscustomobject]@{ Ok = $false; Result = $null; Message = "adapter не надає '$Key' (fail closed)" }
+        return [pscustomobject]@{ Ok = $false; Result = $null; Message = "adapter не надає '$Key' (fail closed)"; TreeNotContained = $false }
     }
     try {
         $result = & $block $RuntimeRoot $LogPath
     } catch {
-        return [pscustomobject]@{ Ok = $false; Result = $null; Message = ("'{0}' завершився винятком: {1}" -f $Key, $_.Exception.Message) }
+        return [pscustomobject]@{ Ok = $false; Result = $null; Message = ("'{0}' завершився винятком: {1}" -f $Key, $_.Exception.Message); TreeNotContained = $false }
     }
     $hasExit = $null -ne $result -and (Test-BRAVOUpdateHasProperty -InputObject $result -Name 'ExitCode')
     if (-not $hasExit) {
-        return [pscustomobject]@{ Ok = $false; Result = $null; Message = "'$Key' повернув результат без ExitCode (fail closed)" }
+        return [pscustomobject]@{ Ok = $false; Result = $null; Message = "'$Key' повернув результат без ExitCode (fail closed)"; TreeNotContained = $false }
     }
-    return [pscustomobject]@{ Ok = $true; Result = $result; Message = '' }
+    return [pscustomobject]@{ Ok = $true; Result = $result; Message = ''; TreeNotContained = [bool](Get-BRAVOUpdatePropertyValue -InputObject $result -Name 'TreeNotContained' -Default $false) }
 }
 
 function Test-BRAVODeploymentValidation {
@@ -83,6 +83,7 @@ function Test-BRAVODeploymentValidation {
     )
 
     $items = New-Object System.Collections.Generic.List[object]
+    $treeFlags = @{ Tree = $false }
     $adapter = Get-BRAVOUpdatePropertyValue -InputObject $Context -Name 'Adapter'
     $paths = Get-BRAVOUpdatePropertyValue -InputObject $Context -Name 'Paths'
     $runtimeRoot = [string](Get-BRAVOUpdatePropertyValue -InputObject $paths -Name 'RuntimeRoot' -Default '')
@@ -92,7 +93,7 @@ function Test-BRAVODeploymentValidation {
     # Без runtime-кореня нічого перевіряти: єдиний безпечний результат — Fail.
     if ([string]::IsNullOrWhiteSpace($runtimeRoot)) {
         [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'VersionJson' -Status 'Fail' -Message 'Context.Paths.RuntimeRoot не задано.'))
-        return [pscustomobject]@{ Status = 'Fail'; Items = $items.ToArray() }
+        return [pscustomobject]@{ Status = 'Fail'; Items = $items.ToArray(); TreeNotContained = $false }
     }
 
     $logPathFor = {
@@ -149,6 +150,7 @@ function Test-BRAVODeploymentValidation {
     # --- Guard ---
     & {
         $call = Get-BRAVOUpdateValidationAdapterCall -Adapter $adapter -Key 'InvokeGuard' -RuntimeRoot $runtimeRoot -LogPath (& $logPathFor 'Guard')
+        if ($call.TreeNotContained) { $treeFlags.Tree = $true; [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'Guard' -Status 'Fail' -Message 'Scheduler.ProcessTreeNotContained: дерево дочірніх процесів не підтверджено завершеним, невідомий процес міг змінювати встановлення.')); return }
         if (-not $call.Ok) {
             [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'Guard' -Status 'Fail' -Message $call.Message))
             return
@@ -176,6 +178,7 @@ function Test-BRAVODeploymentValidation {
     # --- SetupValidate ---
     & {
         $call = Get-BRAVOUpdateValidationAdapterCall -Adapter $adapter -Key 'InvokeSetupValidate' -RuntimeRoot $runtimeRoot -LogPath (& $logPathFor 'SetupValidate')
+        if ($call.TreeNotContained) { $treeFlags.Tree = $true; [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SetupValidate' -Status 'Fail' -Message 'Scheduler.ProcessTreeNotContained: дерево дочірніх процесів не підтверджено завершеним, невідомий процес міг змінювати встановлення.')); return }
         # На чистому встановленні credentials ще не введено: збій — лише Warn.
         $failStatus = if ($Mode -eq 'Install') { 'Warn' } else { 'Fail' }
         if (-not $call.Ok) {
@@ -218,6 +221,7 @@ function Test-BRAVODeploymentValidation {
             return
         }
         $call = Get-BRAVOUpdateValidationAdapterCall -Adapter $adapter -Key 'InvokeSelfTest' -RuntimeRoot $runtimeRoot -LogPath (& $logPathFor 'SelfTest')
+        if ($call.TreeNotContained) { $treeFlags.Tree = $true; [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SelfTest' -Status 'Fail' -Message 'Scheduler.ProcessTreeNotContained: дерево дочірніх процесів не підтверджено завершеним, невідомий процес міг змінювати встановлення.')); return }
         if (-not $call.Ok) {
             [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SelfTest' -Status 'Fail' -Message $call.Message))
             return
@@ -281,5 +285,5 @@ function Test-BRAVODeploymentValidation {
         if ($item.status -eq 'Fail') { $status = 'Fail'; break }
         if ($item.status -eq 'Warn') { $status = 'Warn' }
     }
-    return [pscustomobject]@{ Status = $status; Items = $items.ToArray() }
+    return [pscustomobject]@{ Status = $status; Items = $items.ToArray(); TreeNotContained = [bool]$treeFlags.Tree }
 }
