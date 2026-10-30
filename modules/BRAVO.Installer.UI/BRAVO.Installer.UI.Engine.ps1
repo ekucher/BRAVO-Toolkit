@@ -77,13 +77,14 @@ function New-BRAVOInstallerEngineCommand {
 
 function New-BRAVOInstallerConfiguratorCommand {
     # «Налаштування» запускають канонічний Configurator окремим процесом
-    # (без вбудовування в v1 прототип).
+    # З КАТАЛОГУ ВИБРАНОГО встановлення (не з каталогу самого Installer), щоб
+    # Configurator відкрив конфігурацію саме цього сервера.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$ToolkitRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [string]$PowerShellPath = (Get-BRAVOInstallerPowerShellPath)
     )
-    $script = Join-Path $ToolkitRoot 'BRAVO_CONFIGURATOR.ps1'
+    $script = Join-Path $RuntimeRoot 'BRAVO_CONFIGURATOR.ps1'
     New-BRAVOInstallerCommand -FilePath $PowerShellPath -Argument @(
         '-NoProfile', '-NonInteractive', '-File',
         (ConvertTo-BRAVOInstallerQuotedArgument -Value $script), '-NoPause')

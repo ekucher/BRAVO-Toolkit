@@ -466,7 +466,10 @@ function Update-BRAVOInstallerBackupScreen {
     $c['Backup.Canonical'].Text = 'Канонічний режим: ' + $vm.CanonicalName
     $c['Backup.Summary'].Text = 'Підсумок увімкнень:' + [Environment]::NewLine + (@($vm.EffectiveSummary) -join [Environment]::NewLine)
     $c['Backup.Warning'].Text = $(if ($vm.Warning) { '! ' + $vm.Warning } else { '' })
-    $c['Backup.AdvancedHint'].Text = $vm.AdvancedHint
+    $configRoot = Get-BRAVOInstallerKnownRuntimeRoot -Context $Context
+    $configReady = ((-not [string]::IsNullOrEmpty($configRoot)) -and (Test-Path -LiteralPath (Join-Path $configRoot 'BRAVO_CONFIGURATOR.ps1') -PathType Leaf))
+    $c['Backup.Advanced'].Enabled = ($configReady -and -not $Context.Busy)
+    $c['Backup.AdvancedHint'].Text = $vm.AdvancedHint + $(if ($configReady) { '' } else { ' Недоступно, поки BRAVO Toolkit не встановлено.' })
     Set-BRAVOInstallerWizardFooter -Context $Context -Screen 'Backup' -NextEnabled $vm.CanContinue
 }
 
