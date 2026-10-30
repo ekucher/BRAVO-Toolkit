@@ -886,6 +886,12 @@ function Get-BRAVOConfigPathReferenceFromItem {
             & $fail "switch-параметр -$($current.Spelling) із inline-значенням у режимі -File: powershell.exe 5.1 не передає явний Boolean у switch скрипта через -File, прив'язка завершиться помилкою"
         }
         if ($isSwitch) {
+            # У command-режимах inline-значення може бути рядком або виразом.
+            # Його перетворення на SwitchParameter не моделюється: навіть
+            # буквальний текст 'false' не є Boolean $false для PowerShell.
+            if ($Form -ne 'File' -and [bool]$current.HasInline) {
+                & $fail "inline-значення switch-параметра -$($current.Spelling) не доведено сумісним із SwitchParameter (значення не виводиться)"
+            }
             & $checkValidation $owner $null $false
         } elseif ($null -ne $valueItem -and $null -eq $valueItem.Reason) {
             & $checkValidation $owner ([string]$valueItem.Text) $true

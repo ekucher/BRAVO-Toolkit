@@ -32763,7 +32763,13 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T197_BypassGetCommandWildcardNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSWILD.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T198_BypassSplitPathLeafNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSSPLIT.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
                 @{ Name = 'T199_EncodedLiteralPercentScriptTarget'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '%SystemDrive%$($scanArchiv.Substring(2))' -NoPause")); Wd = $scanRuntime },
-                @{ Name = 'T200_EncodedLiteralPercentConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -ConfigPath '%SystemDrive%$($scanLegacy.Substring(2))'")); Wd = $scanRuntime }
+                @{ Name = 'T200_EncodedLiteralPercentConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -ConfigPath '%SystemDrive%$($scanLegacy.Substring(2))'")); Wd = $scanRuntime },
+                @{ Name = 'T201_CommandInvalidInlineSwitch'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "& '$scanArchiv' -NoPause:garbage$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T202_CommandInvalidInlineSwitchWithConfig'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "& '$scanArchiv' -NoPause:garbage -ConfigPath '$scanLegacy'$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T203_EncodedInvalidInlineSwitch'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -NoPause:garbage")); Wd = $scanRuntime },
+                @{ Name = 'T204_EncodedInvalidInlineSwitchWithConfig'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -NoPause:garbage -ConfigPath '$scanLegacy'")); Wd = $scanRuntime },
+                @{ Name = 'T205_CommandBooleanInlineSwitchConservative'; Expect = 'Unknown'; Arguments = "$scanBase -Command $scanQ" + "& '$scanArchiv' -NoPause:`$false$scanQ"; Wd = $scanRuntime },
+                @{ Name = 'T206_EncodedStringFalseInlineSwitch'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -NoPause:'false'")); Wd = $scanRuntime }
             )
 
 
