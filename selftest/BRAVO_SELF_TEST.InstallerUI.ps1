@@ -120,9 +120,13 @@
     try { [void](New-BRAVOInstallerEngineCommand -ToolkitRoot 'C:\a' -Action Execute -ResultPath 'C:\r.json') } catch { $threw = $true }
     Test-BRAVOCondition -Condition $threw -Name 'InstallerUI/Engine/OnlyReadOnlyActions' -Failure 'Дозволені лише State/Preflight.'
 
-    $cfg = New-BRAVOInstallerConfiguratorCommand -ToolkitRoot 'C:\Теку Тест\BRAVO Toolkit'
-    Test-BRAVOCondition -Condition ($cfg.ArgumentString -like '*-File "C:\Теку Тест\BRAVO Toolkit\BRAVO_CONFIGURATOR.ps1" -NoPause') `
+    $cfg = New-BRAVOInstallerConfiguratorCommand -RuntimeRoot 'D:\Каталог Встановлення\BRAVO Toolkit'
+    Test-BRAVOCondition -Condition ($cfg.ArgumentString -like '*-File "D:\Каталог Встановлення\BRAVO Toolkit\BRAVO_CONFIGURATOR.ps1" -NoPause' -and $cfg.ArgumentString -notmatch [regex]::Escape($root)) `
         -Name 'InstallerUI/Configurator/Command' -Failure $cfg.ArgumentString
+    $cfgThrows = $false
+    try { [void](New-BRAVOInstallerConfiguratorCommand -RuntimeRoot '') } catch { $cfgThrows = $true }
+    $noInstall = ConvertTo-BRAVOInstallerMaintenanceViewModel -State ([pscustomobject]@{ state = 'NotInstalled' })
+    Test-BRAVOCondition -Condition ($cfgThrows -and -not $noInstall.ConfigureAction.Enabled -and $noInstall.ConfigureAction.Reason) -Name 'InstallerUI/Configurator/RequiresSelectedInstallation' -Failure 'Без вибраного встановлення Configurator недоступний.'
     $logs = New-BRAVOInstallerLogsCommand -LogsPath 'C:\Журнали Тест\LOGS'
     Test-BRAVOCondition -Condition ($logs.FilePath -like '*\explorer.exe' -and $logs.ArgumentString -eq '"C:\Журнали Тест\LOGS"') `
         -Name 'InstallerUI/Logs/Command' -Failure $logs.ArgumentString

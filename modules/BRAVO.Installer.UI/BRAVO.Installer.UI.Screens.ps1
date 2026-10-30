@@ -558,10 +558,16 @@ function Invoke-BRAVOInstallerAction {
             }
         }
         'OpenConfigurator' {
-            try {
-                [void](Invoke-BRAVOInstallerCommand -Command (New-BRAVOInstallerConfiguratorCommand -ToolkitRoot $Context.ToolkitRoot))
-            } catch {
-                Show-BRAVOInstallerError -Context $Context -Summary 'Не вдалося відкрити Configurator.' -Technical $_.Exception.ToString()
+            # Configurator відкривається для ВИБРАНОГО встановлення; без нього — відмова з поясненням.
+            $configRoot = Get-BRAVOInstallerKnownRuntimeRoot -Context $Context
+            if ([string]::IsNullOrEmpty($configRoot) -or -not (Test-Path -LiteralPath (Join-Path $configRoot 'BRAVO_CONFIGURATOR.ps1') -PathType Leaf)) {
+                Show-BRAVOInstallerError -Context $Context -Summary 'Configurator недоступний: встановлення не вибрано або BRAVO_CONFIGURATOR.ps1 не знайдено в його каталозі.' -Technical $configRoot
+            } else {
+                try {
+                    [void](Invoke-BRAVOInstallerCommand -Command (New-BRAVOInstallerConfiguratorCommand -RuntimeRoot $configRoot))
+                } catch {
+                    Show-BRAVOInstallerError -Context $Context -Summary 'Не вдалося відкрити Configurator.' -Technical $_.Exception.ToString()
+                }
             }
         }
         'OpenLogsFolder' {
