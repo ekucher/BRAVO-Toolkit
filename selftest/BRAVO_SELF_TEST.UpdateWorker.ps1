@@ -493,6 +493,30 @@
             $allowed = & $call 'Invoke-BRAVOUpdateCliAction' ($base + @{ SourcePath = (Join-Path $wkRoot 'offline.zip') })
             Test-BRAVOCondition -Condition ($allowed.ExitCode -eq 0 -and $calls.Update -eq ($callsBefore + 1) -and $calls.Last.SourcePath -ceq (Join-Path $wkRoot 'offline.zip')) -Name 'UpdateWorker/OfflinePlanWithSourcePathDispatches' -Failure ('код ' + $allowed.ExitCode)
         }
+
+        # --- Codex R3 #3: розпакований комплект не є встановленням без ознак встановлення ---
+        & {
+            $originalToolkit = & $wkModule { $script:BRAVOUpdateToolkitRoot }
+            $bundle = Join-Path $wkRoot 'комплект bundle'
+            & $writeTree $bundle @{ 'VERSION.json' = '{"packageVersion": "5.3.0", "releaseChannel": "stable"}'; 'a.txt' = 'x' }
+            $emptyRuntime = Join-Path $wkRoot 'ще немає runtime'
+            $freshPaths = $paths.PSObject.Copy()
+            $freshPaths.RuntimeRoot = $emptyRuntime
+            try {
+                & $wkModule { param($r) $script:BRAVOUpdateToolkitRoot = $r } $bundle
+                $candidates = @(& $call 'Get-BRAVOUpdateWorkerDefaultCandidate' @{ Paths = $freshPaths })
+                $freshState = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'State'; Paths = $freshPaths; Adapter = $adapter; IsAdministrator = $false }
+                Test-BRAVOCondition -Condition ($candidates.Count -eq 1 -and $candidates[0] -ceq $emptyRuntime -and $freshState.Result.state -eq 'NotInstalled' -and @($freshState.Result.candidateRoots).Count -eq 0) `
+                    -Name 'UpdateWorker/ReleaseBundleIsNotAnInstallation' -Failure ('candidates=' + ($candidates -join ',') + ' state=' + $freshState.Result.state)
+                [IO.File]::WriteAllText((Join-Path $bundle 'BRAVO.local.config'), '@{}', (New-Object Text.UTF8Encoding $false))
+                $withConfig = @(& $call 'Get-BRAVOUpdateWorkerDefaultCandidate' @{ Paths = $freshPaths })
+                $realState = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'State'; Paths = $freshPaths; Adapter = $adapter; IsAdministrator = $false }
+                Test-BRAVOCondition -Condition ($withConfig.Count -eq 2 -and $withConfig[1] -ceq $bundle -and $realState.Result.state -ne 'NotInstalled' -and @($realState.Result.candidateRoots) -contains $bundle) `
+                    -Name 'UpdateWorker/BundleWithLocalConfigIsInstallation' -Failure ('state=' + $realState.Result.state)
+            } finally {
+                & $wkModule { param($r) $script:BRAVOUpdateToolkitRoot = $r } $originalToolkit
+            }
+        }
     } finally {
         if ($null -ne $wkValidatorOriginal) {
             & $wkModule { param($Original) Set-Item -Path Function:\Test-BRAVOUpdateDeploymentPlan -Value $Original } $wkValidatorOriginal
