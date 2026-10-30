@@ -811,6 +811,19 @@ function script:Invoke-BRAVORollback {
             $match = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $rep.Runtime -ManifestPath (Join-Path $releaseRepair.Stage 'RUNTIME_MANIFEST.json') -ExcludeDirs @((Get-BRAVOUpdateSiteOwnedPaths).Dirs)
             Test-BRAVOCondition -Condition (($r.status -eq 'Success') -and $match.IsMatch) -Name 'UpdateDeploy/Repair-Success' -Failure ('Repair тієї самої збірки відновлює пошкоджений guard; status=' + $r.status + ' findings=' + ((Get-E2FindingIds -Result $r) -join ','))
 
+            # Repair, коли конфігурація ЦІЛЬОВОГО runtime не читається (пошкоджений loader), а довіреного комплекту — читається:
+            # область задач у Baseline береться з комплекту (snapshot.runtimeRoot), Repair проходить Baseline і завершується.
+            & $deployTestModule $clearState
+            $bc = New-E2Sandbox -Name 'repair-brokencfg' -Release $releaseRepair -Action Repair -InstalledVersion '5.2.6' -RepairReleaseStage $releaseRepair.Stage
+            $brokenRoot = [string]$bc.Runtime
+            $workingConfig = $bc.Adapter['GetEffectiveConfiguration']
+            $bc.Adapter['GetEffectiveConfiguration'] = { param($RuntimeRoot) if ([string]$RuntimeRoot -ceq $brokenRoot) { throw 'BRAVO_CONFIG_LOADER.ps1 пошкоджено у цільовому runtime' }; & $workingConfig $RuntimeRoot }.GetNewClosure()
+            $bcr = Invoke-E2Deploy -Sandbox $bc
+            $bcJournal = Read-E2Journal -Sandbox $bc
+            $bcPhases = @($bcJournal.phases | ForEach-Object { [string]$_.phase })
+            $bcSnapshot = Get-Content -LiteralPath ([string]$bcJournal.schedulerSnapshot.path) -Raw | ConvertFrom-Json
+            Test-BRAVOCondition -Condition (($bcPhases -contains 'QuiesceTasks') -and ($bcr.status -eq 'Success') -and ([string]$bcSnapshot.runtimeRoot -cne $brokenRoot) -and -not [string]::IsNullOrWhiteSpace([string]$bcSnapshot.runtimeRoot)) -Name 'UpdateDeploy/Repair-BrokenTargetConfigUsesToolkitScope' -Failure ('Repair із непрочитною конфігурацією цілі: Baseline має пройти зі scope комплекту; status=' + $bcr.status + ' phases=' + ($bcPhases -join ',') + ' findings=' + ((Get-E2FindingIds -Result $bcr) -join ','))
+
             $mm = New-E2Sandbox -Name 'repair-mismatch' -Release $releaseRepair -Action Repair -InstalledVersion '5.2.6' -RepairReleaseStage $releaseRepair.Stage
             Write-E2File (Join-Path $mm.Runtime 'VERSION.json') ((@{ packageVersion = '5.2.6'; buildId = 'bbbbbbb'; sourceCommit = ('b' * 40) } | ConvertTo-Json))
             # VERSION.json змінився -> fingerprint плану стане іншим, тому перебудовуємо план

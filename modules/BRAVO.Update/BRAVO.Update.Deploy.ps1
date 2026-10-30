@@ -1249,7 +1249,20 @@ function Invoke-BRAVOUpdateCaptureBaseline {
     [void](Invoke-BRAVOUpdatePhase -Context $Context -Phase 'Baseline' -ProgressPhase Backup -Percent 60 -Action {
             param($Context)
             $siteBaseline = Get-BRAVOSiteConfigurationBaseline -RuntimeRoot $Context.Paths.RuntimeRoot
-            $schedulerSnapshot = Get-BRAVOSchedulerSnapshot -Adapter $Context.Adapter -RuntimeRoot $Context.Paths.RuntimeRoot
+            # Область задач: як у Plan/Preflight (Resolve-BRAVOUpdateTaskRuntimeRoot). Repair пошкодженого
+            # runtime: його конфігурація може не читатись -> довірений комплект. Знімок несе корінь
+            # (snapshot.runtimeRoot), яким далі користуються Suspend/Reconcile/Restore/Rollback.
+            $snapshotAction = [string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')
+            $snapshotRoot = Resolve-BRAVOUpdateTaskRuntimeRoot -Action $snapshotAction -RuntimeRoot ([string]$Context.Paths.RuntimeRoot)
+            try {
+                $schedulerSnapshot = Get-BRAVOSchedulerSnapshot -Adapter $Context.Adapter -RuntimeRoot $snapshotRoot
+            } catch {
+                if ((Get-BRAVOUpdateExceptionKind -ErrorRecord $_).Kind -ceq 'Crash') { throw }
+                $toolkitRoot = [string]$script:BRAVOUpdateToolkitRoot
+                if (($snapshotAction -ceq 'Repair') -and (-not [string]::IsNullOrWhiteSpace($toolkitRoot)) -and ($snapshotRoot -cne $toolkitRoot)) {
+                    $schedulerSnapshot = Get-BRAVOSchedulerSnapshot -Adapter $Context.Adapter -RuntimeRoot $toolkitRoot
+                } else { throw }
+            }
             [void](Save-BRAVOSchedulerSnapshot -Snapshot $schedulerSnapshot -OperationDirectory $Context.OperationDirectory -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot)
             $versionSnapshot = Get-BRAVOVersionStateSnapshot -VersionStatePath $Context.Paths.VersionStatePath -OperationDirectory $Context.OperationDirectory
             $guardExitCode = $null

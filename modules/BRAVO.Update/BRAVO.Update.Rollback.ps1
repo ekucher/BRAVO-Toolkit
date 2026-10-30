@@ -1067,13 +1067,22 @@ function Invoke-BRAVORollback {
                 if (-not $installQuiesce.IsComplete) { throw ('Не вдалося вимкнути задачі, створені установкою: ' + (@($installQuiesce.Failed) -join '; ')) }
                 return
             }
-            $disableArguments = @{ Adapter = $rb.Adapter; RuntimeRoot = $rb.RuntimeRoot }
+            # Корінь області задач — той, що зафіксував знімок (Repair пошкодженого runtime: довірений
+            # комплект); цільовий runtime під час відкату може бути відновлений пошкодженим.
+            $taskScopeRoot = [string](Get-BRAVOUpdatePropertyValue -InputObject $rb.SchedulerSnapshot -Name 'runtimeRoot' -Default '')
+            if ([string]::IsNullOrWhiteSpace($taskScopeRoot)) { $taskScopeRoot = $rb.RuntimeRoot }
+            $disableArguments = @{ Adapter = $rb.Adapter; RuntimeRoot = $taskScopeRoot }
             if ($null -ne $rb.SchedulerSnapshot) { $disableArguments.Snapshot = $rb.SchedulerSnapshot }
             $disableResult = Disable-BRAVOAllManagedTasks @disableArguments
             if (-not [bool](Get-BRAVOUpdatePropertyValue -InputObject $disableResult -Name 'IsComplete' -Default $false)) {
                 throw ('Не вдалося вимкнути керовані задачі перед відкатом: ' + (@(Get-BRAVOUpdatePropertyValue -InputObject $disableResult -Name 'Failed' -Default @() | ForEach-Object { [string](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'message' -Default '') }) -join '; '))
             }
-            $live = Get-BRAVOSchedulerSnapshot -Adapter $rb.Adapter -RuntimeRoot $rb.RuntimeRoot
+            $taskScope = Get-BRAVOReconcileScopeFromSnapshot -Snapshot $rb.SchedulerSnapshot
+            if ($null -ne $taskScope) {
+                $live = Get-BRAVOSchedulerSnapshot -Adapter $rb.Adapter -RuntimeRoot $taskScopeRoot -TaskPath $taskScope.TaskPath -ManagedTaskName $taskScope.Names
+            } else {
+                $live = Get-BRAVOSchedulerSnapshot -Adapter $rb.Adapter -RuntimeRoot $taskScopeRoot
+            }
             $stillEnabled = @(@(Get-BRAVOUpdatePropertyValue -InputObject $live -Name 'tasks' -Default @()) | Where-Object { [bool](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'exists' -Default $false) -and [bool](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'enabled' -Default $false) })
             if ($stillEnabled.Count -gt 0) {
                 throw ('Після вимкнення задачі лишаються увімкненими: ' + (@($stillEnabled | ForEach-Object { [string](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'name' -Default '') }) -join ', '))
