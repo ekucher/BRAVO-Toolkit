@@ -1061,6 +1061,11 @@ function Invoke-BRAVOUpdateAcquireStage {
             if (-not [string]::IsNullOrWhiteSpace($SourcePath)) {
                 $acquired = Get-BRAVOOfflineReleaseSource -ZipPath $SourcePath -ChecksumPath $ChecksumPath -ManifestPath $ManifestPath -DestinationRoot $payloadDir
             } else {
+                # Офлайн-план підтверджено для конкретного архіва: тихий перехід на онлайн-завантаження заборонено.
+                $planSourceKind = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'source') -Name 'kind' -Default '')
+                if ($planSourceKind -ceq 'Offline') {
+                    throw (New-BRAVOUpdateTypedException -Message 'для офлайн-плану вкажіть -SourcePath (архів, для якого побудовано план); завантаження з мережі не виконується.' -Kind Blocked -FindingId 'Acquire.OfflineSourceRequired' -Action 'Повторіть виконання, указавши -SourcePath із тим самим архівом, що й під час побудови плану.')
+                }
                 $tag = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'source') -Name 'tag' -Default '')
                 $candidateArgs = @{ Tag = $tag }
                 if (-not [string]::IsNullOrWhiteSpace($RepositoryBaseUri)) { $candidateArgs['RepositoryBaseUri'] = $RepositoryBaseUri }
