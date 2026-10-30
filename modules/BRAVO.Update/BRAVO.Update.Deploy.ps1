@@ -830,7 +830,8 @@ function Test-BRAVOUpdatePlanStillCurrent {
         $artifact = [string](Get-BRAVOUpdatePropertyValue -InputObject $source -Name 'artifactSha256' -Default '')
         $manifest = [string](Get-BRAVOUpdatePropertyValue -InputObject $source -Name 'manifestSha256' -Default '')
         $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $Context.Paths.RuntimeRoot -StateRoot $Context.Paths.StateRoot `
-            -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Context.Adapter
+            -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Context.Adapter `
+            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')) -RuntimeRoot ([string]$Context.Paths.RuntimeRoot))
         $own = [string]$Context.OperationId
         $preconditions.openJournalIds = @(@($preconditions.openJournalIds) | Where-Object { [string]$_ -cne $own })
         $current = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
@@ -1215,7 +1216,7 @@ function Invoke-BRAVOUpdateEnterOperationLock {
             if (-not $Context.Adapter.ContainsKey('GetManagedTasks') -or $null -eq $Context.Adapter['GetManagedTasks']) {
                 throw (New-BRAVOUpdateTypedException -Message 'Стан керованих задач недоступний (adapter без GetManagedTasks).' -Kind Blocked -FindingId 'Scheduler.TasksUnknown' -Action 'Перевірте доступ до Task Scheduler.')
             }
-            $tasks = @(& $Context.Adapter['GetManagedTasks'] '' ([string]$Context.Paths.RuntimeRoot))
+            $tasks = @(& $Context.Adapter['GetManagedTasks'] '' (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')) -RuntimeRoot ([string]$Context.Paths.RuntimeRoot)))
             foreach ($task in $tasks) {
                 if ($null -eq $task) { continue }
                 $state = [string](Get-BRAVOUpdatePropertyValue -InputObject $task -Name 'State' -Default '')

@@ -728,7 +728,8 @@ function Test-BRAVODeploymentPreflight {
     if ($adapterTable.ContainsKey('GetManagedTasks') -and $adapterTable['GetManagedTasks'] -is [scriptblock]) {
         try {
             # Цільовий RuntimeRoot - другим аргументом (перший - TaskPath, порожній = із конфігурації цього кореня).
-            $managedTasks = @(& $adapterTable['GetManagedTasks'] '' $RuntimeRoot)
+            # Install: область задач - з ДОВІРЕНОЇ конфігурації комплекту (ціль ще не існує, її loader не можна виконувати).
+            $managedTasks = @(& $adapterTable['GetManagedTasks'] '' (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Operation -RuntimeRoot $RuntimeRoot -ToolkitRoot $ToolkitRoot))
             $runningNames = New-Object System.Collections.Generic.List[string]
             foreach ($task in $managedTasks) {
                 $taskState = [string](Get-BRAVOPreflightProperty -InputObject $task -Name 'state' -Default '')
