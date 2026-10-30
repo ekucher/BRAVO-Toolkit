@@ -494,6 +494,49 @@
             Test-BRAVOCondition -Condition ($allowed.ExitCode -eq 0 -and $calls.Update -eq ($callsBefore + 1) -and $calls.Last.SourcePath -ceq (Join-Path $wkRoot 'offline.zip')) -Name 'UpdateWorker/OfflinePlanWithSourcePathDispatches' -Failure ('код ' + $allowed.ExitCode)
         }
 
+        # --- Codex R4 #3: Install, перерваний до копіювання метаданих, відновлюється за журналом ---
+        & {
+            $partial = Join-Path $wkRoot 'частковий install'
+            [void](New-Item -ItemType Directory -Path $partial -Force)
+            [IO.File]::WriteAllText((Join-Path $partial 'a.txt'), 'x', (New-Object Text.UTF8Encoding $false))
+            $recordedIj = @{ Args = $null }
+            $recorder = {
+                param([string]$StateRoot, [string]$LockRoot, [string]$OperationLockPath, $Adapter, [string]$VersionStatePath, [string]$RuntimeRoot, [string]$StagingRoot, [string]$BackupRoot)
+                $recordedIj.Args = @{ RuntimeRoot = $RuntimeRoot }
+                New-BRAVOUpdateDeploymentResult -OperationId ([guid]::NewGuid().ToString()) -Action Recovery -Status Success
+            }.GetNewClosure()
+            $makeState = {
+                param([string]$Name, [string]$JournalAction)
+                $p = $paths.PSObject.Copy()
+                $p.StateRoot = Join-Path $wkRoot $Name
+                $p.StagingRoot = Join-Path $wkRoot ($Name + '-staging')
+                $p.BackupRoot = Join-Path $wkRoot ($Name + '-backup')
+                $p.OperationLockPath = Join-Path $p.LockRoot 'BRAVO_OPERATION.lock'
+                $p.VersionStatePath = Join-Path $p.StateRoot 'version.json'
+                [void](& $call 'Initialize-BRAVOUpdateStateDirectories' @{ StateRoot = $p.StateRoot })
+                [void](& $call 'New-BRAVOUpdateJournal' @{ StateRoot = $p.StateRoot; OperationId = [guid]::NewGuid().ToString(); PlanId = [guid]::NewGuid().ToString(); Action = $JournalAction
+                        RuntimeRoot = $partial; StagingRoot = $p.StagingRoot; BackupRoot = $p.BackupRoot })
+                return $p
+            }
+            $installPaths = & $makeState 'state-install-journal' 'Install'
+            $callRecover = {
+                param($UsePaths, [string]$Root)
+                $recordedIj.Args = $null
+                $arguments = @{ Action = 'Recover'; Paths = $UsePaths; Adapter = $adapter; IsAdministrator = $true; CandidateRoots = @((Join-Path $wkRoot 'нема встановлень')); Operations = @{ Recover = $recorder } }
+                if (-not [string]::IsNullOrEmpty($Root)) { $arguments['RuntimeRoot'] = $Root }
+                & $call 'Invoke-BRAVOUpdateCliAction' $arguments
+            }
+            $noRoot = & $callRecover $installPaths ''
+            Test-BRAVOCondition -Condition ($noRoot.ExitCode -eq 0 -and $null -ne $recordedIj.Args -and $recordedIj.Args.RuntimeRoot -ceq $partial) -Name 'UpdateWorker/RecoverInstallJournalWithoutRoot' -Failure ('код ' + $noRoot.ExitCode + ' ' + (@($noRoot.Result.findings | ForEach-Object { $_.id + ':' + $_.details }) -join '|'))
+            $explicit = & $callRecover $installPaths $partial
+            Test-BRAVOCondition -Condition ($explicit.ExitCode -eq 0 -and $recordedIj.Args.RuntimeRoot -ceq $partial) -Name 'UpdateWorker/RecoverInstallJournalExplicitRoot' -Failure ('код ' + $explicit.ExitCode)
+            $wrong = & $callRecover $installPaths (Join-Path $wkRoot 'інший каталог')
+            Test-BRAVOCondition -Condition ($wrong.ExitCode -eq 80 -and $null -eq $recordedIj.Args) -Name 'UpdateWorker/RecoverInstallJournalRejectsOtherRoot' -Failure ('код ' + $wrong.ExitCode)
+            $updatePaths = & $makeState 'state-update-journal' 'Update'
+            $updExplicit = & $callRecover $updatePaths $partial
+            Test-BRAVOCondition -Condition ($null -eq $recordedIj.Args -and $updExplicit.ExitCode -eq 80) -Name 'UpdateWorker/RecoverUpdateJournalStillRequiresDiscovery' -Failure ('код ' + $updExplicit.ExitCode)
+        }
+
         # --- Codex R3 #3: розпакований комплект не є встановленням без ознак встановлення ---
         & {
             $originalToolkit = & $wkModule { $script:BRAVOUpdateToolkitRoot }

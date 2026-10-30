@@ -125,6 +125,29 @@ function Test-BRAVOUpdateWorkerSamePath {
     }
 }
 
+function Get-BRAVOUpdateWorkerInstallJournalRoot {
+    # Корені runtime з ВІДКРИТИХ читабельних Install-журналів, що проходять політику кореня Install
+    # (Test-BRAVOInstallRuntimeRootPolicy, крім «каталог не порожній» — частково розгорнутий Install
+    # ЗАВЖДИ непорожній). Не кидає; помилка = порожній результат (fail closed).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Paths)
+    $roots = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($entry in @(Get-BRAVOUpdateOpenJournal -StateRoot ([string]$Paths.StateRoot))) {
+            if (([string]$entry.State -cne 'Open') -or [bool]$entry.IsCorrupt -or ($null -eq $entry.Journal)) { continue }
+            if ([string](Get-BRAVOUpdatePropertyValue -InputObject $entry.Journal -Name 'action' -Default '') -cne 'Install') { continue }
+            $root = [string](Get-BRAVOUpdatePropertyValue -InputObject $entry.Journal -Name 'runtimeRoot' -Default '')
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+            $policy = Test-BRAVOInstallRuntimeRootPolicy -RuntimeRoot $root -StateRoot ([string]$Paths.StateRoot) -StagingRoot ([string]$Paths.StagingRoot) -BackupRoot ([string]$Paths.BackupRoot) -LockRoot ([string]$Paths.LockRoot)
+            $blocking = @(@($policy.Problems) | Where-Object { ([string]$_) -notlike '*вже існує і не порожній*' })
+            if ($blocking.Count -eq 0) { $roots.Add([string]$policy.FullPath) }
+        }
+    } catch {
+        return @()
+    }
+    return @($roots.ToArray() | Select-Object -Unique)
+}
+
 function Get-BRAVOUpdateWorkerDefaultCandidate {
     # Типові кандидати discovery: default RuntimeRoot + каталог toolkit, з якого запущено CLI,
     # ЛИШЕ якщо він має ознаки справжнього встановлення (BRAVO.local.config / BRAVO.config).
@@ -1524,8 +1547,16 @@ function Invoke-BRAVOUpdateCliAction {
                     $recoverRuntime = [string](Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'runtimeRoot' -Default '')
                     $recoverCandidates = @(@(Get-BRAVOUpdatePropertyValue -InputObject $recoverState -Name 'candidateRoots' -Default @()) | ForEach-Object { [string]$_ })
                 } catch { $recoverRuntime = ''; $recoverCandidates = @() }
+                # Install, перерваний до копіювання VERSION.json/RUNTIME_MANIFEST.json, не знаходиться discovery.
+                # Тоді ціль відновлення — runtimeRoot ВІДКРИТОГО Install-журналу (стан захищений: корені вже
+                # перевірено вище) за умови політики кореня Install (без вимоги «порожній»). Update/Repair далі
+                # вимагають discovery.
+                $installJournalRoots = @(Get-BRAVOUpdateWorkerInstallJournalRoot -Paths $Paths)
+                if ([string]::IsNullOrWhiteSpace($recoverRuntime) -and [string]::IsNullOrWhiteSpace($RuntimeRoot) -and ($installJournalRoots.Count -eq 1)) {
+                    $recoverRuntime = [string]$installJournalRoots[0]
+                }
                 if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
-                    $explicitFound = @($recoverCandidates | Where-Object { Test-BRAVOUpdateWorkerSamePath -Left $_ -Right $RuntimeRoot })
+                    $explicitFound = @(@($recoverCandidates) + @($installJournalRoots) | Where-Object { Test-BRAVOUpdateWorkerSamePath -Left $_ -Right $RuntimeRoot })
                     if (($explicitFound.Count -eq 0) -and -not (Test-BRAVOUpdateWorkerSamePath -Left $recoverRuntime -Right $RuntimeRoot)) {
                         $foreignRecover = New-BRAVOUpdateWorkerFinding -Id 'Cli.RecoverRuntimeRoot' -Title 'Вказаний -RuntimeRoot не є знайденим встановленням BRAVO' -Details $RuntimeRoot -Action 'Не вказуйте -RuntimeRoot або вкажіть каталог, який знайшов engine.'
                         return (& $done 80 (New-BRAVOUpdateWorkerFailureResult -OperationId '' -PlanId '' -Action 'Recovery' -Finding @($foreignRecover)))
