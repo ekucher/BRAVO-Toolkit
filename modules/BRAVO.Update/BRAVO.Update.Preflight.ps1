@@ -502,13 +502,18 @@ function Test-BRAVODeploymentPreflight {
         [AllowNull()][hashtable]$Adapter = $null,
         [string]$ToolkitRoot = $script:BRAVOUpdateToolkitRoot,
         [switch]$AllowOpenJournal,
-        [switch]$IgnoreOwnLocks
+        [switch]$IgnoreOwnLocks,
+        # Область Repair (All|Runtime|Scheduler); для інших операцій не використовується.
+        [string]$Scope = 'All'
     )
 
     $list = New-Object System.Collections.Generic.List[object]
     $isMutation = ($Operation -ne 'Diagnose')
     $adapterTable = $Adapter
     if ($null -eq $adapterTable) { $adapterTable = @{} }
+    # Цілісність цілі потрібна вже для вибору джерела області задач (Repair пошкодженого runtime).
+    $earlyIntegrity = Get-BRAVOPreflightProperty -InputObject $InstallationState -Name 'integrity'
+    $earlyIntegrityStatus = [string](Get-BRAVOPreflightProperty -InputObject $earlyIntegrity -Name 'status' -Default '')
 
     # ---- Середовище: ОС, PowerShell, .NET, розрядність, elevation -------
     $environment = $null
@@ -729,7 +734,7 @@ function Test-BRAVODeploymentPreflight {
         try {
             # Цільовий RuntimeRoot - другим аргументом (перший - TaskPath, порожній = із конфігурації цього кореня).
             # Install: область задач - з ДОВІРЕНОЇ конфігурації комплекту (ціль ще не існує, її loader не можна виконувати).
-            $managedTasks = @(& $adapterTable['GetManagedTasks'] '' (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Operation -RuntimeRoot $RuntimeRoot -ToolkitRoot $ToolkitRoot))
+            $managedTasks = @(& $adapterTable['GetManagedTasks'] '' (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Operation -RuntimeRoot $RuntimeRoot -ToolkitRoot $ToolkitRoot -IntegrityStatus $earlyIntegrityStatus))
             $runningNames = New-Object System.Collections.Generic.List[string]
             foreach ($task in $managedTasks) {
                 $taskState = [string](Get-BRAVOPreflightProperty -InputObject $task -Name 'state' -Default '')
@@ -899,6 +904,13 @@ function Test-BRAVODeploymentPreflight {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RuntimeIntegrity' -Severity 'Ok' `
             -Title 'Поточна інсталяція цілісна' -Meaning 'Файли збігаються з еталонним маніфестом.'
     } elseif ($Operation -eq 'Repair') {
+        # Repair -Scope Scheduler не має резервної копії файлів: відкат звіряв би незмінені пошкоджені файли з еталоном (Critical).
+        if (($Scope -ceq 'Scheduler') -and ($integrityStatus -eq 'Invalid')) {
+            Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RepairScope' -Severity 'Blocker' `
+                -Title 'Для порушеної цілісності Repair -Scope Scheduler недоступний' `
+                -Meaning 'Відновлення лише планувальника не виправляє файли, а його відкат не пройде перевірку цілісності.' `
+                -Action 'Виконайте повний Repair (Scope All).' -Details "integrity=$integrityStatus; scope=$Scope" -ExitCodeHint 33
+        }
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RuntimeIntegrity' -Severity 'NotApplicable' `
             -Title 'Порушена цілісність — очікувано для відновлення' -Meaning 'Саме це відновлення й виправляє.' `
             -Details "integrity=$integrityStatus"

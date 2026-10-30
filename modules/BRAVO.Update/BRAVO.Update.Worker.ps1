@@ -799,6 +799,7 @@ function Invoke-BRAVOUpdateWorker {
         RequiredBytes = $required; Adapter = $Adapter
     }
     if ($null -ne $installationState) { $preflightArguments['InstallationState'] = $installationState }
+    if ($action -eq 'Repair') { $preflightArguments['Scope'] = [string](Get-BRAVOUpdatePropertyValue -InputObject $options -Name 'scope' -Default 'All') }
     $preflight = $null
     try { $preflight = Test-BRAVODeploymentPreflight @preflightArguments } catch {
         return (& $fail @(New-BRAVOUpdateWorkerFinding -Id 'Worker.Preflight' -Title 'Повторний preflight не виконано' -Details $_.Exception.Message `
@@ -999,6 +1000,7 @@ function New-BRAVOUpdateCliPlan {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Install', 'Update', 'Repair')][string]$Operation,
+        [string]$Scope = 'All',
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)]$Paths,
         [Parameter(Mandatory = $true)][hashtable]$Adapter,
@@ -1047,6 +1049,7 @@ function New-BRAVOUpdateCliPlan {
             RequiredBytes = ($stagedBytes * 2); Adapter = $Adapter
         }
         if ($null -ne $InstallationState) { $preflightArguments['InstallationState'] = $InstallationState }
+        if ($Operation -eq 'Repair') { $preflightArguments['Scope'] = $Scope }
         $preflight = Test-BRAVODeploymentPreflight @preflightArguments
         $planArguments = @{
             Action = $Operation; RuntimeRoot = $RuntimeRoot; StagingRoot = [string]$Paths.StagingRoot; BackupRoot = [string]$Paths.BackupRoot
@@ -1070,6 +1073,7 @@ function Invoke-BRAVOUpdateCliPlanStep {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Operation,
+        [string]$Scope = 'All',
         [Parameter(Mandatory = $true)][hashtable]$StateArguments,
         [Parameter(Mandatory = $true)]$Paths,
         [Parameter(Mandatory = $true)][hashtable]$Adapter,
@@ -1093,7 +1097,7 @@ function Invoke-BRAVOUpdateCliPlanStep {
                         -Action 'Вкажіть -RuntimeRoot явно.' -Details ('state=' + [string](Get-BRAVOUpdatePropertyValue -InputObject $state -Name 'state' -Default ''))) }
         }
     }
-    return (New-BRAVOUpdateCliPlan -Operation $Operation -RuntimeRoot $root -Paths $Paths -Adapter $Adapter -InstallationState $state -Tag $Tag -SourcePath $SourcePath `
+    return (New-BRAVOUpdateCliPlan -Operation $Operation -Scope $Scope -RuntimeRoot $root -Paths $Paths -Adapter $Adapter -InstallationState $state -Tag $Tag -SourcePath $SourcePath `
             -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now)
 }
 
@@ -1280,7 +1284,7 @@ function Invoke-BRAVOUpdateCliMutation {
         $plan = $loaded.Contract
         if ([string]$plan.action -cne $Action) { return (& $refuse 'Cli.PlanAction' 'Дія плану не збігається з -Action' ('план: ' + [string]$plan.action) $plan $null 'Blocked') }
     } else {
-        $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Action -StateArguments $StateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
+        $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Action -Scope $Scope -StateArguments $StateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
             -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
         if ($null -eq $built.Plan) {
             $code = Get-BRAVOUpdateWorkerHintExitCode -Finding @($built.Findings)
@@ -1451,7 +1455,7 @@ function Invoke-BRAVOUpdateCliAction {
     $preflightFor = {
         param([string]$PreflightOperation, $State, [string]$Root)
         Test-BRAVODeploymentPreflight -Operation $PreflightOperation -RuntimeRoot $Root -StateRoot ([string]$Paths.StateRoot) -LockRoot ([string]$Paths.LockRoot) `
-            -OperationLockPath ([string]$Paths.OperationLockPath) -StagingRoot ([string]$Paths.StagingRoot) -BackupRoot ([string]$Paths.BackupRoot) -InstallationState $State -Adapter $Adapter
+            -OperationLockPath ([string]$Paths.OperationLockPath) -StagingRoot ([string]$Paths.StagingRoot) -BackupRoot ([string]$Paths.BackupRoot) -InstallationState $State -Adapter $Adapter -Scope $Scope
     }
 
     switch ($Action) {
@@ -1489,7 +1493,7 @@ function Invoke-BRAVOUpdateCliAction {
         }
         'Plan' {
             if ([string]::IsNullOrEmpty($Operation)) { return (& $usage 'Для -Action Plan потрібен -Operation Install|Update|Repair' '') }
-            $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Operation -StateArguments $stateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
+            $built = Invoke-BRAVOUpdateCliPlanStep -Operation $Operation -Scope $Scope -StateArguments $stateArguments -Paths $Paths -Adapter $Adapter -Tag $Tag -SourcePath $SourcePath `
                 -AllowPrerelease:$AllowPrerelease -SelfTest $SelfTest -WorkRoot $WorkRoot -Acquire $Acquire -Downloader $Downloader -Now $Now
             if ($null -eq $built.Plan) {
                 $failedPreflight = New-BRAVOUpdatePreflightResult -Operation $Operation -Findings @($built.Findings)
