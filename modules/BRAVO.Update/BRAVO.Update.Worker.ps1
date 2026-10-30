@@ -1154,7 +1154,7 @@ function Invoke-BRAVOUpdateElevatedRecover {
         -WorkRoot залишено лише для сумісності підпису: більше не використовується.
     #>
     [CmdletBinding()]
-    param([string]$ScriptPath = '', [string]$StateRoot = '', [string]$WorkRoot = '', [scriptblock]$ElevatedLauncher)
+    param([string]$ScriptPath = '', [string]$StateRoot = '', [string]$WorkRoot = '', [scriptblock]$ElevatedLauncher, [string]$RuntimeRoot = '')
     $problem = {
         param([string]$Id, [string]$Title, [string]$Details, [int]$Code)
         $hint = $null
@@ -1165,8 +1165,12 @@ function Invoke-BRAVOUpdateElevatedRecover {
     if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return (& $problem 'Cli.NoScript' 'Не вказано шлях BRAVO_UPDATE.ps1 для підвищення прав' '' 36) }
     if ([string]::IsNullOrWhiteSpace($StateRoot)) { $StateRoot = [string](Get-BRAVOUpdateDefaultPaths).StateRoot }
     $recoveryId = [guid]::NewGuid().ToString()
+    # Явний -RuntimeRoot передається елевованому процесу; той самостійно перевіряє, що root
+    # ЗНАЙДЕНО discovery, а не довіряє аргументу.
+    $recoverArguments = @('-Action', 'Recover', '-RecoveryId', $recoveryId, '-NoPause')
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) { $recoverArguments = @('-Action', 'Recover', '-RuntimeRoot', $RuntimeRoot, '-RecoveryId', $recoveryId, '-NoPause') }
     $launched = Invoke-BRAVOUpdateElevatedProcess -ScriptPath $ScriptPath -ElevatedLauncher $ElevatedLauncher `
-        -ScriptArgument @('-Action', 'Recover', '-RecoveryId', $recoveryId, '-NoPause')
+        -ScriptArgument $recoverArguments
     if (-not $launched.Launched) { return (& $problem 'Worker.PrivilegeRequired' 'Підвищення прав не підтверджено' ([string]$launched.Error) 36) }
     $resultFile = Join-Path (Join-Path (Join-Path $StateRoot 'Operations') $recoveryId) 'result.json'
     $read = Read-BRAVOUpdateContractFile -Path $resultFile -Kind DeploymentResult
@@ -1244,6 +1248,11 @@ function Invoke-BRAVOUpdateCliMutation {
         $plan = $built.Plan
     }
     $planBlockers = @(@(Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'findings' -Default @()) | Where-Object { [string](Get-BRAVOUpdatePropertyValue -InputObject $_ -Name 'severity') -ceq 'Blocker' })
+    # Офлайн-план виконується лише з тим самим архівом: без -SourcePath не вмикаємо мовчки онлайн-завантаження.
+    $planSourceKind = [string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $plan -Name 'source') -Name 'kind' -Default '')
+    if (($planSourceKind -ceq 'Offline') -and [string]::IsNullOrWhiteSpace($SourcePath)) {
+        return (& $refuse 'Cli.OfflineSourceRequired' 'для офлайн-плану вкажіть -SourcePath' 'План побудовано з локального архіва; завантаження з мережі не виконується. Повторіть із -SourcePath <той самий zip>.' $plan $null 'Blocked')
+    }
     $shortId = ([string]$plan.planId).Substring(0, 8)
     if ($null -ne $Report) { & $Report (@(Format-BRAVODeploymentPlanText -Plan $plan) + @('Короткий id плану: ' + $shortId)) }
     if ($planBlockers.Count -gt 0) {
@@ -1528,7 +1537,7 @@ function Invoke-BRAVOUpdateCliAction {
                 return (& $done ([int]$outcome.exitCode) $outcome)
             }
             # Без прав: перезапуск процесом з правами; результат — через тимчасовий файл.
-            $elevated = Invoke-BRAVOUpdateElevatedRecover -ScriptPath $ScriptPath -StateRoot ([string]$Paths.StateRoot) -ElevatedLauncher $ElevatedLauncher
+            $elevated = Invoke-BRAVOUpdateElevatedRecover -ScriptPath $ScriptPath -StateRoot ([string]$Paths.StateRoot) -ElevatedLauncher $ElevatedLauncher -RuntimeRoot $RuntimeRoot
             return (& $done ([int]$elevated.ExitCode) $elevated.Result)
         }
         default {

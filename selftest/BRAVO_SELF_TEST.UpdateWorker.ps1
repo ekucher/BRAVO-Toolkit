@@ -330,7 +330,7 @@
         # --- CLI диспетчер: підтвердження, елевація, Recover ---
         & {
             $stagedCopy = $staged; $sourceCopy = $source; $acquire = @{ Stage = { param($Tag, $SourcePath, $AllowPrerelease, $WorkDirectory) [pscustomobject]@{ Success = $true; Findings = @(); Source = $sourceCopy; StagedRoot = $stagedCopy } }.GetNewClosure() }
-            $base = @{ Paths = $paths; Adapter = $adapter; CandidateRoots = @($runtime); Operations = $ops; Acquire = $acquire; WorkRoot = $wkRoot; RuntimeRoot = $runtime; Action = 'Update' }
+            $base = @{ Paths = $paths; Adapter = $adapter; CandidateRoots = @($runtime); Operations = $ops; Acquire = $acquire; WorkRoot = $wkRoot; RuntimeRoot = $runtime; Action = 'Update'; SourcePath = (Join-Path $wkRoot 'offline.zip') }
 
             $r = & $call 'Invoke-BRAVOUpdateCliAction' ($base + @{ IsAdministrator = $true; NonInteractive = $true })
             Test-BRAVOCondition -Condition ($r.ExitCode -eq 80) -Name 'UpdateWorker/NonInteractiveNeedsPlanPathAndId' -Failure 'неінтерактивно без -PlanPath/-ConfirmPlanId = 80'
@@ -466,6 +466,32 @@
             $acquire = @{ Stage = { param($Tag, $SourcePath, $AllowPrerelease, $WorkDirectory) [pscustomobject]@{ Success = $true; Findings = @(); Source = $sourceCopy; StagedRoot = $stagedCopy } }.GetNewClosure() }
             $cliPlan = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Plan'; Operation = 'Update'; SelfTest = 'Skip'; Paths = $paths; Adapter = $adapter; CandidateRoots = @($runtime); Acquire = $acquire; WorkRoot = $wkRoot; RuntimeRoot = $runtime }
             Test-BRAVOCondition -Condition ($null -ne $cliPlan.Result -and -not (& $hasPlanned $cliPlan.Result) -and (@(& $skippedItem $cliPlan.Result)).Count -eq 1) -Name 'UpdateWorker/CliPlanSelfTestSkip' -Failure 'CLI -SelfTest Skip мусить потрапити в план'
+        }
+
+        # --- Codex R2 #3: Recover через елевацію передає явний -RuntimeRoot ---
+        & {
+            $captured = New-Object System.Collections.Generic.List[object]
+            $launcher = { param([string[]]$ArgumentList) $captured.Add($ArgumentList); [pscustomobject]@{ Launched = $false; ExitCode = 36; Error = 'UAC скасовано' } }.GetNewClosure()
+            $null = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $false; RuntimeRoot = $runtime; ElevatedLauncher = $launcher; ScriptPath = 'C:\x\BRAVO_UPDATE.ps1' }
+            $argumentText = @($captured | ForEach-Object { $_ }) -join ' '
+            Test-BRAVOCondition -Condition ($argumentText -match '-RuntimeRoot' -and $argumentText.Contains($runtime) -and $argumentText -match '-RecoveryId') -Name 'UpdateWorker/RecoverElevationForwardsRuntimeRoot' -Failure $argumentText
+            $captured.Clear()
+            $null = & $call 'Invoke-BRAVOUpdateCliAction' @{ Action = 'Recover'; Paths = $paths; Adapter = $adapter; IsAdministrator = $false; ElevatedLauncher = $launcher; ScriptPath = 'C:\x\BRAVO_UPDATE.ps1' }
+            Test-BRAVOCondition -Condition ((@($captured | ForEach-Object { $_ }) -join ' ') -notmatch '-RuntimeRoot') -Name 'UpdateWorker/RecoverElevationWithoutRootOmitsIt' -Failure 'без явного root аргумент не додається'
+        }
+
+        # --- Codex R2 #4: збережений офлайн-план без -SourcePath не переходить на онлайн ---
+        & {
+            $plan = & $newPlan
+            $planFile = Join-Path $wkRoot 'offline-plan.json'
+            [IO.File]::WriteAllText($planFile, (& $call 'ConvertTo-BRAVOUpdateJson' @{ InputObject = $plan }), (New-Object Text.UTF8Encoding $false))
+            $callsBefore = $calls.Update
+            $base = @{ Action = 'Update'; PlanPath = $planFile; ConfirmPlanId = $plan.planId.Substring(0, 8); NonInteractive = $true; Paths = $paths; Adapter = $adapter; CandidateRoots = @($runtime); Operations = $ops; IsAdministrator = $true }
+            $refused = & $call 'Invoke-BRAVOUpdateCliAction' $base
+            Test-BRAVOCondition -Condition ($refused.ExitCode -eq 80 -and (@(@($refused.Result.findings) | ForEach-Object { $_.id }) -contains 'Cli.OfflineSourceRequired') -and $calls.Update -eq $callsBefore) `
+                -Name 'UpdateWorker/OfflinePlanRequiresSourcePath' -Failure ('код ' + $refused.ExitCode)
+            $allowed = & $call 'Invoke-BRAVOUpdateCliAction' ($base + @{ SourcePath = (Join-Path $wkRoot 'offline.zip') })
+            Test-BRAVOCondition -Condition ($allowed.ExitCode -eq 0 -and $calls.Update -eq ($callsBefore + 1) -and $calls.Last.SourcePath -ceq (Join-Path $wkRoot 'offline.zip')) -Name 'UpdateWorker/OfflinePlanWithSourcePathDispatches' -Failure ('код ' + $allowed.ExitCode)
         }
     } finally {
         if ($null -ne $wkValidatorOriginal) {
