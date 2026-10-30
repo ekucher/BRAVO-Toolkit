@@ -627,6 +627,16 @@ function Invoke-BRAVOSchedulerReconcile {
         $run = & $setupScheduler $runtimeRoot
         $rawExit = Get-BRAVOUpdatePropertyValue -InputObject $run -Name 'ExitCode' -Default $null
         $timedOut = [bool](Get-BRAVOUpdatePropertyValue -InputObject $run -Name 'TimedOut' -Default $false)
+        if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $run -Name 'TreeNotContained' -Default $false)) {
+            # Дерево процесів setup не підтверджено завершеним: вцілілий процес може ще (пере)реєструвати
+            # задачі. Жодних подальших змін задач (повторне вимкнення гонилось би з ним): негайний FAIL,
+            # прапорець читає orchestrator/rollback (Critical, ручне втручання).
+            return [pscustomobject][ordered]@{
+                Verdict = 'FAIL'; ExitCode = -1; CreatedTasks = @(); RequiescedTasks = @()
+                Problems = @('Scheduler.ProcessTreeNotContained: BRAVO_SETUP -Action Scheduler не вдалося повністю завершити (дерево процесів не підтверджено); задачі не змінювались.')
+                TreeNotContained = $true
+            }
+        }
         if (($null -eq $run) -or (-not (Test-BRAVOUpdateWholeNumber -Value $rawExit))) {
             $problems.Add('BRAVO_SETUP -Action Scheduler не повернув код завершення.')
         } else {
@@ -719,6 +729,7 @@ function Invoke-BRAVOSchedulerReconcile {
         CreatedTasks    = @($created.ToArray())
         RequiescedTasks = @($uniqueRequiesced.ToArray())
         Problems        = @($problems.ToArray())
+        TreeNotContained = $false
     }
 }
 
