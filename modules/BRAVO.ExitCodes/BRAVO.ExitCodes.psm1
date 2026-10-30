@@ -39,6 +39,14 @@ $script:BRAVOExitCodeNames = @{
     51 = "SmbFailed"
     60 = "MaintenanceFailed"
     70 = "HealthCritical"
+    # Lifecycle-операції BRAVO.Update (docs\installer\CONTRACTS.md, розділ 7).
+    # 80 — операцію не виконано, runtime не змінено або відмова без
+    # конкретнішої канонічної причини; 81 — mutation почалась, але
+    # попередній стан відновлено й перевірено; 82 — відкат не вдався або
+    # стан невідомий, потрібна ручна дія.
+    80 = "DeploymentFailed"
+    81 = "DeploymentRolledBack"
+    82 = "DeploymentCritical"
     90 = "InternalError"
 }
 
@@ -153,7 +161,7 @@ function Get-BRAVOExitCodeSeverity {
     if ($Code -eq 0) { return 'SUCCESS' }
     if ($Code -eq 10) { return 'WARNING' }
     if ($Code -eq 20) { return 'WARNING' }
-    if ($Code -eq 32 -or $Code -eq 33 -or $Code -eq 34 -or $Code -eq 35 -or $Code -eq 70) { return 'CRITICAL' }
+    if ($Code -eq 32 -or $Code -eq 33 -or $Code -eq 34 -or $Code -eq 35 -or $Code -eq 70 -or $Code -eq 82) { return 'CRITICAL' }
     return 'ERROR'
 }
 

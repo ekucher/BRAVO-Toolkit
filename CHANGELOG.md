@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **Installer v1: engine `BRAVO.Update`, CLI `BRAVO_UPDATE.ps1` і WinForms GUI `BRAVO_INSTALLER.ps1` (гілка `feature/installer-v1`; не прийнято для production).**
+  Новий модуль `modules/BRAVO.Update`: контракти State/Preflight/Plan/Progress/Result/Journal з забороною секретних
+  полів, атомарний write-ahead журнал, lifecycle-lock і канонічний `BRAVO_OPERATION.lock`, read-only discovery,
+  preflight і бар'єр legacy-конфігурації, план із fingerprint і TTL, отримання релізу (online за явним тегом, offline
+  zip + `.sha256` + обов'язковий `release-manifest.json`) з єдиним конвеєром верифікації, безпечне розпакування,
+  верифікований backup, orchestrator `Invoke-BRAVODeployment` з межею mutation, reconcile конфігурації й задач,
+  post-deployment validation, транзакційний відкат з відновленням version-state, recovery, same-version repair,
+  clean install і захищені корені стану engine. `BRAVO_UPDATE.ps1` — тонкий CLI (`State`, `Preflight`, `Plan`,
+  `Install`/`Update`/`Repair` з підтвердженням коротким id плану, `Recover`, `Diagnose`, `Initialize`); mutation
+  виконує worker після UAC. GUI: майстер, прогрес і результат, Maintenance Center. Нові коди завершення
+  `80 DeploymentFailed`, `81 DeploymentRolledBack`, `82 DeploymentCritical`. Документація `docs/installer/`
+  (CONTRACTS, ENGINE_DESIGN, DECISIONS, OPERATOR_GUIDE). 17 нових self-test suite-ів (`Update*`, `InstallerUI`).
+  VM- і real-host acceptance не виконано; рішення D1–D14 чекають затвердження власником.
+
 - **Fix: status-файли — код 20 дає `WARNINGS`, ранні виходи не лишають старий `OK` (#479, #478; мінімальний
   порт PR #493 у схемі v1).** Нова `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`) — єдине відображення код ->
   `status`, деривоване з severity: 0 -> `OK`, 10 і 20 -> `WARNINGS`, решта -> `ERROR`. Раніше Health, відкладений

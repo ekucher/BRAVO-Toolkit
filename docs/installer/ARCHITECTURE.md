@@ -34,6 +34,8 @@ BRAVO Installer має стати єдиним operator-facing lifecycle fronten
 
 ## 3. Розподіл відповідальності
 
+Точні форми контрактів і назви функцій Installer v1 визначає [CONTRACTS.md](CONTRACTS.md); у разі розбіжності з цим розділом діє CONTRACTS.md.
+
 ### Installer GUI
 
 GUI відображає installation state, запускає preflight, збирає operator intent, показує deployment plan, отримує progress events та показує result/rollback state.
@@ -198,7 +200,9 @@ RolledBack
 Critical
 ```
 
-Numeric exit codes не дублюються; canonical `BRAVO.ExitCodes` залишається source of truth. Поточний deployment contract, де setup result `10` означає success with warning, має бути збережений або змінений лише окремим contract change.
+Numeric exit codes не дублюються; canonical `BRAVO.ExitCodes` залишається source of truth. Відображення результатів на коди (зокрема `80`/`81`/`82`) — у [CONTRACTS.md](CONTRACTS.md) §7.
+
+`BRAVO_SETUP.ps1` фактично завершується лише кодом `0` або `1`; код `10` setup не повертає. Mapping `10` → `PASS_WITH_WARNING` у `Get-BRAVODeploySetupExitVerdict` — залишок сумісності legacy deploy. Engine трактує setup `0` як `Pass`, ненульовий — як `Fail` (див. [DECISIONS.md](DECISIONS.md) D10).
 
 GUI не парсить декоративний console output. Structured progress містить щонайменше operation ID, phase, status, percent, message та timestamp.
 
@@ -207,6 +211,8 @@ GUI не парсить декоративний console output. Structured prog
 Цільовий GUI — Windows-native operator application. Попередній design candidate — C#/.NET Framework/WPF, але exact framework/runtime compatibility має бути окремо перевірена проти підтримуваної Windows matrix до implementation freeze.
 
 GUI technology не змінює вимогу Windows PowerShell 5.1 для BRAVO product/test validation.
+
+Installer v1 використовує Windows PowerShell 5.1 + WinForms замість WPF — див. [DECISIONS.md](DECISIONS.md) D3.
 
 ## 16. Acceptance boundary
 

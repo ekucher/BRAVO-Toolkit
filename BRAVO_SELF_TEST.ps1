@@ -34364,6 +34364,137 @@ function Write-BRAVOLog {
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/MaintenanceDiskSpace' } }
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    # Installer v1 (docs\installer\CONTRACTS.md): engine BRAVO.Update і GUI
+    # BRAVO.Installer.UI. Фрагменти працюють лише в sandbox-каталогах TEMP.
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateStaging') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateStaging'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateStaging') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateStaging.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateStaging' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRelease') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRelease'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRelease') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRelease.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRelease' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateDiscovery') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateDiscovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateDiscovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateDiscovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateDiscovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdatePlan') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdatePlan'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdatePlan') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdatePlan.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdatePlan' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateDiagnostics') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateDiagnostics'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateDiagnostics') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateDiagnostics.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateDiagnostics' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'InstallerUI') {
+        Enter-BRAVOSelfTestSuite -Name 'InstallerUI'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/InstallerUI') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.InstallerUI.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/InstallerUI' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateContracts') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateContracts'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateContracts') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateContracts.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateContracts' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdatePreflight') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdatePreflight'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdatePreflight') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdatePreflight.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdatePreflight' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateBackup') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateBackup'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateBackup') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateBackup.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateBackup' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateValidation') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateValidation'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateValidation') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateValidation.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateValidation' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRecovery') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRecovery'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRecovery') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRecovery.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRecovery' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateReconcile') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateReconcile'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateReconcile') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateReconcile.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateReconcile' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateRollback') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateRollback'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateRollback') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateRollback.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateRollback' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateWorker') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateWorker'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateWorker') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateWorker.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateWorker' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateInstall') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateInstall'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateInstall') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateInstall.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateInstall' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateDeploy') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateDeploy'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateDeploy') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateDeploy.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateDeploy' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'UpdateEndToEnd') {
+        Enter-BRAVOSelfTestSuite -Name 'UpdateEndToEnd'
+        if (Enter-BRAVOSelfTestSection -Name 'Suite/UpdateEndToEnd') { try {
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.UpdateEndToEnd.ps1')
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Suite/UpdateEndToEnd' } }
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     # #219 (частина B): сюди доходять лише маркери глобальних меж і винятки
     # з коду МІЖ секціями. Register-BRAVOSelfTestGlobalFatal реєструє
@@ -38067,7 +38198,8 @@ foreach ($case in $cases) {
         'Status'                 = 'Status'
     }
     $suiteMapModulesWithoutSuite = @('ArchiveHelpers', 'ArchiveRuntime', 'Compatibility', 'Console', 'Credentials',
-        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Logging', 'Maintenance', 'Notifications', 'System')
+        'Discovery', 'ExitCodes', 'Health', 'HelperLogging', 'Installer.UI', 'Logging', 'Maintenance', 'Notifications',
+        'System', 'Update')
     $suiteMapActualModules = [string[]]@(
         [IO.Directory]::GetDirectories((Join-Path $root 'modules')) |
             ForEach-Object { [IO.Path]::GetFileName($_) } |

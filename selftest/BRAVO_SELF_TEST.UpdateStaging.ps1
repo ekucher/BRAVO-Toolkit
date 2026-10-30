@@ -1,0 +1,605 @@
+﻿# Suite UpdateStaging: lifecycle/operation lock і безпечний staging BRAVO.Update
+# (INS-035). Фрагмент dot-source-иться з BRAVO_SELF_TEST.ps1 ($root заданий).
+
+Import-Module (Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.psm1') -Force -DisableNameChecking
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$updStagingTempPrefix = Join-Path ([System.IO.Path]::GetTempPath()) ('bravo-updstg-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $updStagingTempPrefix -Force)
+
+# Явно призначає власником особистий SID поточного користувача (файл або каталог). Дозволено без привілеїв.
+# Тести не покладаються на default owner: елевований токен створює об'єкти з власником BUILTIN\Administrators,
+# неелевований - з особистим SID, тому «чужий/особистий» власник у фікстурі задається лише так.
+function Set-UpdStagingTestOwnerPersonal {
+    param([string]$Path)
+    $personal = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $isDirectory = [System.IO.Directory]::Exists($Path)
+    $item = $null
+    if ($isDirectory) { $item = New-Object System.IO.DirectoryInfo($Path) } else { $item = New-Object System.IO.FileInfo($Path) }
+    $security = $item.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Owner)
+    $security.SetOwner($personal)
+    $item.SetAccessControl($security)
+}
+
+# Будує ZIP із довільними іменами entry: @( @{ Name; Text } ... ).
+function New-UpdStagingTestZip {
+    param([string]$Path, [object[]]$Items)
+    $zipStream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    $zip = New-Object System.IO.Compression.ZipArchive($zipStream, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+        foreach ($item in $Items) {
+            $entry = $zip.CreateEntry([string]$item.Name)
+            if (-not ([string]$item.Name).EndsWith('/')) {
+                $writer = New-Object System.IO.StreamWriter($entry.Open(), (New-Object System.Text.UTF8Encoding $false))
+                $writer.Write([string]$item.Text)
+                $writer.Dispose()
+            }
+        }
+    } finally {
+        $zip.Dispose()
+        $zipStream.Dispose()
+    }
+}
+
+try {
+    # --- Lifecycle lock -----------------------------------------------------
+    & {
+        $lockRoot = Join-Path $updStagingTempPrefix 'lock root Кореневий'
+        $first = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-1'
+        Test-BRAVOCondition -Condition ($first.Success -and $null -ne $first.Stream) -Name 'UpdateStaging/LifecycleLockAcquired' -Failure 'перше захоплення lifecycle-lock має вдатися'
+        Test-BRAVOCondition -Condition ((Split-Path -Leaf $first.Path) -eq 'BRAVO_UPDATE.lock') -Name 'UpdateStaging/LifecycleLockFileName' -Failure 'ім''я lock-файла має бути BRAVO_UPDATE.lock'
+        $second = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-2'
+        Test-BRAVOCondition -Condition (-not $second.Success -and $null -eq $second.Stream) -Name 'UpdateStaging/LifecycleLockBusy' -Failure 'друге захоплення має повернути Success=$false без винятку'
+        Test-BRAVOCondition -Condition ($null -ne $second.Holder -and [string]$second.Holder.operationId -eq 'op-1' -and [int]$second.Holder.pid -eq $PID) -Name 'UpdateStaging/LifecycleLockHolderReadable' -Failure 'holder зайнятого lock-а має читатися (operationId, pid)'
+        Test-BRAVOCondition -Condition ($null -ne $second.Holder.PSObject.Properties['processStartTime'] -and $null -ne $second.Holder.PSObject.Properties['startedAt']) -Name 'UpdateStaging/LifecycleLockHolderFields' -Failure 'holder має містити processStartTime і startedAt'
+        Exit-BRAVOUpdateLifecycleLock -Lock $first
+        $third = Enter-BRAVOUpdateLifecycleLock -LockRoot $lockRoot -OperationId 'op-3'
+        Test-BRAVOCondition -Condition ($third.Success -and [string]$third.Holder.operationId -eq 'op-3') -Name 'UpdateStaging/LifecycleLockReacquire' -Failure 'після Exit повторне захоплення має вдатися'
+        Exit-BRAVOUpdateLifecycleLock -Lock $third
+        Exit-BRAVOUpdateLifecycleLock -Lock $null
+        Test-BRAVOCondition -Condition (-not (Test-Path -LiteralPath (Join-Path $lockRoot 'BRAVO_UPDATE.holder.json'))) -Name 'UpdateStaging/LifecycleLockSidecarRemoved' -Failure 'Exit має прибрати sidecar holder'
+    }
+
+    # --- Operation lock -----------------------------------------------------
+    & {
+        $opPath = Join-Path $updStagingTempPrefix 'op lock Папка\BRAVO_OPERATION.lock'
+        $idle = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition (-not $idle.Active -and $null -eq $idle.Holder) -Name 'UpdateStaging/OperationLockInactiveMissing' -Failure 'без файла lock неактивний'
+        $first = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-a' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition ($first.Success) -Name 'UpdateStaging/OperationLockAcquired' -Failure 'захоплення operation-lock має вдатися'
+        $active = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition ($active.Active -and $null -ne $active.Holder -and [string]$active.Holder.operation -eq 'Update') -Name 'UpdateStaging/OperationLockActiveHolder' -Failure 'активний lock має давати holder operation=Update'
+        $second = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-b' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition (-not $second.Success -and $null -ne $second.Holder) -Name 'UpdateStaging/OperationLockBusy' -Failure 'зайнятий lock: Success=$false і читабельний holder'
+        $json = & (Get-Module BRAVO.Update) { param($p) Read-BRAVOUpdateLockHolderFile -Path $p } $opPath
+        Test-BRAVOCondition -Condition ([string]$json.operation -eq 'Update' -and [string]$json.generationId -eq 'op-a' -and [string]$json.packageVersion -eq '9.9.9' -and [string]$json.hostname -eq [Environment]::MachineName -and $null -eq $json.config) -Name 'UpdateStaging/OperationLockCanonicalFormat' -Failure 'JSON-holder має канонічний формат'
+        Exit-BRAVOUpdateOperationLock -Lock $first
+        $after = Test-BRAVOUpdateOperationLockActive -OperationLockPath $opPath
+        Test-BRAVOCondition -Condition (-not $after.Active) -Name 'UpdateStaging/OperationLockReleasedInactive' -Failure 'після Exit lock неактивний'
+        $third = Enter-BRAVOUpdateOperationLock -OperationLockPath $opPath -OperationId 'op-c' -PackageVersion '9.9.9'
+        Test-BRAVOCondition -Condition ($third.Success) -Name 'UpdateStaging/OperationLockReacquire' -Failure 'після Exit повторне захоплення має вдатися'
+        Exit-BRAVOUpdateOperationLock -Lock $third
+    }
+
+    # --- Private directory & reparse ---------------------------------------
+    & {
+        $dir = Join-Path $updStagingTempPrefix 'private Приватний'
+        $created = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition ($created.Success -and (Test-Path -LiteralPath $dir -PathType Container)) -Name 'UpdateStaging/PrivateDirCreated' -Failure ('приватний каталог не створено: ' + ($created.Problems -join '; '))
+        $acl = Get-Acl -LiteralPath $dir
+        Test-BRAVOCondition -Condition ($acl.AreAccessRulesProtected) -Name 'UpdateStaging/PrivateDirNoInheritance' -Failure 'успадкування DACL має бути вимкнено'
+        $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        Test-BRAVOCondition -Condition (@($rules | Where-Object { $_.IsInherited }).Count -eq 0) -Name 'UpdateStaging/PrivateDirNoInheritedRules' -Failure 'не має бути успадкованих правил'
+        $sids = @($rules | ForEach-Object { [string]$_.IdentityReference.Value })
+        # Очікуваний довірений набір залежить від елевації процесу (елевований: лише Administrators/SYSTEM; без прав: + особистий SID),
+        # тому обчислюється канонічною Get-BRAVOUpdateTrustedSid, а не хардкодом «поточний користувач присутній».
+        $expectedSids = @(& (Get-Module BRAVO.Update) { Get-BRAVOUpdateTrustedSid })
+        Test-BRAVOCondition -Condition (($expectedSids.Count -gt 0) -and (@($expectedSids | Where-Object { $sids -notcontains $_ }).Count -eq 0) -and (@($sids | Where-Object { $expectedSids -notcontains $_ }).Count -eq 0)) -Name 'UpdateStaging/PrivateDirTrustedOnly' -Failure ('очікувано ' + ($expectedSids -join ',') + ', у каталозі ' + ($sids -join ','))
+        # Наявний порожній каталог допустимий, непорожній — ні.
+        $again = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition ($again.Success) -Name 'UpdateStaging/PrivateDirExistingEmptyOk' -Failure 'наявний порожній каталог має прийматися'
+        [System.IO.File]::WriteAllText((Join-Path $dir 'x.txt'), 'x')
+        $nonEmpty = New-BRAVOUpdatePrivateDirectory -Path $dir
+        Test-BRAVOCondition -Condition (-not $nonEmpty.Success -and $nonEmpty.Problems.Count -gt 0) -Name 'UpdateStaging/PrivateDirNonEmptyRefused' -Failure 'непорожній каталог має відхилятися'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path $dir)) -Name 'UpdateStaging/ReparseNegative' -Failure 'звичайний каталог не reparse point'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path (Join-Path $dir 'missing\child'))) -Name 'UpdateStaging/ReparseMissingSkipped' -Failure 'неіснуючий шлях без reparse у предках -> $false'
+        # Junction: створюємо через cmd mklink /J (без елевації), лише якщо вдалося.
+        $target = Join-Path $updStagingTempPrefix 'junction target'
+        $junction = Join-Path $updStagingTempPrefix 'junction link'
+        [void](New-Item -ItemType Directory -Path $target -Force)
+        $null = & cmd.exe /c mklink /J ('"' + $junction + '"') ('"' + $target + '"') 2>&1
+        if (Test-Path -LiteralPath $junction) {
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path $junction) -Name 'UpdateStaging/ReparseJunctionDetected' -Failure 'junction має виявлятися'
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path (Join-Path $junction 'child')) -Name 'UpdateStaging/ReparseAncestorDetected' -Failure 'junction серед предків має виявлятися'
+            Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdatePathHasReparsePoint -Path $junction -StopAt $junction)) -Name 'UpdateStaging/ReparseStopAt' -Failure 'StopAt виключає межу'
+            $viaJunction = New-BRAVOUpdatePrivateDirectory -Path $junction
+            Test-BRAVOCondition -Condition (-not $viaJunction.Success) -Name 'UpdateStaging/PrivateDirReparseRefused' -Failure 'reparse point має відхилятися'
+            [System.IO.Directory]::Delete($junction)
+        } else {
+            Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateStaging/ReparseJunction' -Failure 'junction створити не вдалося'
+        }
+    }
+
+    # --- Перевірка ZIP ------------------------------------------------------
+    & {
+        $good = Join-Path $updStagingTempPrefix 'good пакет.zip'
+        New-UpdStagingTestZip -Path $good -Items @(
+            @{ Name = 'a.txt'; Text = 'one' },
+            @{ Name = 'Підтека з пробілом/файл Один.txt'; Text = 'два' },
+            @{ Name = 'dir/'; Text = '' },
+            @{ Name = 'dir\sub\b.txt'; Text = 'three' })
+        $valid = Test-BRAVOUpdateZipEntries -ZipPath $good
+        Test-BRAVOCondition -Condition ($valid.IsValid -and $valid.Entries.Count -eq 4 -and $valid.TotalUncompressedBytes -gt 0) -Name 'UpdateStaging/ZipValid' -Failure ('валідний ZIP відхилено: ' + ($valid.Problems -join '; '))
+
+        $cases = [ordered]@{
+            'DotDot'      = '../x.txt'
+            'DotDotMid'   = 'a/../../x.txt'
+            'DriveRooted' = 'C:/x.txt'
+            'Unc'         = '\\server\share\x.txt'
+            'Rooted'      = '/etc/x.txt'
+            'Ads'         = 'a:b'
+            'AdsStream'   = 'file.txt:stream'
+            'TrailingDot' = 'dir/name.'
+            'Reserved'    = 'dir/NUL.txt'
+            'InvalidChar' = 'dir/a*b.txt'
+        }
+        foreach ($caseName in $cases.Keys) {
+            $badZip = Join-Path $updStagingTempPrefix ('bad-' + $caseName + '.zip')
+            New-UpdStagingTestZip -Path $badZip -Items @(@{ Name = 'ok.txt'; Text = 'ok' }, @{ Name = [string]$cases[$caseName]; Text = 'evil' })
+            $badResult = Test-BRAVOUpdateZipEntries -ZipPath $badZip
+            Test-BRAVOCondition -Condition (-not $badResult.IsValid -and $badResult.Problems.Count -gt 0) -Name ('UpdateStaging/ZipRejects' + $caseName) -Failure ('ім''я "' + $cases[$caseName] + '" має відхилятися')
+        }
+        $dupZip = Join-Path $updStagingTempPrefix 'dup.zip'
+        New-UpdStagingTestZip -Path $dupZip -Items @(@{ Name = 'A.txt'; Text = '1' }, @{ Name = 'a.txt'; Text = '2' })
+        $dupResult = Test-BRAVOUpdateZipEntries -ZipPath $dupZip
+        Test-BRAVOCondition -Condition (-not $dupResult.IsValid -and (@($dupResult.Problems) -join ' ') -match 'дублікат') -Name 'UpdateStaging/ZipRejectsCaseDuplicates' -Failure 'A.txt/a.txt мають відхилятися'
+        $dupSlash = Join-Path $updStagingTempPrefix 'dup-slash.zip'
+        New-UpdStagingTestZip -Path $dupSlash -Items @(@{ Name = 'd/x.txt'; Text = '1' }, @{ Name = 'D\x.txt'; Text = '2' })
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath $dupSlash).IsValid) -Name 'UpdateStaging/ZipRejectsSlashNormalisedDuplicates' -Failure 'дублікати після нормалізації слешів мають відхилятися'
+
+        $limits = Test-BRAVOUpdateZipEntries -ZipPath $good -MaxEntries 2
+        Test-BRAVOCondition -Condition (-not $limits.IsValid) -Name 'UpdateStaging/ZipRejectsTooManyEntries' -Failure 'перевищення -MaxEntries має відхилятися'
+        $limits = Test-BRAVOUpdateZipEntries -ZipPath $good -MaxTotalBytes 5
+        Test-BRAVOCondition -Condition (-not $limits.IsValid) -Name 'UpdateStaging/ZipRejectsTooLarge' -Failure 'перевищення -MaxTotalBytes має відхилятися'
+
+        $bomb = Join-Path $updStagingTempPrefix 'bomb.zip'
+        $bombStream = New-Object System.IO.FileStream($bomb, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+        $bombZip = New-Object System.IO.Compression.ZipArchive($bombStream, [System.IO.Compression.ZipArchiveMode]::Create)
+        $bombEntry = $bombZip.CreateEntry('zeros.bin', [System.IO.Compression.CompressionLevel]::Optimal)
+        $bombOut = $bombEntry.Open()
+        $zeros = New-Object byte[] 1048576
+        for ($i = 0; $i -lt 12; $i++) { $bombOut.Write($zeros, 0, $zeros.Length) }
+        $bombOut.Dispose(); $bombZip.Dispose(); $bombStream.Dispose()
+        $bombResult = Test-BRAVOUpdateZipEntries -ZipPath $bomb
+        Test-BRAVOCondition -Condition (-not $bombResult.IsValid -and (@($bombResult.Problems) -join ' ') -match 'стиснення') -Name 'UpdateStaging/ZipRejectsCompressionBomb' -Failure '12 МБ нулів (>200:1) мають відхилятися'
+
+        $notZip = Join-Path $updStagingTempPrefix 'not a zip.zip'
+        [System.IO.File]::WriteAllText($notZip, 'це не архів')
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath $notZip).IsValid) -Name 'UpdateStaging/ZipRejectsCorrupt' -Failure 'пошкоджений ZIP має відхилятися'
+        Test-BRAVOCondition -Condition (-not (Test-BRAVOUpdateZipEntries -ZipPath (Join-Path $updStagingTempPrefix 'missing.zip')).IsValid) -Name 'UpdateStaging/ZipRejectsMissing' -Failure 'відсутній ZIP має відхилятися'
+    }
+
+    # --- Розпакування -------------------------------------------------------
+    & {
+        $good = Join-Path $updStagingTempPrefix 'expand пакет.zip'
+        New-UpdStagingTestZip -Path $good -Items @(
+            @{ Name = 'a.txt'; Text = 'one' },
+            @{ Name = 'Підтека з пробілом/файл Один.txt'; Text = 'два' },
+            @{ Name = 'empty dir/'; Text = '' },
+            @{ Name = 'dir\sub\b.txt'; Text = 'three' })
+        $sha = (Get-FileHash -LiteralPath $good -Algorithm SHA256).Hash
+
+        $dest = Join-Path $updStagingTempPrefix 'dest Призначення'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest)
+        $ok = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest -ExpectedSha256 $sha
+        Test-BRAVOCondition -Condition ($ok.Success -and $ok.FileCount -eq 3) -Name 'UpdateStaging/ExpandOk' -Failure ('розпакування не вдалося: ' + ($ok.Problems -join '; '))
+        Test-BRAVOCondition -Condition ([System.IO.File]::ReadAllText((Join-Path $dest 'Підтека з пробілом\файл Один.txt')) -eq 'два' -and (Test-Path -LiteralPath (Join-Path $dest 'empty dir') -PathType Container) -and (Test-Path -LiteralPath (Join-Path $dest 'dir\sub\b.txt'))) -Name 'UpdateStaging/ExpandContent' -Failure 'вміст розпакованого не збігається'
+        Test-BRAVOCondition -Condition ((Get-BRAVOUpdateDirectorySize -Path $dest) -eq ([long]([System.Text.Encoding]::UTF8.GetByteCount('one') + [System.Text.Encoding]::UTF8.GetByteCount('два') + [System.Text.Encoding]::UTF8.GetByteCount('three')))) -Name 'UpdateStaging/DirectorySize' -Failure 'розмір каталогу має дорівнювати сумі файлів'
+
+        # Повторне розпакування в уже непорожній каталог відхиляється, наявне не чіпається.
+        $again = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest
+        Test-BRAVOCondition -Condition (-not $again.Success -and (Test-Path -LiteralPath (Join-Path $dest 'a.txt'))) -Name 'UpdateStaging/ExpandNonEmptyRefused' -Failure 'непорожнє призначення має відхилятися, вміст лишається'
+
+        # Неправильний SHA256.
+        $dest2 = Join-Path $updStagingTempPrefix 'dest2'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest2)
+        $badSha = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $dest2 -ExpectedSha256 ('0' * 64)
+        Test-BRAVOCondition -Condition (-not $badSha.Success -and @(Get-ChildItem -LiteralPath $dest2 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandShaMismatchRefused' -Failure 'невірний SHA256 має відхилятися без жодного файла'
+
+        # Шкідливий ZIP: нічого не розпаковується.
+        $evil = Join-Path $updStagingTempPrefix 'evil.zip'
+        New-UpdStagingTestZip -Path $evil -Items @(@{ Name = 'good.txt'; Text = 'g' }, @{ Name = '../escape.txt'; Text = 'e' })
+        $evilResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $evil -DestinationRoot $dest2
+        Test-BRAVOCondition -Condition (-not $evilResult.Success -and @(Get-ChildItem -LiteralPath $dest2 -Force).Count -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $updStagingTempPrefix 'escape.txt'))) -Name 'UpdateStaging/ExpandEvilRefused' -Failure 'шкідливий ZIP не має залишати файлів'
+
+        # Призначення без захищеного DACL (звичайний каталог) відхиляється.
+        $plain = Join-Path $updStagingTempPrefix 'plain dest'
+        [void](New-Item -ItemType Directory -Path $plain -Force)
+        $plainResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $plain
+        Test-BRAVOCondition -Condition (-not $plainResult.Success -and @(Get-ChildItem -LiteralPath $plain -Force).Count -eq 0) -Name 'UpdateStaging/ExpandNonPrivateRefused' -Failure 'неприватний каталог має відхилятися'
+
+        # Регресія P1: захищений DACL із явним ACE для Users — не приватний.
+        $leaky = Join-Path $updStagingTempPrefix 'leaky dest'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $leaky)
+        $leakyInfo = New-Object System.IO.DirectoryInfo($leaky)
+        $leakyAcl = $leakyInfo.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+        $usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $leakyAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, [System.Security.AccessControl.FileSystemRights]::Modify, ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit), [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+        $leakyInfo.SetAccessControl($leakyAcl)
+        $aclProblems = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateDirectoryAclProblem -Path $p } $leaky)
+        Test-BRAVOCondition -Condition ((Get-Acl -LiteralPath $leaky).AreAccessRulesProtected -and $aclProblems.Count -gt 0) -Name 'UpdateStaging/AclAllowlistDetectsUsersAce' -Failure 'ACE для Users у захищеному DACL має виявлятися'
+        $leakyResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $leaky
+        Test-BRAVOCondition -Condition (-not $leakyResult.Success -and @(Get-ChildItem -LiteralPath $leaky -Force).Count -eq 0) -Name 'UpdateStaging/ExpandAclViolationRefused' -Failure 'каталог з ACE для Users має відхилятися без файлів'
+        $cleanAcl = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateDirectoryAclProblem -Path $p } $dest2)
+        Test-BRAVOCondition -Condition ($cleanAcl.Count -eq 0) -Name 'UpdateStaging/AclAllowlistAcceptsPrivateDir' -Failure ('приватний каталог не має давати проблем: ' + ($cleanAcl -join '; '))
+
+        # Регресія P1 (TOCTOU): ZIP відкривається з FileShare.Read — поки handle
+        # тримається, запис/видалення/підміна файла неможливі; читач не заважає.
+        $held = Join-Path $updStagingTempPrefix 'held.zip'
+        New-UpdStagingTestZip -Path $held -Items @(@{ Name = 'h.txt'; Text = 'held' })
+        $holdStream = New-Object System.IO.FileStream($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $replaced = $true
+        try { [System.IO.File]::WriteAllText($held, 'replacement') } catch { $replaced = $false }
+        $deleted = $true
+        try { [System.IO.File]::Delete($held) } catch { $deleted = $false }
+        Test-BRAVOCondition -Condition (-not $replaced -and -not $deleted -and (Test-Path -LiteralPath $held)) -Name 'UpdateStaging/ZipHandleBlocksReplaceDelete' -Failure 'файл під handle FileShare.Read не можна підмінити/видалити'
+        $dest4 = Join-Path $updStagingTempPrefix 'dest4'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest4)
+        $withReader = Expand-BRAVOUpdateArchiveSafe -ZipPath $held -DestinationRoot $dest4 -ExpectedSha256 ((Get-FileHash -LiteralPath $held -Algorithm SHA256).Hash)
+        $holdStream.Dispose()
+        Test-BRAVOCondition -Condition ($withReader.Success -and $withReader.FileCount -eq 1) -Name 'UpdateStaging/ExpandWorksWithConcurrentReader' -Failure 'розпакування має працювати, поки інший читач тримає файл'
+        # Файл, відкритий на запис іншим handle, не розпаковується (незмінність не гарантована).
+        $writeStream = New-Object System.IO.FileStream($held, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $dest5 = Join-Path $updStagingTempPrefix 'dest5'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest5)
+        $withWriter = Expand-BRAVOUpdateArchiveSafe -ZipPath $held -DestinationRoot $dest5
+        $writeStream.Dispose()
+        Test-BRAVOCondition -Condition (-not $withWriter.Success -and @(Get-ChildItem -LiteralPath $dest5 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandRefusesZipOpenForWrite' -Failure 'ZIP, відкритий на запис, має відхилятися'
+
+        # Регресія P1: junction як корінь призначення відхиляється; підкаталог,
+        # підмінений на junction, виявляється ланцюгом -StopAt (його викликає
+        # Expand перед записом у кожен каталог).
+        $jTarget = Join-Path $updStagingTempPrefix 'jt target'
+        $jLink = Join-Path $updStagingTempPrefix 'jt link'
+        [void](New-Item -ItemType Directory -Path $jTarget -Force)
+        $null = & cmd.exe /c mklink /J ('"' + $jLink + '"') ('"' + $jTarget + '"') 2>&1
+        if (Test-Path -LiteralPath $jLink) {
+            $viaLink = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot $jLink
+            Test-BRAVOCondition -Condition (-not $viaLink.Success -and @(Get-ChildItem -LiteralPath $jTarget -Force).Count -eq 0) -Name 'UpdateStaging/ExpandJunctionRootRefused' -Failure 'junction як призначення має відхилятися, ціль лишається порожньою'
+            $swapRoot = Join-Path $updStagingTempPrefix 'swap root'
+            [void](New-BRAVOUpdatePrivateDirectory -Path $swapRoot)
+            $swapLink = Join-Path $swapRoot 'sub'
+            $null = & cmd.exe /c mklink /J ('"' + $swapLink + '"') ('"' + $jTarget + '"') 2>&1
+            Test-BRAVOCondition -Condition (Test-BRAVOUpdatePathHasReparsePoint -Path $swapLink -StopAt $swapRoot) -Name 'UpdateStaging/SwappedSubdirJunctionDetected' -Failure 'підкаталог-junction усередині кореня має виявлятися'
+            [System.IO.Directory]::Delete($swapLink)
+            [System.IO.Directory]::Delete($jLink)
+        } else {
+            Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateStaging/ExpandJunction' -Failure 'junction створити не вдалося'
+        }
+
+        # Відсутнє призначення.
+        $missingDest = Expand-BRAVOUpdateArchiveSafe -ZipPath $good -DestinationRoot (Join-Path $updStagingTempPrefix 'no such dest')
+        Test-BRAVOCondition -Condition (-not $missingDest.Success) -Name 'UpdateStaging/ExpandMissingDestRefused' -Failure 'відсутнє призначення має відхилятися'
+
+        # Відкат: перший файл створено, другий конфліктує (файл і каталог з одним ім'ям) -> нічого не лишається.
+        $conflict = Join-Path $updStagingTempPrefix 'conflict.zip'
+        New-UpdStagingTestZip -Path $conflict -Items @(@{ Name = 'p/one.txt'; Text = '1' }, @{ Name = 'p/two'; Text = '2' }, @{ Name = 'p/two/inner.txt'; Text = '3' })
+        $dest3 = Join-Path $updStagingTempPrefix 'dest3'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $dest3)
+        $conflictResult = Expand-BRAVOUpdateArchiveSafe -ZipPath $conflict -DestinationRoot $dest3
+        Test-BRAVOCondition -Condition (-not $conflictResult.Success -and @(Get-ChildItem -LiteralPath $dest3 -Force).Count -eq 0) -Name 'UpdateStaging/ExpandRollbackOnFailure' -Failure 'при збої розпакування створене має бути видалене'
+    }
+
+    # --- Вільне місце -------------------------------------------------------
+    & {
+        $space = Get-BRAVOUpdateFreeSpace -Path (Join-Path $updStagingTempPrefix 'not yet created')
+        Test-BRAVOCondition -Condition ($null -eq $space.Error -and $space.AvailableFreeBytes -gt 0 -and -not [string]::IsNullOrEmpty($space.Volume)) -Name 'UpdateStaging/FreeSpace' -Failure 'вільне місце тому має визначатися'
+        $unc = Get-BRAVOUpdateFreeSpace -Path '\\host-a\share\x'
+        Test-BRAVOCondition -Condition ($null -eq $unc.AvailableFreeBytes -and $null -ne $unc.Error) -Name 'UpdateStaging/FreeSpaceUncUnknown' -Failure 'UNC -> невідомо з Error'
+    }
+    # --- H1: захищені корені engine, довіра до особистого SID, робочі каталоги, guarded-видалення ---
+    & {
+        $h1Module = Get-Module BRAVO.Update
+        $h1Base = Join-Path $updStagingTempPrefix 'h1 Кореневі'
+        [void](New-Item -ItemType Directory -Path $h1Base -Force)
+        $h1UsersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $h1AddUsersAce = {
+            param([string]$Path, $Rights)
+            $info = New-Object System.IO.DirectoryInfo($Path)
+            $acl = $info.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($h1UsersSid, $Rights,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                    [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+            $info.SetAccessControl($acl)
+        }
+
+        # Рішення «довіряти особистому SID»: false для ролі Administrators (елевований процес), true без неї; помилка = false.
+        $trustAdmin = & $h1Module { Test-BRAVOUpdateTrustCurrentUser -AdminCheck { $true } }
+        $trustUser = & $h1Module { Test-BRAVOUpdateTrustCurrentUser -AdminCheck { $false } }
+        $trustError = & $h1Module { Test-BRAVOUpdateTrustCurrentUser -AdminCheck { throw 'role check failed' } }
+        Test-BRAVOCondition -Condition (($trustAdmin -eq $false) -and ($trustUser -eq $true) -and ($trustError -eq $false)) -Name 'UpdateStaging/H1/TrustDecisionPure' -Failure "admin=$trustAdmin user=$trustUser error=$trustError"
+        $sidsAdmin = @(& $h1Module { Get-BRAVOUpdateTrustedSid -AdminCheck { $true } })
+        $sidsUser = @(& $h1Module { Get-BRAVOUpdateTrustedSid -AdminCheck { $false } })
+        $currentSidText = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        Test-BRAVOCondition -Condition (($sidsAdmin -notcontains $currentSidText -or @('S-1-5-18', 'S-1-5-32-544') -contains $currentSidText) -and ($sidsUser -contains $currentSidText)) -Name 'UpdateStaging/H1/TrustedSidsExcludePersonalWhenElevated' -Failure ('admin=' + ($sidsAdmin -join ',') + ' user=' + ($sidsUser -join ','))
+
+        # Приватний каталог проходить суворе завершальне оцінювання; Users Write, успадкування й «елевований» власник — ні.
+        $h1Private = Join-Path $h1Base 'приватний'
+        $made = New-BRAVOUpdatePrivateDirectory -Path $h1Private
+        $okProblems = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $h1Private)
+        Test-BRAVOCondition -Condition ($made.Success -and $okProblems.Count -eq 0) -Name 'UpdateStaging/H1/ValidatorAcceptsPrivateDirectory' -Failure ($okProblems -join '; ')
+        # Фікстура задає власника й ACE особистого SID ЯВНО (default owner елевованого токена - Administrators, тож «приватний» каталог
+        # елевованого процесу особистого SID не містить): така директорія для елевованого engine має бути відхилена.
+        $personalDir = Join-Path $h1Base 'особистий'
+        [void](New-Item -ItemType Directory -Path $personalDir -Force)
+        $personalSecurity = New-Object System.Security.AccessControl.DirectorySecurity
+        $personalSecurity.SetAccessRuleProtection($true, $false)
+        foreach ($personalAceSid in @((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')), (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), [System.Security.Principal.WindowsIdentity]::GetCurrent().User)) {
+            $personalSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($personalAceSid, [System.Security.AccessControl.FileSystemRights]::FullControl,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit), [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        $personalSecurity.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+        (New-Object System.IO.DirectoryInfo($personalDir)).SetAccessControl($personalSecurity)
+        $asElevated = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private -AdminCheck { $true } } $personalDir)
+        $asUnelevated = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private -AdminCheck { $false } } $personalDir)
+        $personalIsAdminLike = (@('S-1-5-18', 'S-1-5-32-544') -contains $currentSidText)
+        Test-BRAVOCondition -Condition ($personalIsAdminLike -or (($asElevated.Count -gt 0) -and (@($asElevated | Where-Object { $_ -like 'власник*' }).Count -gt 0) -and ($asUnelevated.Count -eq 0))) -Name 'UpdateStaging/H1/ValidatorRejectsPersonalSidWhenElevated' -Failure ('elevated=' + ($asElevated -join '; ') + ' | unelevated=' + ($asUnelevated -join '; '))
+        & $h1AddUsersAce $h1Private ([System.Security.AccessControl.FileSystemRights]::Write)
+        $usersWrite = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $h1Private)
+        Test-BRAVOCondition -Condition (@($usersWrite | Where-Object { $_ -like '*S-1-5-32-545*' }).Count -gt 0) -Name 'UpdateStaging/H1/ValidatorRejectsUsersWrite' -Failure ($usersWrite -join '; ')
+        $inherited = Join-Path $h1Base 'успадкований'
+        [void](New-Item -ItemType Directory -Path $inherited -Force)
+        $inheritedProblems = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $inherited)
+        Test-BRAVOCondition -Condition (@($inheritedProblems | Where-Object { $_ -like '*успадкування*' }).Count -gt 0) -Name 'UpdateStaging/H1/ValidatorRejectsInheritedDacl' -Failure ($inheritedProblems -join '; ')
+
+        # Reparse point серед компонентів шляху.
+        $junctionTarget = Join-Path $h1Base 'ціль junction'
+        $junction = Join-Path $h1Base 'junction'
+        [void](New-Item -ItemType Directory -Path $junctionTarget -Force)
+        $null = & cmd.exe /c ('mklink /J "' + $junction + '" "' + $junctionTarget + '"')
+        if (Test-Path -LiteralPath $junction) {
+            $viaJunction = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } (Join-Path $junction 'x'))
+            $junctionDirect = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $junction)
+            Test-BRAVOCondition -Condition (($junctionDirect.Count -gt 0) -and ($junctionDirect[0] -like '*reparse*')) -Name 'UpdateStaging/H1/ValidatorRejectsReparseRoot' -Failure ($junctionDirect -join '; ')
+            [void]$viaJunction
+            try { [IO.Directory]::Delete($junction) } catch { $null = $_ }
+        } else {
+            Test-BRAVOCondition -Condition $true -EnvironmentLimitation -Name 'UpdateStaging/H1/ValidatorRejectsReparseRoot' -Failure 'junction не створено'
+        }
+
+        # Initialize: створення, -Validate (відсутні = Missing, не помилка), повторне застосування DACL для довіреного власника,
+        # відмова без змін для «чужого» власника (симуляція: процес з роллю Administrators, власник — особистий SID).
+        $h1Roots = [pscustomobject]@{ StateRoot = (Join-Path $h1Base 'state'); LockRoot = (Join-Path $h1Base 'lock'); StagingRoot = (Join-Path $h1Base 'stg'); BackupRoot = (Join-Path $h1Base 'bak') }
+        $missingCheck = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p -Validate } $h1Roots
+        Test-BRAVOCondition -Condition ($missingCheck.Success -and @($missingCheck.Missing).Count -ge 8 -and -not (Test-Path -LiteralPath $h1Roots.StateRoot)) -Name 'UpdateStaging/H1/ValidateOnlyCreatesNothing' -Failure ('Missing=' + @($missingCheck.Missing).Count)
+        $applied = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p } $h1Roots
+        $requestsPath = Join-Path $h1Roots.StateRoot 'Requests'
+        $requestsProblems = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Requests } $requestsPath)
+        Test-BRAVOCondition -Condition ($applied.Success -and (Test-Path -LiteralPath $requestsPath) -and $requestsProblems.Count -eq 0) -Name 'UpdateStaging/H1/InitializeCreatesRoots' -Failure (($applied.Problems -join '; ') + ' | ' + ($requestsProblems -join '; '))
+        $again = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p } $h1Roots
+        Test-BRAVOCondition -Condition ($again.Success -and @($again.Created).Count -eq 0 -and @($again.Reapplied).Count -eq 0) -Name 'UpdateStaging/H1/InitializeIdempotent' -Failure ($again.Problems -join '; ')
+        & $h1AddUsersAce $requestsPath ([System.Security.AccessControl.FileSystemRights]::Modify)
+        $requestsBad = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Requests } $requestsPath)
+        Test-BRAVOCondition -Condition ($requestsBad.Count -gt 0) -Name 'UpdateStaging/H1/RequestsDropBoxRejectsUsersModify' -Failure 'Users Modify на Requests має відхилятись'
+        $fixed = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p } $h1Roots
+        Test-BRAVOCondition -Condition ($fixed.Success -and (@($fixed.Reapplied) -contains $requestsPath)) -Name 'UpdateStaging/H1/TrustedOwnerDaclReapplied' -Failure ($fixed.Problems -join '; ')
+        if (-not $personalIsAdminLike) {
+            # Власник = особистий SID явно: для (симульованого) елевованого процесу він «чужий» і при реальній елевації теж
+            # (default owner там Administrators, тож без явного SetOwner сценарій був би порожнім).
+            Set-UpdStagingTestOwnerPersonal -Path $requestsPath
+            & $h1AddUsersAce $requestsPath ([System.Security.AccessControl.FileSystemRights]::Modify)
+            $foreign = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p -AdminCheck { $true } } $h1Roots
+            $stillBad = @(& $h1Module { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Requests } $requestsPath)
+            Test-BRAVOCondition -Condition ((-not $foreign.Success) -and (@($foreign.Findings).Count -eq 1) -and ([string]$foreign.Findings[0].id -ceq 'State.RootUnsafe') -and $stillBad.Count -gt 0) -Name 'UpdateStaging/H1/ForeignOwnerBlockedNotReAcled' -Failure ('Success=' + $foreign.Success + ' still=' + $stillBad.Count)
+        }
+        $wrapper = & $h1Module { param($p) Initialize-BRAVOUpdateStateDirectories -StateRoot $p } (Join-Path $h1Base 'wrapper-state')
+        Test-BRAVOCondition -Condition ($wrapper.Success -and (Test-Path -LiteralPath (Join-Path $h1Base 'wrapper-state\Operations')) -and -not (Test-Path -LiteralPath (Join-Path $h1Base 'wrapper-state\Staging'))) -Name 'UpdateStaging/H1/StateDirectoriesWrapperScoped' -Failure ($wrapper.Problems -join '; ')
+
+        # Робочий каталог дочірніх скриптів — під заданим коренем, захищений, видаляється guarded-видалювачем.
+        $workRoot = $h1Roots.StagingRoot
+        $work = & $h1Module { param($p) New-BRAVOUpdateChildWorkDirectory -Root $p } $workRoot
+        $workProblems = @()
+        if ($work.Success) { $workProblems = @(Get-BRAVOUpdateDirectoryAclProblem -Path $work.WorkDirectory) }
+        Test-BRAVOCondition -Condition ($work.Success -and (Test-BRAVOUpdatePathIsUnder -Path $work.WorkDirectory -Root $workRoot) -and $workProblems.Count -eq 0 -and ((Split-Path -Leaf $work.WorkDirectory) -ceq 'work')) -Name 'UpdateStaging/H1/ChildWorkDirectoryUnderRootProtected' -Failure (($work.Problems -join '; ') + ($workProblems -join '; '))
+        [IO.File]::WriteAllText((Join-Path $work.WorkDirectory 'child.ps1'), 'x')
+        & $h1Module { param($w) Remove-BRAVOUpdateChildWorkDirectory -WorkInfo $w } $work
+        Test-BRAVOCondition -Condition (-not (Test-Path -LiteralPath $work.OperationDirectory)) -Name 'UpdateStaging/H1/ChildWorkDirectoryRemoved' -Failure 'робочий каталог має бути видалений'
+        $badRoot = Join-Path $h1Base 'badroot'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $badRoot)
+        & $h1AddUsersAce $badRoot ([System.Security.AccessControl.FileSystemRights]::Modify)
+        $badWork = & $h1Module { param($p) New-BRAVOUpdateChildWorkDirectory -Root $p } $badRoot
+        Test-BRAVOCondition -Condition (-not $badWork.Success) -Name 'UpdateStaging/H1/ChildWorkDirectoryRefusesWritableRoot' -Failure 'корінь із Users Modify має відхилятись'
+        $engineSource = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.Paths.ps1')) + [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.Install.ps1'))
+        Test-BRAVOCondition -Condition (($engineSource -notmatch 'BRAVO_UPDATE_EFFECTIVE_') -and ($engineSource -notmatch 'BRAVO_UPDATE_SEED_')) -Name 'UpdateStaging/H1/NoTempWorkDirectoriesForChildScripts' -Failure 'child-скрипти не мають лежати у %TEMP%'
+
+        # Guarded-видалення: AllowedRoot, ACL кореня, junction усередині дерева.
+        $removeRoot = Join-Path $h1Base 'remove-root'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $removeRoot)
+        $removeId = [guid]::NewGuid().ToString()
+        $removeDir = Join-Path $removeRoot $removeId
+        [void](New-Item -ItemType Directory -Path (Join-Path $removeDir 'sub') -Force)
+        $outside = Join-Path $h1Base 'outside'
+        [void](New-Item -ItemType Directory -Path $outside -Force)
+        [IO.File]::WriteAllText((Join-Path $outside 'keep.txt'), 'keep')
+        $otherRoot = Join-Path $h1Base 'other-root'
+        [void](New-Item -ItemType Directory -Path $otherRoot -Force)
+        $threwForeign = $false
+        try { [void](& $h1Module { param($a, $b, $c, $d) Remove-BRAVOUpdateOperationDirectory -Path $a -ExpectedParent $b -OperationId $c -AllowedRoot @($d) } $removeDir $removeRoot $removeId $otherRoot) } catch { $threwForeign = $true }
+        Test-BRAVOCondition -Condition ($threwForeign -and (Test-Path -LiteralPath $removeDir)) -Name 'UpdateStaging/H1/RemoverRefusesRootOutsideAllowed' -Failure 'ExpectedParent поза AllowedRoot має відхилятись без змін'
+        $null = & cmd.exe /c ('mklink /J "' + (Join-Path $removeDir 'sub\link') + '" "' + $outside + '"')
+        $linkCreated = Test-Path -LiteralPath (Join-Path $removeDir 'sub\link')
+        $removal = & $h1Module { param($a, $b, $c) Remove-BRAVOUpdateOperationDirectory -Path $a -ExpectedParent $b -OperationId $c -AllowedRoot @($b) } $removeDir $removeRoot $removeId
+        Test-BRAVOCondition -Condition ((-not (Test-Path -LiteralPath $removeDir)) -and (Test-Path -LiteralPath (Join-Path $outside 'keep.txt')) -and ($removal.Removed -or -not $linkCreated)) -Name 'UpdateStaging/H1/RemoverStopsAtJunction' -Failure ('Removed=' + $removal.Removed + '; ' + (@($removal.Problems) -join '; '))
+        $writableRoot = Join-Path $h1Base 'writable-root'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $writableRoot)
+        & $h1AddUsersAce $writableRoot ([System.Security.AccessControl.FileSystemRights]::Modify)
+        $writableId = [guid]::NewGuid().ToString()
+        [void](New-Item -ItemType Directory -Path (Join-Path $writableRoot $writableId) -Force)
+        $threwWritable = $false
+        try { [void](& $h1Module { param($a, $b, $c) Remove-BRAVOUpdateOperationDirectory -Path $a -ExpectedParent $b -OperationId $c -AllowedRoot @($b) } (Join-Path $writableRoot $writableId) $writableRoot $writableId) } catch { $threwWritable = $true }
+        Test-BRAVOCondition -Condition ($threwWritable -and (Test-Path -LiteralPath (Join-Path $writableRoot $writableId))) -Name 'UpdateStaging/H1/RemoverRefusesWritableRoot' -Failure 'корінь із Users Modify має відхилятись'
+    }
+    # --- H1 раунд 2: контейнери validate-only, N1/N2/N3, довіра до каталогу скрипта ---
+    & {
+        $h1Module = Get-Module BRAVO.Update
+        $r2Base = Join-Path $updStagingTempPrefix 'h1 раунд2'
+        [void](New-Item -ItemType Directory -Path $r2Base -Force)
+        $r2UsersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $r2AddUsersAce = {
+            param([string]$Path, $Rights)
+            $info = New-Object System.IO.DirectoryInfo($Path)
+            $acl = $info.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($r2UsersSid, $Rights,
+                    ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+                    [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)))
+            $info.SetAccessControl($acl)
+        }
+        $r2Sddl = { param([string]$Path) (New-Object System.IO.DirectoryInfo($Path)).GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) }
+
+        # Контейнери (предки в «ProgramData»): валідація без зміни; Users Modify (видалення чужого) — відмова, ACL не переписано.
+        $pd = Join-Path $r2Base 'ProgramData'
+        $legacy = Join-Path $pd 'BRAVO'
+        [void](New-BRAVOUpdatePrivateDirectory -Path $pd)
+        [void](New-BRAVOUpdatePrivateDirectory -Path $legacy)
+        [IO.File]::WriteAllText((Join-Path $legacy 'legacy.txt'), 'legacy')
+        $r2Roots = [pscustomobject]@{ StateRoot = (Join-Path $legacy 'State\Update'); LockRoot = (Join-Path $legacy 'Locks'); StagingRoot = (Join-Path $legacy 'Update\Staging'); BackupRoot = (Join-Path $legacy 'Update\Backup') }
+        $legacyBefore = & $r2Sddl $legacy
+        $okRun = & $h1Module { param($p, $d) Initialize-BRAVOUpdateProtectedRoots -Paths $p -ProgramDataRoot $d } $r2Roots $pd
+        $legacyAfter = & $r2Sddl $legacy
+        Test-BRAVOCondition -Condition ($okRun.Success -and ($legacyBefore -ceq $legacyAfter) -and (Test-Path -LiteralPath (Join-Path $legacy 'legacy.txt'))) -Name 'UpdateStaging/H1/ContainersNotReAcled' -Failure (($okRun.Problems -join '; ') + ' sddl-changed=' + ($legacyBefore -cne $legacyAfter))
+        Test-BRAVOCondition -Condition ((Test-Path -LiteralPath $r2Roots.StateRoot) -and (Test-Path -LiteralPath $r2Roots.StagingRoot) -and (Test-Path -LiteralPath $r2Roots.LockRoot)) -Name 'UpdateStaging/H1/EngineRootsCreatedUnderContainers' -Failure 'корені engine мають створюватись під контейнерами'
+        & $r2AddUsersAce $legacy ([System.Security.AccessControl.FileSystemRights]::Modify)
+        $legacyBad = & $r2Sddl $legacy
+        $badRun = & $h1Module { param($p, $d) Initialize-BRAVOUpdateProtectedRoots -Paths $p -ProgramDataRoot $d } $r2Roots $pd
+        Test-BRAVOCondition -Condition ((-not $badRun.Success) -and ((& $r2Sddl $legacy) -ceq $legacyBad)) -Name 'UpdateStaging/H1/ContainerUsersModifyBlockedNotFixed' -Failure ('Success=' + $badRun.Success)
+        $ancestorBad = @(& $h1Module { param($p, $d) Get-BRAVOUpdateAncestorProblem -Path $p -ProgramDataRoot $d } (Join-Path $legacy 'Update\Staging') $pd)
+        Test-BRAVOCondition -Condition ($ancestorBad.Count -gt 0) -Name 'UpdateStaging/H1/AncestorValidatorFlagsWritableContainer' -Failure 'контейнер із Users Modify має бути проблемою'
+
+        # N1: елевований (симуляція) child work dir відмовляє за небезпечного контейнера; неелевований його не перевіряє.
+        $workElevated = & $h1Module { param($r, $d) New-BRAVOUpdateChildWorkDirectory -Root $r -AdminCheck { $true } -ProgramDataRoot $d } (Join-Path $legacy 'Update\Staging') $pd
+        Test-BRAVOCondition -Condition ((-not $workElevated.Success) -and (@($workElevated.Problems | Where-Object { $_ -like '*S-1-5-32-545*' }).Count -gt 0)) -Name 'UpdateStaging/H1/ChildWorkDirectoryElevatedChecksContainers' -Failure ($workElevated.Problems -join '; ')
+        $workUser = & $h1Module { param($r, $d) New-BRAVOUpdateChildWorkDirectory -Root $r -AdminCheck { $false } -ProgramDataRoot $d } (Join-Path $legacy 'Update\Staging') $pd
+        Test-BRAVOCondition -Condition ($workUser.Success) -Name 'UpdateStaging/H1/ChildWorkDirectoryUnelevatedSkipsContainers' -Failure ($workUser.Problems -join '; ')
+        & $h1Module { param($w) Remove-BRAVOUpdateChildWorkDirectory -WorkInfo $w } $workUser
+
+        # N2: де будується робочий каталог плану.
+        $planElevated = & $h1Module { Resolve-BRAVOUpdatePlanWorkRoot -WorkRoot '' -StagingRoot 'C:\stg' -IsAdministrator $true }
+        $planUser = & $h1Module { Resolve-BRAVOUpdatePlanWorkRoot -WorkRoot '' -StagingRoot 'C:\stg' -IsAdministrator $false }
+        $planExplicit = & $h1Module { Resolve-BRAVOUpdatePlanWorkRoot -WorkRoot 'D:\w' -StagingRoot 'C:\stg' -IsAdministrator $true }
+        Test-BRAVOCondition -Condition (($planElevated.Root -ceq 'C:\stg') -and $planElevated.UseChildWorkDirectory -and ($planUser.Root -ceq [IO.Path]::GetTempPath()) -and (-not $planUser.UseChildWorkDirectory) -and ($planExplicit.Root -ceq 'D:\w') -and (-not $planExplicit.UseChildWorkDirectory)) -Name 'UpdateStaging/H1/PlanWorkRootElevatedUsesStaging' -Failure 'рішення про робочий корінь плану хибне'
+
+        # N3: власники вмісту перед re-ACL.
+        $contentDir = Join-Path $r2Base 'content'
+        [void](New-Item -ItemType Directory -Path (Join-Path $contentDir 'id1') -Force)
+        [IO.File]::WriteAllText((Join-Path $contentDir 'marker.json'), '{}')
+        [IO.File]::WriteAllText((Join-Path $contentDir 'id1\result.json'), '{}')
+        # Явний власник = особистий SID (елевований процес створив би об'єкти з власником Administrators, і скан нічого б не знайшов).
+        foreach ($contentItem in @((Join-Path $contentDir 'id1'), (Join-Path $contentDir 'marker.json'), (Join-Path $contentDir 'id1\result.json'))) { Set-UpdStagingTestOwnerPersonal -Path $contentItem }
+        $ownedByMeUnelevated = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 2 -AdminCheck { $false } } $contentDir)
+        $ownedByMeElevated = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 2 -AdminCheck { $true } } $contentDir)
+        $depthOne = @(& $h1Module { param($p) Get-BRAVOUpdateUntrustedContentOwner -Path $p -Depth 1 -AdminCheck { $true } } $contentDir)
+        $meIsAdminLike = (@('S-1-5-18', 'S-1-5-32-544') -contains [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+        if (-not $meIsAdminLike) {
+            Test-BRAVOCondition -Condition (($ownedByMeUnelevated.Count -eq 0) -and ($ownedByMeElevated.Count -ge 3) -and ($depthOne.Count -ge 2) -and ($depthOne.Count -lt $ownedByMeElevated.Count)) -Name 'UpdateStaging/H1/ContentOwnerScan' -Failure ('unelevated=' + $ownedByMeUnelevated.Count + ' elevated=' + $ownedByMeElevated.Count + ' depth1=' + $depthOne.Count)
+        }
+        # Re-ACL не виконується, якщо у вмісті є елемент недовіреного власника (симуляція: ElevatedCheck, вміст створено особистим SID).
+        # Корені нижче створено без елевації, тож власник кореня теж «недовірений» для симуляції — перевіряємо лише відсутність змін DACL.
+        # Реальні шляхи coverage: ContentOwnerScan вище + Initialize нижче не змінює каталог із чужим вмістом.
+        $scanRoots = [pscustomobject]@{ StateRoot = (Join-Path $r2Base 'scan-state'); LockRoot = (Join-Path $r2Base 'scan-lock'); StagingRoot = (Join-Path $r2Base 'scan-stg'); BackupRoot = (Join-Path $r2Base 'scan-bak') }
+        $null = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p } $scanRoots
+        $journalDir = Join-Path $scanRoots.StateRoot 'Journal'
+        & $r2AddUsersAce $journalDir ([System.Security.AccessControl.FileSystemRights]::Modify)
+        $journalBad = & $r2Sddl $journalDir
+        if (-not $meIsAdminLike) {
+            [IO.File]::WriteAllText((Join-Path $journalDir 'x.json'), '{}')
+            # Вміст належить особистому SID явно. Власник самого каталогу: без прав - особистий (симуляція відхиляє вже за власником),
+            # з правами - Administrators (відхиляє саме скан вмісту); в обох випадках DACL лишається незмінним.
+            Set-UpdStagingTestOwnerPersonal -Path (Join-Path $journalDir 'x.json')
+            $simulated = & $h1Module { param($p) Initialize-BRAVOUpdateProtectedRoots -Paths $p -AdminCheck { $true } } $scanRoots
+            Test-BRAVOCondition -Condition ((-not $simulated.Success) -and ((& $r2Sddl $journalDir) -ceq $journalBad)) -Name 'UpdateStaging/H1/ForeignContentBlocksReAcl' -Failure ('Success=' + $simulated.Success)
+        }
+
+        # P3 #9: функція довіри до каталогу скрипта з BRAVO_UPDATE.ps1 (витягається з AST, виконується з fake-читачем ACL).
+        $scriptPath = Join-Path $root 'BRAVO_UPDATE.ps1'
+        $scriptAst = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
+        $trustNode = $scriptAst.Find({ param($n) ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($n.Name -eq 'Test-BRAVOUpdateScriptRootTrusted') }, $true)
+        Test-BRAVOCondition -Condition ($null -ne $trustNode) -Name 'UpdateStaging/H1/ScriptRootTrustFunctionPresent' -Failure 'у BRAVO_UPDATE.ps1 немає Test-BRAVOUpdateScriptRootTrusted'
+        if ($null -ne $trustNode) {
+            . ([scriptblock]::Create($trustNode.Extent.Text))
+            $mkAcl = {
+                param([string]$Owner, [object[]]$Rules)
+                $acl = New-Object psobject
+                $ownerObject = [pscustomobject]@{ Value = $Owner }
+                $acl | Add-Member -MemberType ScriptMethod -Name GetOwner -Value { param($t) $ownerObject }.GetNewClosure()
+                $acl | Add-Member -MemberType ScriptMethod -Name GetAccessRules -Value { param($a, $b, $c) $Rules }.GetNewClosure()
+                $acl
+            }
+            $mkRule = {
+                param([string]$Sid, $Rights, $Propagation = [System.Security.AccessControl.PropagationFlags]::None)
+                [pscustomobject]@{ AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow; IdentityReference = [pscustomobject]@{ Value = $Sid }; PropagationFlags = $Propagation; FileSystemRights = $Rights }
+            }
+            $fsr = [System.Security.AccessControl.FileSystemRights]
+            $selfPath = [IO.Path]::GetFullPath($r2Base).TrimEnd('\')
+            $goodReader = { param($p) & $mkAcl 'S-1-5-32-544' @((& $mkRule 'S-1-5-18' $fsr::FullControl), (& $mkRule 'S-1-5-32-545' $fsr::ReadAndExecute)) }.GetNewClosure()
+            $good = Test-BRAVOUpdateScriptRootTrusted -Path $selfPath -AclReader $goodReader
+            Test-BRAVOCondition -Condition ($good.IsTrusted) -Name 'UpdateStaging/H1/ScriptRootTrustedAdminOnlyChain' -Failure ($good.Problems -join '; ')
+            $ownerReader = { param($p) & $mkAcl 'S-1-5-21-1-2-3-1001' @((& $mkRule 'S-1-5-18' $fsr::FullControl)) }.GetNewClosure()
+            $badOwner = Test-BRAVOUpdateScriptRootTrusted -Path $selfPath -AclReader $ownerReader
+            Test-BRAVOCondition -Condition ((-not $badOwner.IsTrusted) -and (@($badOwner.Problems | Where-Object { $_ -like 'власник*' }).Count -gt 0)) -Name 'UpdateStaging/H1/ScriptRootRejectsUserOwner' -Failure 'власник-користувач має відхилятись'
+            $writerReader = { param($p) & $mkAcl 'S-1-5-32-544' @((& $mkRule 'S-1-5-32-545' $fsr::Modify)) }.GetNewClosure()
+            $badWriter = Test-BRAVOUpdateScriptRootTrusted -Path $selfPath -AclReader $writerReader
+            Test-BRAVOCondition -Condition ((-not $badWriter.IsTrusted) -and (@($badWriter.Problems | Where-Object { $_ -like 'запис для*' }).Count -gt 0)) -Name 'UpdateStaging/H1/ScriptRootRejectsUsersWrite' -Failure 'Users Modify має відхилятись'
+            $createOnAncestor = { param($p) if ([IO.Path]::GetFullPath($p).TrimEnd('\') -ieq $selfPath) { & $mkAcl 'S-1-5-32-544' @((& $mkRule 'S-1-5-18' $fsr::FullControl)) } else { & $mkAcl 'S-1-5-32-544' @((& $mkRule 'S-1-5-11' ($fsr::AppendData -bor $fsr::WriteData))) } }.GetNewClosure()
+            $ancestorCreate = Test-BRAVOUpdateScriptRootTrusted -Path $selfPath -AclReader $createOnAncestor
+            Test-BRAVOCondition -Condition ($ancestorCreate.IsTrusted) -Name 'UpdateStaging/H1/ScriptRootAllowsCreateOnAncestors' -Failure ($ancestorCreate.Problems -join '; ')
+            $throwReader = { param($p) throw (New-Object System.UnauthorizedAccessException('denied')) }
+            $denied = Test-BRAVOUpdateScriptRootTrusted -Path $selfPath -AclReader $throwReader
+            Test-BRAVOCondition -Condition (-not $denied.IsTrusted) -Name 'UpdateStaging/H1/ScriptRootUnreadableAclFailsClosed' -Failure 'нечитабельний ACL = недовірений'
+            $scriptText = [IO.File]::ReadAllText($scriptPath)
+            $gateIndex = $scriptText.IndexOf('Test-BRAVOUpdateScriptRootTrusted -Path $PSScriptRoot')
+            $guardIndex = $scriptText.IndexOf('$entryGuard = Invoke-BRAVOUpdateEntryGuard')
+            Test-BRAVOCondition -Condition (($gateIndex -gt 0) -and ($guardIndex -gt $gateIndex) -and ($scriptText -match '@\(''Execute'', ''Install'', ''Update'', ''Repair'', ''Recover'', ''Initialize''\) -contains \$Action')) -Name 'UpdateStaging/H1/ScriptRootGateBeforeGuardForMutationActions' -Failure 'перевірка каталогу має бути до guard і лише для mutation-дій'
+        }
+    }
+} finally {
+    if ($updStagingTempPrefix.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase) -and
+        (Split-Path -Leaf $updStagingTempPrefix) -like 'bravo-updstg-*' -and (Test-Path -LiteralPath $updStagingTempPrefix)) {
+        Remove-Item -LiteralPath $updStagingTempPrefix -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Codex P1 (фінальне рев'ю): справжня відмова Get-Acl (не throwing-seam) має
+# класифікуватися як "доступ до ACL заборонено" (відкладення для неелевованого
+# preflight), а не як загальна проблема. OWNER RIGHTS без READ_CONTROL забирає
+# неявне право власника читати DACL — це відтворює фільтрований UAC-токен.
+& {
+    $aclDeniedDir = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_UPDSTG_ACLDENY_' + [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($aclDeniedDir)
+    try {
+        $aclDeniedSec = New-Object System.Security.AccessControl.DirectorySecurity
+        $aclDeniedSec.SetAccessRuleProtection($true, $false)
+        $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')), 'FullControl', 'Allow')))
+        $aclDeniedSec.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4')), 'ReadData', 'Allow')))
+        # Власник явно = особистий SID: OWNER RIGHTS (ReadData) тоді обмежує неявні права власника; Administrators-членство
+        # (елевований токен CI) не дає READ_CONTROL, бо групи Administrators у DACL немає.
+        $aclDeniedSec.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+        (New-Object System.IO.DirectoryInfo($aclDeniedDir)).SetAccessControl($aclDeniedSec)
+        $realAclDenied = $false
+        try { [void](Get-Acl -LiteralPath $aclDeniedDir -ErrorAction Stop) } catch [System.UnauthorizedAccessException] { $realAclDenied = $true } catch { $realAclDenied = $false }
+        $aclDeniedProblems = @(& (Get-Module BRAVO.Update) { param($p) Get-BRAVOUpdateProtectedRootProblem -Path $p -Kind Private } $aclDeniedDir)
+        $aclDeniedPrefix = & (Get-Module BRAVO.Update) { $script:BRAVOUpdateAclDeniedPrefix }
+        # Якщо Get-Acl справді відмовив - рівно одна проблема з префіксом відмови (клас «відкласти»). Якщо Get-Acl вдався (привілеї
+        # backup тощо) - відкладення не стверджуємо, але валідатор НІКОЛИ не повертає успіх для каталогу з OWNER RIGHTS-only DACL.
+        $aclDeniedOk = $false
+        if ($realAclDenied) { $aclDeniedOk = ($aclDeniedProblems.Count -eq 1 -and ([string]$aclDeniedProblems[0]).StartsWith([string]$aclDeniedPrefix)) } else { $aclDeniedOk = ($aclDeniedProblems.Count -ge 1) }
+        Test-BRAVOCondition `
+            -Condition $aclDeniedOk `
+            -Name 'UpdateStaging/H1/RealGetAclAccessDeniedClassifiedAsDeferred' `
+            -Failure ('realAclDenied=' + $realAclDenied + '; отримано: ' + ($aclDeniedProblems -join ' | '))
+    } finally {
+        if ([IO.Directory]::Exists($aclDeniedDir) -and ([IO.Path]::GetFileName($aclDeniedDir)).StartsWith('BRAVO_UPDSTG_ACLDENY_')) {
+            [IO.Directory]::Delete($aclDeniedDir)
+        }
+    }
+}

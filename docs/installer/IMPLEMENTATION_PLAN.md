@@ -6,6 +6,59 @@
 
 Issues доцільно створювати хвилями після стабілізації попередньої фази, а не переносити весь план у GitHub одночасно.
 
+Реалізацію Installer v1 розпочато в гілці `feature/installer-v1`. Актуальний стан (що вже в коді, що в роботі, що не виконано) ведеться в [README.md](README.md), розділ «Стан реалізації»; цей backlog не є звітом про виконання.
+
+### 1.1 Аудит виконання — 2026-10-29
+
+Знімок гілки `feature/installer-v1` (локальна, не опублікована; push/PR/merge не виконувались).
+Позначення: **✓** — реалізовано в коді й покрито sandbox self-test; **◐** — реалізовано частково
+або є відкриті знахідки; **✗** — не виконано; **—** — виключено з v1 рішенням D1.
+Жоден пункт не є production acceptance: усі перевірки — sandbox зі stub-адаптером, без
+реального Task Scheduler, Credential Manager, UAC і VM.
+
+| Фаза | INS | Статус | Докази / що лишилось |
+|---|---|---|---|
+| 0 | 000 Stabilization disposition | ✗ | Рішення власника; поточні lanes не класифіковано |
+| 0 | 001 Fleet inventory | ✗ | Потрібен доступ до парку |
+| 0 | 002 Config v2 fleet migration | ✗ | Operator-controlled; у коді є лише fail-closed бар'єр INS-022 |
+| 0 | 003 Discovery baseline | ✗ | Operational baseline на хостах |
+| 0 | 004 Real-host acceptance | ✗ | Live gates на хостах |
+| 0 | 005 Defect disposition | ◐ | Дефекти, знайдені рев'ю цієї гілки, виправлено або передано в роботу; класифікації дефектів парку немає |
+| 1 | 010–014 Contracts | ✓ | `CONTRACTS.md`, `BRAVO.Update.{Contracts,Journal,Paths}.ps1`; suite `UpdateContracts`. Architecture review: внутрішній architect + Codex (3 раунди) |
+| 2 | 020 Discovery | ✓ | `Get-BRAVOInstallationState`; suite `UpdateDiscovery` (доведено read-only) |
+| 2 | 021 Preflight | ✓ | `Test-BRAVODeploymentPreflight`; suite `UpdatePreflight` |
+| 2 | 022 Config migration gate | ✓ | `Test-BRAVOConfigMigrationBlocker` (legacy `BRAVO.config` не виконується) |
+| 2 | 023 Plan builder | ✓ | `New-BRAVODeploymentPlan`, fingerprint/expiry; suite `UpdatePlan` |
+| 2 | 024 Diagnostics | ✓ | Redaction, support report без автоматичного надсилання; suite `UpdateDiagnostics` |
+| 3 | 030–034 Release discovery / acquisition / offline / verification / prerelease | ✓ | Один pipeline online/offline, manifest обов'язковий для stable; suite `UpdateRelease`. Без підпису (D5) |
+| 3 | 035 Staging | ✓ | Безпечне розпакування ZIP: ACL allowlist, один handle; suite `UpdateStaging` |
+| 3 | 036 Staged validation | ✓ | `Test-BRAVOStagedRuntime` довіреним guard |
+| 4 | 040 `modules/BRAVO.Update` | ◐ | 19 частин, 108 експортів; частини Deploy/Worker/Rollback/Contracts > 1000 рядків — кандидат на safe-refactor |
+| 4 | 041 `BRAVO_UPDATE.ps1` | ✓ | Thin CLI (152 рядки); suite `UpdateWorker` |
+| 4 | 042 Mutation boundary | ✓ | `mutationStarted` на U11, cancel до/після межі; suite `UpdateDeploy` |
+| 4 | 043 Runtime backup | ✓ | Перевірений backup; suite `UpdateBackup` |
+| 4 | 044 Canonical deployment operation | ✓ | `Invoke-BRAVODeployment` U0–U19 для CLI і GUI; suite `UpdateDeploy` |
+| 4 | 045 Configuration reconciliation | ✓ | Site config зберігається побайтово (перевірка хешем) |
+| 4 | 046 Scheduler reconciliation | ◐ | Через canonical `BRAVO_SETUP`; повторне вимкнення після реєстрації (F1); COM-шлях не перевірено на VM |
+| 4 | 047 Post-deployment validation | ✓ | suite `UpdateValidation` |
+| 5 | 050–052 Rollback / validation / Critical | ✓ | Quiesce перед відкатом, reparse-перевірки, довіра до журналу, version-state транзакція; suite `UpdateRollback` |
+| 5 | 053–054 Interrupted detection / crash recovery | ✓ | suite `UpdateRecovery`, `UpdateEndToEnd` (зокрема crash → CLI Recover → RolledBack; CLI сам знаходить встановлення й передає корені engine) |
+| 5 | 055 Failure injection suite | ✓ | `UpdateEndToEnd` (195 перевірок): кожна fault-точка, crash, cancel, rollback failure, сканування секретів |
+| 5 | Gate: security + architecture + behavioral review | ◐ | Codex: 6 раундів, усі P1 виправлено, останнє підтвердження — «нових P0–P2 немає». Internal security pre-review: reject → після виправлень accept-with-fixes; N1–N3 і P3 #9 виправлено, повторно не переглядалось. Формальний codex-security gate не виконувався; прийняті залишкові ризики — D14 |
+| 6 | 060–065 Clean install | ◐ | `Install-BRAVOToolkit`, root policy, seed config, scheduler deferred без credentials; suite `UpdateInstall`. Seed/COM/UAC реально не перевірено |
+| 7 | 070–074 Repair | ✓ | `Repair-BRAVOInstallation -Scope`, без implicit upgrade; suite `UpdateRecovery`, `UpdateEndToEnd` |
+| 8 | 080–092 Installer GUI | ◐ | WinForms (D3 — відхилення від WPF, чекає затвердження); suite `InstallerUI` (view-model і побудова форми). DPI/RDP/keyboard/usability не перевірено |
+| 9 | 100–104 Maintenance Center | ◐ | Logs, Diagnostics, Configuration/Repair launchers; реальний запуск не перевірено |
+| 10 | 110–120 Scheduled update | — | Виключено з v1 (D1) |
+| 11 | 130–137 VM acceptance | ✗ | Є лише sandbox-аналоги в `UpdateEndToEnd`; VM не виконувалась |
+| 11 | 138–140 Scheduled modes | — | Виключено з v1 |
+| 11 | 141 Full BRAVO self-test | ◐ | Повний `BRAVO_SELF_TEST.ps1 -NoPause` на f1a5d839: 5542 PASS / 1 FAIL — `Archive/SftpConnectionTimeoutLogsError` через сторонній активний `WinSCP.com` на хості (Archive гілкою не змінювався; окремий прогін `-Suite Archive` на тій самій голові: 1748 PASS / 0 FAIL). Чистого повного прогону без збою середовища ще немає; CI не запускався |
+| 11 | 142 Fresh independent review | ◐ | Codex-рев'ю кожної хвилі й фінальної дельти виконано; незалежне рев'ю людиною — ні |
+| 12 | 150–155 Real-host pilot | ✗ | Рішення й доступ власника |
+
+Рішення D1–D13 та R1–R7 (`DECISIONS.md`) мають статус «Запропоновано — чекає затвердження
+власником».
+
 ## 2. Dependency graph
 
 ```text
