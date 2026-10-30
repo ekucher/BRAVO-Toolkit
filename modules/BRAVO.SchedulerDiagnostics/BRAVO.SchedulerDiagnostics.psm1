@@ -1077,6 +1077,15 @@ function Get-BRAVOTaskActionConfigPathReference {
         $references.Add((& $problemReference $mode $null 'після -EncodedCommand є додаткові токени'))
         return (& $result $false 'після -EncodedCommand є додаткові токени')
     }
+    # Base64 приховує percent-вирази від Task Scheduler; у декодованому
+    # PowerShell-тексті вони літеральні. Не застосовуємо до них повторне
+    # розкриття змінних Task Scheduler, зокрема в цілі скрипта й ConfigPath.
+    if ($mode -eq 'EncodedCommand' -and [string]$Definition.CommandText -match '%[^%]+%') {
+        $problem = 'декодований EncodedCommand містить літеральний percent-вираз; повторне розкриття змінних Task Scheduler неприпустиме'
+        $references.Add((& $problemReference $mode $null $problem))
+        return (& $result $false $problem)
+    }
+
     $parseTokens = $null
     $parseErrors = $null
     $commandAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$Definition.CommandText, [ref]$parseTokens, [ref]$parseErrors)

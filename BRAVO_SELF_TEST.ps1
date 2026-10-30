@@ -32761,7 +32761,9 @@ function Set-LockLogHolder { param($Holder) $script:LockLogHolder = $Holder; $sc
                 @{ Name = 'T196_SupportsShouldProcessNonBooleanLiteralUnknown'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_SPEXPR.ps1')$scanQ -WhatIf $scanQ$scanLegacy$scanQ"; Wd = $scanRuntime },
                 # #496 (рішення власника): обходи provenance-аналізу не сертифікуються — скрипт не є незміненим канонічним entrypoint-ом.
                 @{ Name = 'T197_BypassGetCommandWildcardNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSWILD.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
-                @{ Name = 'T198_BypassSplitPathLeafNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSSPLIT.ps1')$scanQ -NoPause"; Wd = $scanRuntime }
+                @{ Name = 'T198_BypassSplitPathLeafNotCanonical'; Expect = 'Unknown'; Arguments = "$scanBase -File $scanQ$(Join-Path $scanRuntime 'BRAVO_BYPASSSPLIT.ps1')$scanQ -NoPause"; Wd = $scanRuntime },
+                @{ Name = 'T199_EncodedLiteralPercentScriptTarget'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '%SystemDrive%\BRAVO\BRAVO_ARCHIV.ps1'")); Wd = $scanRuntime },
+                @{ Name = 'T200_EncodedLiteralPercentConfigPath'; Expect = 'Unknown'; Arguments = "$scanBase -EncodedCommand " + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("& '$scanArchiv' -ConfigPath '%SystemDrive%\BRAVO\BRAVO.config'")); Wd = $scanRuntime }
             )
 
 
