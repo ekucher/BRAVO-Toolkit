@@ -41,10 +41,10 @@ $includedExtensions = @('.ps1', '.psm1', '.psd1')
 # Відносні шляхи, не самі лише імена: TOOLS_MANIFEST.json лежить у
 # Tools\ (поруч із самими утилітами), а не в корені комплекту.
 $includedExtraFiles = @('VERSION.json', 'Tools\TOOLS_MANIFEST.json')
-# .claude — локальні файли асистентського середовища розробника (hooks,
-# правила): git-ignored, ніколи не входять у production-комплект. Без
-# виключення локально згенерований манфест розійшовся б із CI-checkout
-# (де .claude/hooks не існує) і зламав би "Integrity manifests are current".
+# .claude — локальний стан інструментів розробника: git-ignored, ніколи
+# не входить у production-комплект. Без виключення маніфест, локально
+# згенерований на робочій станції з таким каталогом, розійшовся б із
+# CI-checkout (де його немає) і зламав би "Integrity manifests are current".
 # artifacts — вихід ci\New-BRAVOReleaseArtifact.ps1 (git-ignored):
 # збірник НАВМИСНО лишає artifacts\release\staging (повну розпаковану
 # копію комплекту для self-test), і без виключення `-Apply` після

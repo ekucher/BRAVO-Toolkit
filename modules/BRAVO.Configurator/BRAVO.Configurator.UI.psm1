@@ -34,7 +34,7 @@
 
 Set-StrictMode -Version 2.0
 
-# Codex review PR #224 (P1, "Import authorization modules into the UI
+# Рев'ю PR #224 (P1, "Import authorization modules into the UI
 # scope unconditionally"): Show-BRAVOConfiguratorMainForm раніше
 # перевіряла `Get-Module -Name 'BRAVO.Configuration'/'...Schema'` і
 # імпортувала ЛИШЕ якщо модуля не знайдено в процесі — та сама
@@ -218,7 +218,7 @@ function Get-BRAVOConfiguratorUICategoryTree {
 function Resolve-BRAVOConfiguratorUICategoryTreeSelection {
     <#
     .SYNOPSIS
-        (Codex review PR #224, P2, thread lGNJ9) Чиста (headless, без
+        (Рев'ю PR #224, P2, thread lGNJ9) Чиста (headless, без
         System.Windows.Forms) проекція: з ПОТОЧНОГО SchemaCatalog і
         попередньо обраного Group/Section визначає (1) актуальну
         Group->Section[] структуру (Get-BRAVOConfiguratorUICategoryTree)
@@ -272,7 +272,7 @@ function Resolve-BRAVOConfiguratorUICategoryTreeSelection {
 function Update-BRAVOConfiguratorUICategoryTreeNodes {
     <#
     .SYNOPSIS
-        (Codex review PR #224, P2, thread lGNJ9) Перебудовує TreeView-
+        (Рев'ю PR #224, P2, thread lGNJ9) Перебудовує TreeView-
         вузли з ПОТОЧНОГО SchemaCatalog — тонка WinForms-глюя навколо
         headless Resolve-BRAVOConfiguratorUICategoryTreeSelection.
     .DESCRIPTION
@@ -1862,7 +1862,7 @@ function Show-BRAVOConfiguratorMainForm {
         if (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state) { $form.Close() }
     })
 
-    # P2-фікс за результатами незалежного review (Agent D): раніше
+    # P2-фікс за результатами незалежного рев'ю D: раніше
     # єдиний спосіб реально "reload configuration" (як велить
     # RaceDetection-повідомлення нижче) — закрити форму й перезапустити
     # BRAVO_CONFIGURATOR.ps1. Той самий discard-confirm gate, що Cancel/

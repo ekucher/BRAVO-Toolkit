@@ -1,7 +1,7 @@
 # BRAVO-Toolkit 5.3 — виконувана Windows acceptance-матриця (Wave E, issue #216)
 
 Дата складання: 2026-09-25.
-Автор: Agent E (issue-216-wave-e-acceptance), worktree
+Автор: потік робіт E (issue-216-wave-e-acceptance), worktree
 `E:\GitHub\BRAVO-Toolkit-216-e-acceptance`, база `origin/developer` @ `3e9e172`.
 
 ## Призначення й межі документа

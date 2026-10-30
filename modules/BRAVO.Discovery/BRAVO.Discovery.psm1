@@ -625,7 +625,7 @@ function Resolve-BRAVODiscoveryPathComponentPresence {
 }
 
 function Resolve-BRAVOInstallationDiscovery {
-    # Пріоритетний ланцюг (аудит/ТЗ CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md):
+    # Пріоритетний ланцюг (аудит/ТЗ ARCHIV_LIMS_MONOLITH):
     # 1. CLI-параметри runtime-скриптів — не реалізовано в цій ітерації.
     # 2. Явний override у BRAVO.config (-DiscoverySettings) — виграє й
     #    ніколи не замінюється автоматично знайденим значенням.

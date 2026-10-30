@@ -272,6 +272,7 @@ function Get-BRAVODryRunConfiguredServiceState {
     )
 
     $service = $null
+    $enumerationError = $null
     foreach ($name in @($DiscoveredServiceName) + @($ServiceCandidates)) {
         if ([string]::IsNullOrWhiteSpace([string]$name) -or $null -ne $service) {
             continue
@@ -279,11 +280,21 @@ function Get-BRAVODryRunConfiguredServiceState {
         $service = Get-Service -Name ([string]$name) -ErrorAction SilentlyContinue
     }
     if ($null -eq $service -and @($ServiceCandidates).Count -gt 0) {
-        $candidateServices = @(Get-Service -ErrorAction SilentlyContinue)
-        $service = $candidateServices | Where-Object {
-            $ServiceCandidates -contains [string]$_.Name -or
-                $ServiceCandidates -contains [string]$_.DisplayName
-        } | Select-Object -First 1
+        # Без права SC_MANAGER_ENUMERATE_SERVICE (напр. обліковий запис без
+        # INTERACTIVE/SERVICE у токені) Get-Service без -Name кидає
+        # термінальний InvalidOperationException, який -ErrorAction
+        # SilentlyContinue не придушує. Для опціонального компонента це не
+        # підстава обривати весь Dry Run: збій повертається викликачу як
+        # EnumerationError, а той показує його окремим WARN.
+        try {
+            $candidateServices = @(Get-Service -ErrorAction SilentlyContinue)
+            $service = $candidateServices | Where-Object {
+                $ServiceCandidates -contains [string]$_.Name -or
+                    $ServiceCandidates -contains [string]$_.DisplayName
+            } | Select-Object -First 1
+        } catch {
+            $enumerationError = [string]$_.Exception.Message
+        }
     }
 
     # StartType відсутній у ServiceController на .NET < 4.6.1 (#319), а під
@@ -302,6 +313,7 @@ function Get-BRAVODryRunConfiguredServiceState {
         Exists = ($null -ne $service)
         Disabled = ($startType -ieq 'Disabled')
         Name = if ($null -ne $service) { [string]$service.Name } else { $null }
+        EnumerationError = $enumerationError
     }
 }
 
@@ -1290,11 +1302,22 @@ try {
             -DiscoveredServiceName ([string]$bravoDiscoveryResult.WebServiceName) `
             -ServiceCandidates @($maintenanceSettings.Services.BravoWebCandidates)
     } else {
-        [pscustomobject]@{ Exists = $false; Disabled = $false; Name = $null }
+        [pscustomobject]@{ Exists = $false; Disabled = $false; Name = $null; EnumerationError = $null }
     }
     $exchangeApiServiceName = [string]$maintenanceSettings.Services.ExchangeApiName
     $exchangeApiServiceState = Get-BRAVODryRunConfiguredServiceState `
         -ServiceCandidates @($exchangeApiServiceName)
+    foreach ($optionalServiceProbe in @(
+        @{ Name = 'BravoWeb'; State = $bravoWebServiceState },
+        @{ Name = 'exchangAPI'; State = $exchangeApiServiceState }
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$optionalServiceProbe.State.EnumerationError)) {
+            Add-DryRunResult WARN "Служби" ([string]$optionalServiceProbe.Name) (
+                "перелік служб недоступний ($([string]$optionalServiceProbe.State.EnumerationError)); " +
+                "компонент вважається відсутнім і його готовність не планується"
+            )
+        }
+    }
     $optionalComponentPlan = Get-BRAVODryRunOptionalComponentPlan `
         -BravoWebEnabled $bravoWebEnabled `
         -BravoWebServiceExists $bravoWebServiceState.Exists `

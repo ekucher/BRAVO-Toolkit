@@ -109,6 +109,101 @@ if (-not (Test-Path -LiteralPath $notificationHelpersPath -PathType Leaf)) {
 }
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 
+# #478: точка раннього виходу Maintenance (ДО фінального запису) — спершу
+# best-effort machine-readable status-файл, лише потім exit. Раніше ранні
+# виходи (ToolIntegrity 32, помилки конфігурації 30/31, середовище 90)
+# завершували процес без запису, і BRAVO_STATUS_Maintenance.json лишався з
+# попереднім "OK", хоча Task Scheduler показував ненульовий код.
+# Визначено ДО розбору конфігурації: перші виходи (код 30) трапляються ще до
+# визначення $stateRoot — тоді запис неможливий і пропускається (лише
+# WARNING у лог; нічого не вигадується). Fail-soft: збій запису або логування
+# (Write-Log може ще не існувати) НЕ змінює код завершення.
+# НЕ використовується (навмисно) для: lock-busy (прогін не відбувся — статус
+# останнього реального прогону не затирається), Recovery-виходів
+# (відкладено до 5.3 разом із lock/preservation), дочірнього елевованого
+# процесу (статус пише він сам), disk-preflight (пише статус із власними
+# лічильниками) і фінального exit.
+function Write-BRAVOMaintenanceEarlyExitStatus {
+    # Лише запис (fail-soft, без exit): окремою функцією, бо exit
+    # блокування цілісності інструментів лишається буквальним
+    # `exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)` (на нього
+    # спирається статичний тест #299 Maintenance/ToolIntegrityExitSendsCriticalImmediately).
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    try {
+        $earlyStateRootVariable = Get-Variable -Name stateRoot -ErrorAction SilentlyContinue
+        $earlyStateRoot = if ($null -ne $earlyStateRootVariable) { [string]$earlyStateRootVariable.Value } else { '' }
+        if ([string]::IsNullOrWhiteSpace($earlyStateRoot)) {
+            throw 'stateRoot ще не визначено'
+        }
+        $earlyStartedAtVariable = Get-Variable -Name ScriptStartTime -Scope Script -ErrorAction SilentlyContinue
+        $earlyStartedAt = if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) {
+            [datetime]$earlyStartedAtVariable.Value
+        } else {
+            Get-Date
+        }
+        # ARCH-001: ранні виходи йдуть ДО Enter-BRAVOMaintenanceOperationLock,
+        # тож другий екземпляр міг би затерти статус того, що працює (і пізніше
+        # його успішний фінальний запис). Статус пишеться лише коли спільний
+        # operation lock (Maintenance і Archive) вільний: короткочасно
+        # захоплюємо той самий lock-файл (ті ж Open-параметри, що в
+        # Enter-BRAVOMaintenanceOperationLock) на час запису. Зайнятий або
+        # невизначений стан — fail-closed: не пишемо, лише лог із причиною.
+        $earlyLockSettingsVariable = Get-Variable -Name operationLockSettings -ErrorAction SilentlyContinue
+        $earlyLockPath = if ($null -ne $earlyLockSettingsVariable -and $null -ne $earlyLockSettingsVariable.Value) { [string]$earlyLockSettingsVariable.Value.Path } else { '' }
+        if ([string]::IsNullOrWhiteSpace($earlyLockPath)) {
+            throw 'шлях operation lock невідомий — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        $earlyLockStream = $null
+        try {
+            # Як в Enter-BRAVOMaintenanceOperationLock: на свіжій установці каталогу lock ще немає.
+            $earlyLockDirectory = Split-Path -Path $earlyLockPath -Parent
+            if (-not (Test-Path -LiteralPath $earlyLockDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $earlyLockDirectory -Force -ErrorAction Stop)
+            }
+            $earlyLockStream = [System.IO.File]::Open($earlyLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        } catch {
+            throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        try {
+            # Без сирих повідомлень, шляхів чи секретів — лише маркери.
+            Write-BRAVOOperationStatus `
+                -StateRoot $earlyStateRoot `
+                -Operation Maintenance `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -StartedAt $earlyStartedAt `
+                -Details @{ earlyTermination = $true; earlyExitReason = $Reason }
+        } finally {
+            $earlyLockStream.Dispose()
+        }
+    } catch {
+        $earlyStatusFailureMessage = "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance ($Reason): $($_.Exception.Message)"
+        try {
+            if ($null -ne (Get-Command -Name Write-Log -CommandType Function -ErrorAction SilentlyContinue)) {
+                Write-Log -Message $earlyStatusFailureMessage
+            } else {
+                Write-Warning $earlyStatusFailureMessage
+            }
+        } catch {
+            $null = $_
+        }
+    }
+}
+
+function Complete-BRAVOMaintenanceEarlyExit {
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    Write-BRAVOMaintenanceEarlyExitStatus -ExitCode $ExitCode -Reason $Reason
+    exit $ExitCode
+}
+
 # Пауза при ручному запуску мала охопити геть усі точки виходу нижче
 # (їх багато, розкидані по всьому файлу), а не лише останню. exit
 # всередині try ГАРАНТОВАНО проходить крізь усі finally на своєму шляху
@@ -248,7 +343,7 @@ try {
     }
 } catch {
     Write-Host "ПОМИЛКА читання конфігурації '$ConfigPath': $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'ConfigurationLoad'
 }
 
 $requiredConfigPaths = @(
@@ -280,14 +375,14 @@ foreach ($requiredPath in $requiredConfigPaths) {
         if ($currentNode -is [System.Collections.IDictionary]) {
             if (-not $currentNode.Contains($segment) -or $null -eq $currentNode[$segment]) {
                 Write-Host "ПОМИЛКА: У конфігурації відсутній обов'язковий параметр '$requiredPath'" -ForegroundColor Red
-                exit 30
+                Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'MissingConfigParameter'
             }
             $currentNode = $currentNode[$segment]
         } else {
             $property = $currentNode.PSObject.Properties[$segment]
             if ($null -eq $property -or $null -eq $property.Value) {
                 Write-Host "ПОМИЛКА: У конфігурації відсутній обов'язковий параметр '$requiredPath'" -ForegroundColor Red
-                exit 30
+                Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'MissingConfigParameter'
             }
             $currentNode = $property.Value
         }
@@ -763,8 +858,9 @@ function Get-BRAVOMaintenanceRestoreDecisionSnapshot {
     $todayMarkerPresent = (Test-Path -LiteralPath $TodayMarkerFile)
     $scheduledSucceeded = (Test-Path -LiteralPath $ScheduledMarkerFile) -or (
         $null -ne $restoreState -and
-        # #438 (P3-4): стан може не мати Status/ScheduledOccurrence (його створив
-        # невдалий -ForceRestore лише з лічильником) — StrictMode-безпечне читання.
+        # #438 (P3-4): StrictMode-безпечне читання — стан, записаний вручну
+        # оператором, може не мати Status/ScheduledOccurrence (BRAVO сам пише їх
+        # завжди, при невдалому -ForceRestore — порожніми).
         $null -ne $restoreState.PSObject.Properties['Status'] -and
         $null -ne $restoreState.PSObject.Properties['ScheduledOccurrence'] -and
         [string]$restoreState.Status -eq 'Succeeded' -and
@@ -952,28 +1048,28 @@ if ([string]::IsNullOrWhiteSpace($script:ObjectName) -or
     $script:LogLevel -notin @("DEBUG", "INFO", "WARNING", "ERROR", "SUCCESS") -or
     $arcCommonParams.Count -eq 0) {
     Write-Host "ПОМИЛКА: BRAVO.config містить некоректні значення" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidConfigValues'
 }
 
 if ($invalidExcludedDrives.Count -gt 0) {
     Write-Host "ПОМИЛКА: Некоректні значення Limits.ExcludedDrives: $($invalidExcludedDrives -join ', ')" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidExcludedDrives'
 }
 
 if ($RangeIdMonitoringEnabled -and [string]::IsNullOrWhiteSpace($RangeIdLogPath)) {
     Write-Host "ПОМИЛКА: Не вдалося визначити системний шлях до файлу контролю діапазонів ID" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'RangeIdLogPathUndefined'
 }
 
 if ($archivePasswordPresentInConfig) {
     Write-Host "ПОМИЛКА: Видаліть параметр -p<пароль> із Maintenance.Archiver.Parameters у BRAVO.config. Пароль має зберігатися лише у Credential Manager." -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'ArchivePasswordInConfig'
 }
 
 if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     $archiveCredentialDetails = if ($ArchiveCredentialError) { ": $ArchiveCredentialError" } else { "" }
     Write-Host "ПОМИЛКА: Не знайдено пароль архівів 7-Zip у Credential Manager$archiveCredentialDetails" -ForegroundColor Red
-    exit 31
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 31 -Reason 'ArchivePasswordMissing'
 }
 
 if ($script:SlackMode -ne "none") {
@@ -995,7 +1091,7 @@ if ($script:SlackMode -ne "none") {
     if (-not $notificationConfigurationValid) {
         $credentialDetails = if ($NotificationCredentialError) { ": $NotificationCredentialError" } else { "" }
         Write-Host "ПОМИЛКА: Для каналу $NotificationProviderDisplayName не знайдено коректний HTTPS webhook у Credential Manager$credentialDetails" -ForegroundColor Red
-        exit 31
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 31 -Reason 'NotificationWebhookMissing'
     }
 }
 
@@ -1519,7 +1615,7 @@ function Enter-BRAVOMaintenanceOperationLock {
                         # Оператор бачив лише мовчазний Start-Sleep до
                         # OperationLockWaitMinutes і жодного натяку, хто саме
                         # тримає lock, хоча holder уже пише в цей файл JSON із
-                        # operation/pid/hostname/generationId (DEV-LIMS
+                        # operation/pid/hostname/generationId (HOST-11
                         # acceptance 2026-08-23). Читання — best-effort: holder
                         # тримає файл із FileShare.Read, тому в звичайному разі
                         # peek вдається; вузьке вікно між OpenOrCreate і Write
@@ -1603,7 +1699,7 @@ if ($PSBoundParameters.ContainsKey('AutoShutdown')) {
 
 if ($AutoShutdown -notin @("on", "off")) {
     Write-Host "ПОМИЛКА: Параметр AutoShutdown має бути 'on' або 'off'. Поточне значення: $AutoShutdown" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidAutoShutdown'
 }
 
 $script:EnableAutoShutdown = ($AutoShutdown -eq "on")
@@ -1620,7 +1716,7 @@ if ($PSBoundParameters.ContainsKey('ArchiveAfterMaintenance')) {
 
 if ($ArchiveAfterMaintenance -notin @("on", "off")) {
     Write-Host "ПОМИЛКА: Параметр ArchiveAfterMaintenance має бути 'on' або 'off'. Поточне значення: $ArchiveAfterMaintenance" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'InvalidArchiveAfterMaintenance'
 }
 
 $script:EnableArchiveAfterMaintenance = ($ArchiveAfterMaintenance -eq "on")
@@ -1756,7 +1852,7 @@ function Get-BRAVOMaintenanceResolvedExitCode {
 # Get-BRAVOExitCodeName (BRAVO.ExitCodes, те саме джерело істини, що
 # вже показує "Код завершення:" у РЕЗУЛЬТАТ нижче). default-гілка
 # покриває 40/41/60 і будь-який інший неуспішний/не-warning код без
-# перелічення кожного окремо. Реальний DEV-LIMS запуск: відсутній
+# перелічення кожного окремо. Реальний HOST-11 запуск: відсутній
 # Range ID log (WARN-only, семантика НЕ змінена) -> exit 10
 # (SuccessWithWarnings), але ЛОГ і фінальне повідомлення раніше
 # незалежно показували "УСПІШНО" без жодної згадки про попередження.
@@ -1773,6 +1869,14 @@ function Get-BRAVOMaintenanceFinalStatus {
         'SuccessWithWarnings' {
             return [pscustomobject]@{
                 Text = 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
+                Color = [ConsoleColor]::Yellow
+            }
+        }
+        'SkippedLockBusy' {
+            # 20 — не відмова (інший екземпляр уже працює): severity WARNING,
+            # status-файл WARNINGS (рішення D-A, BRAVO.ExitCodes).
+            return [pscustomobject]@{
+                Text = 'ПОПЕРЕДЖЕННЯ'
                 Color = [ConsoleColor]::Yellow
             }
         }
@@ -1829,7 +1933,7 @@ function Register-BRAVOMaintenanceArchiveChildResult {
 # рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
 # Write-BRAVOMaintenanceOperation (ненумеровані операції).
 #
-# Реальний DEV-LIMS прогін 19:26 показав, чому облік мусить бути спільним:
+# Реальний HOST-11 прогін 19:26 показав, чому облік мусить бути спільним:
 # ненумеровані операції рендерилися прямо через Write-BRAVOOperationResult
 # (BRAVO.Console), тому FAIL-операція "Trace: добовий архів і SFTP" не
 # потрапляла ані в лічильники (підсумок брехав "Помилок: 0" при exit 60),
@@ -2082,7 +2186,7 @@ function Write-Log {
     # задають етапи (Write-BRAVOMaintenanceStep), тому в консоль вони більше
     # не йдуть.
     # dev.19: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
-    # журнал (той самий підхід, що вже Archive dev.18). Реальний DEV-LIMS
+    # журнал (той самий підхід, що вже Archive dev.18). Реальний HOST-11
     # лог показав рядки лише зі 100 символами "=" між звичайними секціями
     # — без жодної діагностичної цінності, бо кожен такий виклик стоїть
     # безпосередньо перед "=== ЗАГОЛОВОК ===", який і так фіксує ту саму
@@ -2761,13 +2865,18 @@ function Write-BRAVORestoreRetryState {
         Write-Log -Message "restore state пошкоджено ($($readResult.Error)); копію збережено: $corruptCopyPath. Блокування автоматичної реставрації збережено." -Level 'ERROR'
     }
     $map = ConvertTo-BRAVORestoreStateMap -State $readResult.State
-    # #438 (P3-4): примусовий шлях НІКОЛИ не створює поля слоту
-    # (ScheduledOccurrence/Status/Reason): невдалий -ForceRestore при
-    # відсутньому стані не повинен вигадувати 'Pending' для планового слоту
-    # (це замовляло б автоматичну реставрацію). Лише лічильник/клас/
-    # write-ahead. Читач слоту (Main, $scheduledSucceeded) StrictMode-безпечний
-    # до відсутності цих полів.
-    if (-not $ForceRestore) {
+    # #438 (P3-4): примусовий шлях НІКОЛИ не вигадує слот: невдалий
+    # -ForceRestore при відсутньому чи пошкодженому стані не пише 'Pending'
+    # для планового слоту (це замовляло б автоматичну реставрацію). Відсутні
+    # поля слоту (ScheduledOccurrence/Status/Reason) він створює ПОРОЖНІМИ,
+    # як Write-BRAVORestoreForcedOutcome: читач v5.2.4 звертається до
+    # $restoreState.Status напряму під StrictMode 2.0, і файл без цих полів
+    # ламав би кожен прогін Maintenance після rollback на 5.2.4.
+    if ($ForceRestore) {
+        foreach ($legacyKey in @('ScheduledOccurrence', 'Status', 'Reason')) {
+            if (-not $map.Contains($legacyKey)) { $map[$legacyKey] = '' }
+        }
+    } else {
         if (-not $map.Contains('ScheduledOccurrence')) { $map['ScheduledOccurrence'] = $ScheduledOccurrence.ToString('o') }
         if (-not $map.Contains('Status')) { $map['Status'] = 'Pending' }
         if (-not $map.Contains('Reason')) { $map['Reason'] = $Reason }
@@ -5238,7 +5347,7 @@ function Send-BRAVOTraceArchive {
         $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
         $remoteArchivePath = "$remoteRoot/$([System.IO.Path]::GetFileName($ArchivePath))"
         # session.PutFiles НЕ створює відсутні remote-каталоги: реальний
-        # DEV-LIMS прогін падав на кожному запуску з "Cannot create remote
+        # HOST-11 прогін падав на кожному запуску з "Cannot create remote
         # file '/trace/Trace_YYYYMMDD.mdz.new.filepart'. No such file or
         # directory", бо /trace/ на сервері не існував — і це давало exit 60
         # обслуговування, яке насправді відпрацювало. Канонічний рекурсивний
@@ -6055,6 +6164,12 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         [int]$IntegrityTimeoutSeconds = 43200,
         [AllowNull()]$Session,
         [string]$RemoteDirectory,
+        # SFTP свідомо вимкнено конфігурацією (componentSettings.SFTP.Enabled
+        # = false): $Session=$null тут — не збій, а local-only режим, тож
+        # відкладення передачі логується INFO і не інкрементує лічильник
+        # попереджень (інакше щоночі exit 10). Без прапорця (SFTP увімкнено,
+        # але сесії немає: креденшли/WinSCP/мережа) — WARNING, як і раніше.
+        [switch]$RemoteDisabled,
         # R3-2 (PR #136, третє коло review): ідентичність SFTP-призначення
         # (типово "логін@хост") цього $Session — записується у grace-
         # completion state РАЗОМ із RemoteDirectory, щоб зміна акаунта чи
@@ -6237,8 +6352,13 @@ function Invoke-BRAVOTraceArchiveMaintenance {
 
             if ($null -eq $Session) {
                 $result.UploadsDeferred++
-                Write-BRAVOLogRotationMessage -Logger $Logger `
-                    -Message "${ComponentLabel}: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні файли збережено для наступного прогону" -Level "WARNING"
+                if ($RemoteDisabled) {
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "${ComponentLabel}: SFTP вимкнено конфігурацією — передачу $($group.ArchiveName) відкладено; джерельні файли збережено (local-only)" -Level "INFO"
+                } else {
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "${ComponentLabel}: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні файли збережено для наступного прогону" -Level "WARNING"
+                }
                 continue
             }
 
@@ -6948,7 +7068,7 @@ function Compare-FileSizes {
         [int]$MinSizeBytes = 2048,
         [AllowNull()][string]$MainModelRelativePath = $null,
         # Settle-retry (порт 67f3ad3+e2c61e1 з backup/local-developer-rc2-line):
-        # двічі підтверджено на реальному DEV-LIMS (2026-08-23/24, byte-точний
+        # двічі підтверджено на реальному HOST-11 (2026-08-23/24, byte-точний
         # збіг розмірів на диску одразу після хибного rollback) — активний
         # антивірус із real-time захистом тримав щойно записані гігабайтні
         # .md залоченими одразу після bravocmd repair/екстракції, і
@@ -7910,11 +8030,11 @@ function Get-BRAVORestoreArchiveMainFiles {
 
     $enumeratedFiles = @()
     try {
-        # Codex P2 (раунд 2): Test-Path за ACL / збою провайдера може
+        # рев'ю P2 (раунд 2): Test-Path за ACL / збою провайдера може
         # записати non-terminating error і нічого не повернути — це не
         # доказ відсутності каталогу, тож -ErrorAction Stop веде в той
         # самий fail-closed catch, що й збій Get-ChildItem.
-        # Codex P2 (раунд 3): налаштований каталог — буквальний шлях
+        # рев'ю P2 (раунд 3): налаштований каталог — буквальний шлях
         # (-LiteralPath): з -Path символи [ / ] у назві каталогу були б
         # шаблоном (наявний каталог «відсутній» чи збіг із сусіднім).
         # Шаблон імені файлу лишається в -Filter.
@@ -7984,7 +8104,7 @@ function Remove-OldRestoreArchives {
         # 7z t, ті самі WARNING/ERROR і прапорці exit 41), БЕЗ жодного
         # видалення. Main використовує його, коли сесій ≤ ArchivesKeepCount.
         [switch]$ReportOnly,
-        # #424 (Codex P2, раунд 3): необов'язковий облік кроку очистки:
+        # #424 (рев'ю P2, раунд 3): необов'язковий облік кроку очистки:
         # IntegrityFailed = $true, коли цей виклик виставив прапорці exit 41
         # (збій переліку, 7z t, жодної підтвердженої точки відновлення).
         # Глобальний Boolean не показує нового збою, якщо попередня фаза
@@ -8151,7 +8271,7 @@ function Remove-OldRestoreArchives {
     # #300 / #424: жодної придатної точки відновлення не лишилось —
     # критично (exit 41) незалежно від етапу, на якому забраковано сесії
     # (SHA512 чи 7z t), навіть якщо окремі збої старіших сесій були лише
-    # WARNING. Codex P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
+    # WARNING. рев'ю P1 (раунд 3): раніше умова вимагала збою 7z t, і сесії,
     # забраковані вже на SHA512 (hash-файл відсутній / некоректний / не
     # збігається / не читається), давали лише exit 10. Видалення це не
     # розширює: без підтвердженої точки $groupsToKeep і $groupsToDelete
@@ -8248,7 +8368,7 @@ function Remove-OldRestoreArchives {
         # результат, pipeline віддає скалярний FileInfo замість масиву, і
         # .Count на ньому кидає "The property 'Count' cannot be found on
         # this object": підтверджено реальним acceptance-прогоном dev.15
-        # на DEV-LIMS (виняток після [8/8], перехоплений fail-safe catch).
+        # на HOST-11 (виняток після [8/8], перехоплений fail-safe catch).
         $beforeCount = @($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
         $afterCount = @($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
         Write-Log "  - $sessionTime (before: $beforeCount, after: $afterCount)" -Level "DEBUG"
@@ -8263,7 +8383,7 @@ function Remove-OldRestoreArchives {
         Write-Log "Видалення сесії: $sessionTime ($($group.Count) файлів)..." -Level "INFO"
         
         # Видаляємо всі файли цієї сесії (основні архіви та контрольні суми)
-        # #424 (Codex P2, раунд 3): -LiteralPath — той самий буквальний
+        # #424 (рев'ю P2, раунд 3): -LiteralPath — той самий буквальний
         # каталог, який перевіряв Get-BRAVORestoreArchiveMainFiles, а не
         # сусідній, що збігся б із шаблоном [ / ].
         $sessionFiles = Get-ChildItem -LiteralPath $Path -ErrorAction SilentlyContinue | 
@@ -8990,14 +9110,14 @@ function Send-BRAVOMaintenanceOperationsEvent {
 # Планувальника, навіть якщо роль Administrators не відобразилась через UAC API.
 if (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "ЗАПУСТІТЬ СКРИПТ ВІД ІМЕНІ АДМІНІСТРАТОРА!" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'AdministratorRequired'
 }
 
 # Перевірка версії PowerShell. Для PowerShell 3.0 використовується сумісна
 # реалізація SHA512 та доступні в цій версії системні командлети.
 if ($PSVersionTable.PSVersion.Major -lt 3) {
     Write-Host "ПОМИЛКА: Необхідна версія PowerShell 3.0 або вище. Поточна версія: $($PSVersionTable.PSVersion)" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'PowerShellVersion'
 }
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "УВАГА: PowerShell $($PSVersionTable.PSVersion) — увімкнено режим сумісності." -ForegroundColor Yellow
@@ -9006,7 +9126,7 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 # Перевірка архітектури ОС
 if (-not [Environment]::Is64BitOperatingSystem) {
     Write-Host "ПОМИЛКА: Скрипт працює тільки на 64-бітних системах" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'Unsupported32BitOS'
 }
 
 # Перевірка версії ОС. Environment.OSVersion без application manifest може
@@ -9015,7 +9135,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
 $osVersion = [System.Environment]::OSVersion.Version
 if ($osVersion.Major -lt 6 -or ($osVersion.Major -eq 6 -and $osVersion.Minor -lt 1)) {
     Write-Host "ПОМИЛКА: Необхідна Windows 7/Windows Server 2008 R2 або новіша версія" -ForegroundColor Red
-    exit 90
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'UnsupportedWindowsVersion'
 }
 if ($osVersion.Major -eq 6 -and $osVersion.Minor -lt 3) {
     Write-Host "УВАГА: Windows версії $osVersion — увімкнено сумісний режим роботи." -ForegroundColor Yellow
@@ -9051,7 +9171,7 @@ $SYSTEM_LOG_ROOT = [string]$systemLogRoot
 if ([string]::IsNullOrWhiteSpace($ROOT_LIMS) -or
     [string]::IsNullOrWhiteSpace($SYSTEM_LOG_ROOT)) {
     Write-Host "ПОМИЛКА: У BRAVO.config не визначено EffectiveLIMSRoot або SystemLogRoot" -ForegroundColor Red
-    exit 30
+    Complete-BRAVOMaintenanceEarlyExit -ExitCode 30 -Reason 'EffectiveRootsUndefined'
 }
 # Похідні шляхи
 # MODEL_PATH: джерело істини — Resolve-BRAVOInstallationDiscovery
@@ -9148,7 +9268,7 @@ if (-not (Test-Path $LOG_DIR)) {
     }
     catch {
         Write-Host "Не вдалося створити директорію для логів $LOG_DIR : $($_.Exception.Message)" -ForegroundColor Red
-        exit 90
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode 90 -Reason 'LogDirectoryCreateFailed'
     }
 }
 
@@ -9463,7 +9583,7 @@ if ($script:BRAVOOSSupportTier.Tier -eq "LegacyBestEffort") {
         Write-Log -Message "$($script:BRAVOOSSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"
     } else {
         Write-Log -Message $script:BRAVOOSSupportTier.Message -Level "ERROR"
-        exit (Resolve-BRAVOExitCode -InvalidConfiguration)
+        Complete-BRAVOMaintenanceEarlyExit -ExitCode (Resolve-BRAVOExitCode -InvalidConfiguration) -Reason 'UnsupportedOperatingSystem'
     }
 }
 $script:BRAVOToolIntegrity = Get-BRAVOToolIntegrityRecommendation `
@@ -9504,6 +9624,7 @@ if (-not $script:BRAVOToolManifest.IsValid) {
         # а не лише рядок ERROR у лозі.
         Send-SlackAlert -Message "Обслуговування заблоковано перевіркою цілісності інструментів: $($script:BRAVOToolManifest.Message)" -IsCritical
         Send-BRAVOMaintenanceEarlyExitAlerts -Reason "перевірка цілісності інструментів"
+        Write-BRAVOMaintenanceEarlyExitStatus -ExitCode (Resolve-BRAVOExitCode -ToolIntegrityViolation) -Reason 'ToolIntegrityViolation'
         exit (Resolve-BRAVOExitCode -ToolIntegrityViolation)
     }
 } elseif (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOToolManifest.Message)) {
@@ -9646,7 +9767,7 @@ if ($BravoMaintenanceEnabled) {
         # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
         # передав -ForceRestore), а не аномалія. Будь-який WARNING інкрементує
         # $script:BRAVOWarningCount (Write-Log вище), а той піднімає severity
-        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний DEV-LIMS
+        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний HOST-11
         # прогін 20:29 показав оператору жовте "ПОТРІБНА ДІЯ: перевірити
         # журнал" при повністю зеленому списку етапів, без жодної підказки,
         # що саме не так. Текст лишається в лозі повністю — змінюється лише
@@ -11412,7 +11533,7 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
 # Зріз лічильників пересвіжується САМЕ ТУТ, після реставрації і перевірки
 # розмірів .md: початкова ініціалізація вище знімається ДО них, тому
 # критична помилка реставрації опинялася "новою" для цього етапу і
-# фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+# фарбувала його в FAIL. Реальний HOST-11 негативний прогін 19:48
 # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
 # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
 # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
@@ -12182,6 +12303,7 @@ if (-not $BravoMaintenanceEnabled) {
             -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
             -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
             -Session $traceSftpSession `
+            -RemoteDisabled:(-not [bool]$storageEffective.SFTP.Enabled) `
             -RemoteDirectory $traceSftpRemoteDirectory `
             -DestinationIdentity $traceDestinationIdentity `
             -RawSourceRetentionDays $RAW_SOURCE_GRACE_DAYS `
@@ -12205,6 +12327,7 @@ if (-not $BravoMaintenanceEnabled) {
                 -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
                 -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
                 -Session $traceSftpSession `
+                -RemoteDisabled:(-not [bool]$storageEffective.SFTP.Enabled) `
                 -RemoteDirectory $exchangeApiSftpRemoteDirectory `
                 -DestinationIdentity $traceDestinationIdentity `
                 -ComponentLabel 'exchangAPI' `
@@ -12325,7 +12448,7 @@ $restoreArchiveDeleteCandidateGroups = @()
 # #424: кількість усіх сесій архівів реставрації (без валідації) — для
 # гілки «лише перевірка», коли сесій ≤ ArchivesKeepCount.
 $restoreArchiveGroupCount = 0
-# #424 (Codex P2, раунд 3): власний облік збою цілісності архівів
+# #424 (рев'ю P2, раунд 3): власний облік збою цілісності архівів
 # реставрації для статусу кроку очистки (Remove-OldRestoreArchives -Outcome
 # і збій переліку нижче). Глобальний criticalErrorOccurred не показує нового
 # збою, якщо його вже виставила попередня фаза.
@@ -12584,7 +12707,7 @@ $cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLo
 $cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
     -CriticalBefore $cleanupCriticalBefore `
     -WarningsBefore $cleanupWarningsBefore
-# #424 (Codex P2, раунд 3): збій цілісності архівів реставрації в цьому
+# #424 (рев'ю P2, раунд 3): збій цілісності архівів реставрації в цьому
 # кроці — FAIL і тоді, коли criticalErrorOccurred уже виставила попередня
 # фаза (снепшот $cleanupCriticalBefore тоді не бачить нового збою).
 if ([bool]$restoreArchiveIntegrityOutcome['IntegrityFailed']) {

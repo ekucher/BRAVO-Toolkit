@@ -1309,6 +1309,50 @@ function Get-BRAVOServiceDelayedAutoStart { param($ServiceName) return $false }
         -Name "DryRun/ServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
         -Failure "Get-BRAVODryRunConfiguredServiceState: служба без StartType (.NET < 4.6.1) не має кидати виняток під StrictMode 2.0, тип запуску береться з WMI, наявний StartType має пріоритет над WMI, збій WMI не обриває Dry Run. Розбіжності: $($startModeDryRunDiffs -join ' | ')"
 
+    # 4b) BRAVO_DRY_RUN.ps1: перелік служб без права SC_MANAGER_ENUMERATE_SERVICE.
+    # Справжній Get-Service без -Name у Windows PowerShell 5.1 кидає тоді
+    # термінальний InvalidOperationException попри -ErrorAction SilentlyContinue
+    # (відтворено в batch-сесії без INTERACTIVE у токені) і обривав увесь Dry Run.
+    # Stub відтворює саме цю форму: пошук за -Name -> $null, перелік -> throw.
+    $dryRunEnumerationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startModeIssueDryRunText + "`n" + @'
+function Get-Service {
+    param($Name, $ErrorAction)
+    if ($null -ne $Name) { return $null }
+    if ($script:svcEnumerationDenied) {
+        throw (New-Object System.InvalidOperationException "Cannot open Service Control Manager on computer '.'. (stub)")
+    }
+    return @([pscustomobject]@{ Name = 'svc-probe'; DisplayName = 'SvcProbe'; Status = 'Running'; StartType = 'Automatic' })
+}
+function Get-BRAVOServiceStartMode { param($Service) return [pscustomobject]@{ StartMode = [string]$Service.StartType } }
+'@) `
+        -FunctionNames @('Get-Service', 'Get-BRAVOServiceStartMode', 'Get-BRAVODryRunConfiguredServiceState')
+    $dryRunEnumerationProbe = & $dryRunEnumerationModule {
+        Set-StrictMode -Version 2.0
+        $out = [ordered]@{}
+        foreach ($denied in @($true, $false)) {
+            $script:svcEnumerationDenied = $denied
+            $thrown = $null; $state = $null
+            try { $state = Get-BRAVODryRunConfiguredServiceState -ServiceCandidates @('SvcProbe') } catch { $thrown = $_.Exception.Message }
+            $out["Denied_$denied"] = if ($null -ne $thrown) { "THROW:$thrown" } else {
+                'Exists={0},Name={1},EnumerationError={2}' -f $state.Exists, $state.Name, (-not [string]::IsNullOrWhiteSpace([string]$state.EnumerationError))
+            }
+        }
+        $out
+    }
+    $dryRunEnumerationExpected = [ordered]@{
+        Denied_True = 'Exists=False,Name=,EnumerationError=True'
+        Denied_False = 'Exists=True,Name=svc-probe,EnumerationError=False'
+    }
+    $dryRunEnumerationDiffs = @($dryRunEnumerationExpected.Keys | Where-Object { [string]$dryRunEnumerationProbe[$_] -ne [string]$dryRunEnumerationExpected[$_] } |
+        ForEach-Object { "$_ => '$($dryRunEnumerationProbe[$_])' (очікувалось '$($dryRunEnumerationExpected[$_])')" })
+    $dryRunEnumerationWarnWired = $startModeIssueDryRunText.Contains('if (-not [string]::IsNullOrWhiteSpace([string]$optionalServiceProbe.State.EnumerationError)) {') -and
+        $startModeIssueDryRunText.Contains('Add-DryRunResult WARN "Служби" ([string]$optionalServiceProbe.Name) (')
+    Test-BRAVOCondition `
+        -Condition ($dryRunEnumerationDiffs.Count -eq 0 -and $dryRunEnumerationWarnWired) `
+        -Name "DryRun/ServiceEnumerationDeniedIsWarnNotFatal" `
+        -Failure "Get-BRAVODryRunConfiguredServiceState: термінальний збій переліку служб (SCM без SC_MANAGER_ENUMERATE_SERVICE) не має обривати Dry Run — компонент Exists=False з EnumerationError, а викликач показує WARN 'Служби'; без збою EnumerationError порожній. WARN підключено: $dryRunEnumerationWarnWired. Розбіжності: $($dryRunEnumerationDiffs -join ' | ')"
+
     # 5) BRAVO.System: Set-BRAVOBootRestoreServiceStartType без StartType.
     $startModeBootRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($startModeIssueStubs + "`n" + $startModeIssueSystemText) `

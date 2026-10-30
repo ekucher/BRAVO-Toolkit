@@ -108,10 +108,10 @@ BRAVO.config") і зафіксувати рішення про розбиття 
 | `LogLevel`, лог-скаляри | `BRAVO.config` | Raw | Частково | No | `Get-BRAVODefaultConfiguration` |
 | `backupConsistency.*` | `BRAVO.config` | Raw | Yes | Так (VSS/Direct — data-integrity) | `Get-BRAVODefaultConfiguration` |
 | `operationLockSettings.Path` | `BRAVO.config` (`Join-Path $env:ProgramData ...`) | **Derived** | No | No | залишається деривацією |
-| robocopy*/sftp-скаляри/`smbSettings.*` | `BRAVO.config` | Raw | Yes | Так (`sftpHostKey` — host-key pinning, розділ 03-security.md) | `Get-BRAVODefaultConfiguration` |
+| robocopy*/sftp-скаляри/`smbSettings.*` | `BRAVO.config` | Raw | Yes | Так (`sftpHostKey` — host-key pinning, `docs/engineering/security.md`) | `Get-BRAVODefaultConfiguration` |
 | `sftpDirectories.*` | `BRAVO.config` (фаза 2) | Raw | Yes | No | `Get-BRAVODefaultConfiguration` |
 | `toolIntegritySettings.*` | `BRAVO.config` (`Join-Path $toolsPath ...`) | **Derived** | No | Так | залишається деривацією |
-| `backupMonitoring.*` (крім шляхів стану) | `BRAVO.config` (фаза 2) | Raw | Yes | Частково (`BAZA.MutationPolicy`, `AutoArchiveMutationThreshold` — append-only invariant, `07-bravo-runtime-invariants.md`) | `Get-BRAVODefaultConfiguration` |
+| `backupMonitoring.*` (крім шляхів стану) | `BRAVO.config` (фаза 2) | Raw | Yes | Частково (`BAZA.MutationPolicy`, `AutoArchiveMutationThreshold` — append-only invariant, `docs/engineering/runtime-invariants.md`) | `Get-BRAVODefaultConfiguration` |
 | `backupMonitoring.SFTP.BAZA.StateRoot`, `*StatePath` | `BRAVO.config` (`Join-Path $stateRoot ...`) | **Derived** | No | No | залишається деривацією |
 | `schedulerSettings.*` (крім `*.ScriptPath`, `Recovery.Enabled`, `Recovery.StartupDelayMinutes`, `BAZASync.Enabled`) | `BRAVO.config` (фаза 2) | Raw | Yes | No | `Get-BRAVODefaultConfiguration` |
 | `schedulerSettings.*.ScriptPath`, `Recovery.Enabled/StartupDelayMinutes`, `BAZASync.Enabled` | `BRAVO.config` | **Derived** (з RuntimeRoot або з інших raw-полів) | No (документовано в example: "перевизначайте first-order поле") | No | залишається деривацією |
@@ -181,8 +181,7 @@ capture + переписаний loader без mandatory `BRAVO.config` + Config
 DefaultValue adapter + security-invariant integration + 25
 regression-тестів + real-server acceptance checklist) має надто великий
 blast radius для одного review-циклу і суперечить принципу "мінімальний
-повний зворотно-сумісний крок" (`.claude/CLAUDE.md`, "Minimal scope of
-change"). Тому:
+повний зворотно-сумісний крок" (`docs/engineering/README.md`, «Дисципліна змін»). Тому:
 
 - **PR A (цей PR):** `modules/BRAVO.Configuration` — canonical
   `Get-BRAVODefaultConfiguration` (built-in raw defaults, включно з

@@ -25,6 +25,39 @@
 # перелік AUTOEXEC-цілей не пропускає жодного реального викликача
 # Import-BravoConfiguration серед кореневих *.ps1 і modules\.
 
+# Memo розбору одного виклику Test-BRAVOConfigV2CutoverGates; поза викликом завжди $null.
+$script:BRAVOCutoverGateParseMemo = $null
+
+function Get-BRAVOCutoverGateParsedSource {
+    <#
+        Розбір одного файлу AST-гейтів. Усередині ОДНОГО виклику
+        Test-BRAVOConfigV2CutoverGates гейти 3, 4 і 5 читають і розбирають
+        одні й ті самі файли — тоді результат (текст, AST, помилки)
+        береться з локальної memo-таблиці цього виклику (ключ — повний
+        шлях). Memo створюється на початку виклику й скидається в finally:
+        між викликами та поза викликом (прямі виклики Test-BRAVOConfigLoader-
+        CallerCompleteness / Test-BRAVOGeneratedLoaderCallText) кешу немає,
+        файл завжди читається з диска. AST лише читається (FindAll), не
+        мутується.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $memo = $script:BRAVOCutoverGateParseMemo
+    if ($null -ne $memo -and $memo.ContainsKey($Path)) {
+        return $memo[$Path]
+    }
+    $parsedText = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    $parsedErrors = $null
+    $parsedAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $parsedText, [ref]$null, [ref]$parsedErrors
+    )
+    $parsedEntry = [pscustomobject]@{ Ast = $parsedAst; Errors = $parsedErrors }
+    if ($null -ne $memo) {
+        $memo[$Path] = $parsedEntry
+    }
+    return $parsedEntry
+}
+
 function Get-BRAVOProductionEntryPointRelativePath {
     <#
         Канонічний перелік production/operator entrypoint-ів (Issue #216),
@@ -128,11 +161,9 @@ function Get-BRAVOConfigLoaderCallerRelativePath {
     $parseFailures = New-Object System.Collections.Generic.List[string]
     foreach ($candidateFile in $candidateFiles) {
         $relativePath = $candidateFile.FullName.Substring($resolvedRoot.Length).TrimStart('\', '/').Replace('/', '\')
-        $candidateText = [IO.File]::ReadAllText($candidateFile.FullName, [Text.Encoding]::UTF8)
-        $candidateParseErrors = $null
-        $candidateAst = [System.Management.Automation.Language.Parser]::ParseInput(
-            $candidateText, [ref]$null, [ref]$candidateParseErrors
-        )
+        $candidateParsed = Get-BRAVOCutoverGateParsedSource -Path $candidateFile.FullName
+        $candidateParseErrors = $candidateParsed.Errors
+        $candidateAst = $candidateParsed.Ast
         if ($candidateParseErrors -and $candidateParseErrors.Count -gt 0) {
             [void]$parseFailures.Add("$relativePath ($($candidateParseErrors[0].Message))")
             continue
@@ -336,11 +367,9 @@ function Test-BRAVOGeneratedLoaderCallText {
     foreach ($candidateFile in $candidateFiles) {
         $relativePath = $candidateFile.FullName.Substring($resolvedRoot.Length).TrimStart('\', '/').Replace('/', '\')
         if ($sanctioned.Contains($relativePath)) { continue }
-        $candidateText = [IO.File]::ReadAllText($candidateFile.FullName, [Text.Encoding]::UTF8)
-        $candidateParseErrors = $null
-        $candidateAst = [System.Management.Automation.Language.Parser]::ParseInput(
-            $candidateText, [ref]$null, [ref]$candidateParseErrors
-        )
+        $candidateParsed = Get-BRAVOCutoverGateParsedSource -Path $candidateFile.FullName
+        $candidateParseErrors = $candidateParsed.Errors
+        $candidateAst = $candidateParsed.Ast
         if ($candidateParseErrors -and $candidateParseErrors.Count -gt 0) {
             [void]$parseFailures.Add("$relativePath ($($candidateParseErrors[0].Message))")
             continue
@@ -401,6 +430,26 @@ function Test-BRAVOGeneratedLoaderCallText {
 }
 
 function Test-BRAVOConfigV2CutoverGates {
+    <#
+        Публічний вхід гейтів: відкриває memo розбору на час ОДНОГО виклику
+        (див. Get-BRAVOCutoverGateParsedSource) і гарантовано скидає її.
+        Сам перелік і результат гейтів — у Invoke-BRAVOConfigV2CutoverGatesCore.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$ProductionEntryPointRelativePath = (Get-BRAVOProductionEntryPointRelativePath)
+    )
+
+    $previousParseMemo = $script:BRAVOCutoverGateParseMemo
+    $script:BRAVOCutoverGateParseMemo = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    try {
+        return (Invoke-BRAVOConfigV2CutoverGatesCore -Root $Root -ProductionEntryPointRelativePath $ProductionEntryPointRelativePath)
+    } finally {
+        $script:BRAVOCutoverGateParseMemo = $previousParseMemo
+    }
+}
+
+function Invoke-BRAVOConfigV2CutoverGatesCore {
     <#
         -Root: staging-каталог (release-build) або checked-out repo tree
         (PR-check) — обидва гейти читають лише відносні шляхи нижче.
@@ -665,7 +714,7 @@ function Test-BRAVOConfigV2CutoverGates {
     # BRAVO_ARCHIV.ps1, BRAVO_HEALTH.ps1, BRAVO_MAINTENANCE.ps1,
     # BRAVO_DATA_RESTORE.ps1, BRAVO_CONFIGURATOR.ps1) — усі кореневі
     # BRAVO_*.ps1-скрипти є production/operator-поверхнею репозиторію
-    # (архітектурна політика 05-architecture.md), тому скануються всі, не
+    # (архітектурна політика docs/engineering/architecture.md), тому скануються всі, не
     # лише підмножина з AUTOEXEC-переліку.
     # R3 (issue #216, gate-review): deploy\ раніше не сканувався ЗОВСІМ —
     # додано, щоб deploy\Install-BRAVOServer.ps1 та інші не-migration
@@ -696,11 +745,9 @@ function Test-BRAVOConfigV2CutoverGates {
             if ($legacyReaderAllowedRelativePaths -contains $fileRelativePath) {
                 continue
             }
-            $scanTargetFileText = Get-Content -LiteralPath $scanTargetFile.FullName -Raw -Encoding UTF8
-            $legacyReaderParseErrors = $null
-            $legacyReaderFileAst = [System.Management.Automation.Language.Parser]::ParseInput(
-                $scanTargetFileText, [ref]$null, [ref]$legacyReaderParseErrors
-            )
+            $legacyReaderParsed = Get-BRAVOCutoverGateParsedSource -Path $scanTargetFile.FullName
+            $legacyReaderParseErrors = $legacyReaderParsed.Errors
+            $legacyReaderFileAst = $legacyReaderParsed.Ast
             if ($legacyReaderParseErrors -and $legacyReaderParseErrors.Count -gt 0) {
                 # Fail closed: незрозумілий для парсера файл не можна довести
                 # безпечним — гейт відмовляє явно, а не мовчки пропускає скан.

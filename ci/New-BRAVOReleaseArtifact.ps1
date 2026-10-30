@@ -83,6 +83,22 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedTag) -and $ExpectedTag -ne ('v' +
     throw "Тег '$ExpectedTag' не відповідає packageVersion '$packageVersion' (очікується 'v$packageVersion')."
 }
 
+# Релізний тег — лише annotated (RELEASE_POLICY.md 15, рішення D8):
+# lightweight-тег не несе автора, дати й повідомлення. GitHub ruleset не
+# вміє цього вимагати, тому вимога стоїть тут, до збирання, — Release з
+# lightweight-тега не з'являється. Тег не можна видалити чи пересунути
+# (ruleset protected-release-tags, 16.2), тож помилка виправляється лише
+# наступною версією. Без 2>$null — та сама причина, що й у
+# Get-BRAVOArtifactVersionFromRef.
+if (-not [string]::IsNullOrWhiteSpace($ExpectedTag)) {
+    $expectedTagObjectType = (& git -C $repositoryRoot cat-file -t ("refs/tags/{0}" -f $ExpectedTag) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $expectedTagObjectType -ne 'tag') {
+        $seen = if ([string]::IsNullOrWhiteSpace($expectedTagObjectType)) { 'тег не знайдено' } else { "тип об'єкта: $expectedTagObjectType" }
+        throw ("RELEASE_TAG_NOT_ANNOTATED: тег '$ExpectedTag' не є annotated ($seen). " +
+            "Релізні теги створюються лише як annotated: git tag -a $ExpectedTag -m ""BRAVO-Toolkit $packageVersion"".")
+    }
+}
+
 $archiveCommit = (& git -C $repositoryRoot rev-parse ("{0}^{{commit}}" -f $Ref)).Trim()
 if ($LASTEXITCODE -ne 0 -or $archiveCommit -notmatch '^[0-9a-f]{40}$') {
     throw "Не вдалося розв'язати ref '$Ref' у commit."
@@ -161,6 +177,23 @@ $stagedVersion = Get-Content -LiteralPath (Join-Path $stagingDir 'VERSION.json')
 if ([string]$stagedVersion.packageVersion -ne $packageVersion) {
     throw "packageVersion у розпакованому комплекті ('$($stagedVersion.packageVersion)') не збігається з '$packageVersion'."
 }
+
+# --- 3-pre. Гейт AGENT_FILES_IN_ARTIFACT: у продуктовому комплекті немає ---
+#     файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json) ---
+#
+# Перевірка на РЕАЛЬНОМУ розпакованому дереві (режим файлової системи, разом
+# із порожніми й прихованими каталогами); політика - єдина канонічна
+# реалізація в ci\BRAVOAgentFilePolicy.ps1, її ж застосовує self-test
+# Governance/NoAgentFilesInTree.*. Стоїть ДО перевірки манифестів і запису
+# release-manifest.json: артефакт із такими файлами не публікується.
+. (Join-Path $PSScriptRoot 'BRAVOAgentFilePolicy.ps1')
+$agentFileViolations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $stagingDir))
+if ($agentFileViolations.Count -gt 0) {
+    throw ("AGENT_FILES_IN_ARTIFACT: у комплекті артефакту знайдено файли/каталоги AI-агентів (" + $agentFileViolations.Count + "): " +
+        ([string]::Join(', ', ($agentFileViolations | Select-Object -First 10))) +
+        ". Продуктове дерево не повинно містити .claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json - приберіть їх з git-індексу ref '$Ref'.")
+}
+Write-Host 'Гейт AGENT_FILES_IN_ARTIFACT (AI-агенти): у staged-комплекті немає файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json).'
 
 Push-Location $stagingDir
 try {

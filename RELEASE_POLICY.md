@@ -1019,7 +1019,7 @@ branch protection зіставляє required checks за ІМЕНЕМ, і пі�
 | rulesets гілки (`GET /rules/branches/{b}`) | немає (`[]`) | немає (`[]`) |
 | required status checks | 6, перелік нижче | немає (`contexts: []`) |
 | `Config parity (BRAVO_CONFIG_LOADER)` серед required | ні | ні |
-| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен сесії не має `administration=read`) | відсутні — protection немає |
+| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен перевірки не має `administration=read`) | відсутні — protection немає |
 
 Required checks `master` за live-відповіддю
 (`protection.required_status_checks`, `enforcement_level: everyone`) —
@@ -1040,7 +1040,7 @@ ruleset (чи існував захист 2026-08-26 і був згодом зн
 встановити не можна — важливий поточний стан). Отже зараз
 **ніщо технічно не блокує merge у `developer` з червоним CI** — зелений
 CI там тримається лише дисципліною. Для `master` ті самі `strict` і
-`enforce_admins` з цієї сесії не перевірювані (HTTP 403), тож їх не
+`enforce_admins` цим токеном не перевірювані (HTTP 403), тож їх не
 записано ані як увімкнені, ані як вимкнені. Створення захисту
 `developer` — дія власника, §13.4.
 
@@ -1075,8 +1075,8 @@ CI там тримається лише дисципліною. Для `master` 
 
 ### 13.4. OWNER ACTION REQUIRED: захист `developer`
 
-Статус: **не застосовано** (live 2026-09-30, §13.3). Автоматична сесія
-цього зробити не може: токен інтеграції не має дозволу Administration
+Статус: **не застосовано** (live 2026-09-30, §13.3). Токеном без
+дозволу Administration цього зробити не можна
 (`GET`/`PUT .../branches/{b}/protection` → HTTP 403), тож дію виконує
 власник — у GitHub UI або через `gh` під власним обліковим записом.
 
@@ -1160,13 +1160,12 @@ curl -sS https://api.github.com/repos/<owner>/BRAVO-Toolkit/branches/developer
 
 Очікувано `protected: true` і рівно сім імен у
 `protection.required_status_checks.contexts`. Лише тоді оновлюються
-таблиця live-стану в §13.3 (з датою), абзац про `Config parity` і
-`.claude/PROJECT_STATE.md`.
+таблиця live-стану в §13.3 (з датою) і абзац про `Config parity`.
 
 **Необов'язкове рішення власника: `Config parity` на `master`.** Не
 застосовано й не є частиною обов'язкової дії вище. Якщо власник вирішить
 додати перевірку й на `master`, змінювати треба **лише** перелік
-required checks, не чіпаючи налаштувань, яких сесія не бачить (`strict`,
+required checks, не чіпаючи налаштувань, яких токен без admin-прав не бачить (`strict`,
 `enforce_admins`, вимога PR). Спершу зберегти поточний стан
 (`gh api repos/<owner>/BRAVO-Toolkit/branches/master/protection`), потім:
 
@@ -1396,11 +1395,18 @@ vX.Y.Z
 v4.5.0
 ```
 
-Теги повинні бути анотованими:
+Усі релізні теги (dev, RC, stable) повинні бути анотованими:
 
 ```bash
 git tag -a v4.5.0 -m "BRAVO-Toolkit 4.5.0"
 ```
+
+GitHub ruleset тип тега не перевіряє, тому вимогу стереже
+`ci\New-BRAVOReleaseArtifact.ps1`: з `-ExpectedTag` (так його викликає
+`release-artifact.yml`) збирання lightweight-тега падає з маркером
+`RELEASE_TAG_NOT_ANNOTATED`, і Release не створюється. Виправити такий тег
+не можна (16.2) — випускається наступна версія. Lightweight-теги, що вже є
+в історії (`v5.2.1-rc.9`, `v5.2.5-rc.1`…`v5.2.5-rc.4`), лишаються як є.
 
 Перезапис опублікованих тегів заборонений.
 
@@ -1734,10 +1740,10 @@ Compare-FileSizes-фікси з локальної незапушеної гіл
 (зміст уже в developer іншими комітами).
 
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
-(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS
+(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО HOST-11
 acceptance того ж дня (evidence
-`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md`, гілка
-`evidence/219c55b-rc4-devlims-acceptance-pass`). Шлях циклу:
+`docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md`, гілка
+`evidence/219c55b-rc4-host11-acceptance-pass`). Шлях циклу:
 rc.1 (інвалідовано фічею DATA_RESTORE) → rc.2 (acceptance PASS, але
 промоцію скасовано: виявлено відсутність порту severity-routing
 PR #39) → rc.3 (порт routing; на acceptance виявлено, що DataRestore
@@ -1793,10 +1799,10 @@ required checks гілки master, merge PR #61 виконано admin-обхо�
   став тонким адаптером над канонічною `Get-BRAVOSevenZipArchiveEntries`;
   гейт `Secrets/SevenZipPasswordUsesStdin` розширено на DataRestore.)*
 
-### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
+### Функціональна зміна дефолту під час HOST-11 acceptance `5.2.0-rc.1`
 
 - **`RepeatAlertAfterHours` (health-alert дедуп): дефолт `6` → `0`.**
-  Виявлено під час реального DEV-LIMS acceptance (ЛАБОРАТОРІЯ-6,
+  Виявлено під час реального HOST-11 acceptance (ЛАБОРАТОРІЯ-6,
   2026-08-23): при увімкненому `AutoArchiveMutationThreshold` оператор
   спостерігав лише перше сповіщення про `MUTATION_VIOLATION`, повторний
   ідентичний alert протягом наступних до 6 год. мовчав
