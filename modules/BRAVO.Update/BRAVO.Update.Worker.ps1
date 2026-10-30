@@ -125,6 +125,25 @@ function Test-BRAVOUpdateWorkerSamePath {
     }
 }
 
+function Get-BRAVOUpdateWorkerDefaultCandidate {
+    # Типові кандидати discovery: default RuntimeRoot + каталог toolkit, з якого запущено CLI,
+    # ЛИШЕ якщо він має ознаки справжнього встановлення (BRAVO.local.config / BRAVO.config).
+    # Розпакований релізний комплект має VERSION.json і RUNTIME_MANIFEST.json, але не є
+    # встановленням: інакше на чистому сервері Install цілився б у сам комплект, а GUI ніколи
+    # не показував би NotInstalled. Нетипові встановлення знаходяться через задачі планувальника
+    # (-IncludeScheduler) або явний -RuntimeRoot.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Paths)
+    $list = New-Object System.Collections.Generic.List[string]
+    $list.Add([string]$Paths.RuntimeRoot)
+    $toolkit = [string]$script:BRAVOUpdateToolkitRoot
+    if (-not [string]::IsNullOrWhiteSpace($toolkit)) {
+        $hasEvidence = ([System.IO.File]::Exists((Join-Path $toolkit 'BRAVO.local.config')) -or [System.IO.File]::Exists((Join-Path $toolkit 'BRAVO.config')))
+        if ($hasEvidence) { $list.Add($toolkit) }
+    }
+    return $list.ToArray()
+}
+
 function Test-BRAVOUpdateWorkerPlanHasSelfTest {
     # $true, якщо підтверджений план передбачає self-test (plan.tests.planned містить SelfTest).
     [CmdletBinding()]
@@ -691,7 +710,7 @@ function Invoke-BRAVOUpdateWorker {
         # runtime + корінь toolkit; задачі планувальника додає -IncludeScheduler. Запитаний root усе
         # одно мусить бути ЗНАЙДЕНИМ встановленням (запиту не вірять).
         $candidates = @($CandidateRoots)
-        if ($candidates.Count -eq 0) { $candidates = @([string]$Paths.RuntimeRoot, [string]$script:BRAVOUpdateToolkitRoot) }
+        if ($candidates.Count -eq 0) { $candidates = @(Get-BRAVOUpdateWorkerDefaultCandidate -Paths $Paths) }
         try {
             $installationState = Get-BRAVOInstallationState -CandidateRoots $candidates -StateRoot $stateRoot -VersionStatePath ([string]$Paths.VersionStatePath) `
                 -OperationLockPath ([string]$Paths.OperationLockPath) -LockRoot ([string]$Paths.LockRoot) -Adapter $Adapter -IncludeScheduler
@@ -1384,7 +1403,7 @@ function Invoke-BRAVOUpdateCliAction {
     if ($null -eq $isAdmin) { $isAdmin = Test-BRAVOUpdateWorkerIsAdministrator }
     $isAdmin = [bool]$isAdmin
     # Без явних кандидатів: типовий runtime + корінь toolkit (entrypoint кандидатів не задає); задачі планувальника додає -IncludeScheduler.
-    if (@($CandidateRoots).Count -eq 0) { $CandidateRoots = @([string]$Paths.RuntimeRoot, [string]$script:BRAVOUpdateToolkitRoot) }
+    if (@($CandidateRoots).Count -eq 0) { $CandidateRoots = @(Get-BRAVOUpdateWorkerDefaultCandidate -Paths $Paths) }
 
     $done = {
         param([int]$Code, $Result)
