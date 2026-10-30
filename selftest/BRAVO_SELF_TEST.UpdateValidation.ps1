@@ -341,8 +341,13 @@ try {
         New-Item -ItemType Directory -Path $childDir -Force | Out-Null
         $childScript = Join-Path $childDir 'e4-child.ps1'
         $childLines = @(
-            'param([string]$Mode)',
+            'param([string]$Mode, [string]$PidFile)',
             'if ($Mode -eq ''Sleep'') { Start-Sleep -Seconds 60; exit 0 }',
+            'if ($Mode -eq ''Spawn'') {',
+            '    $grandchild = Start-Process -FilePath ''powershell.exe'' -ArgumentList @(''-NoProfile'', ''-Command'', ''Start-Sleep -Seconds 90'') -WindowStyle Hidden -PassThru',
+            '    [IO.File]::WriteAllText($PidFile, [string]$grandchild.Id)',
+            '    Start-Sleep -Seconds 90; exit 0',
+            '}',
             'Write-Output ''CHILD-OUTPUT-START''',
             'Write-Output ''password=HunterFakeSecret42 token=FAKEtokenValue123456''',
             '[Console]::Error.WriteLine(''stderr password=HunterFakeSecret42'')',
@@ -371,6 +376,22 @@ try {
         Test-BRAVOCondition -Condition ($slow.TimedOut -and $slow.ExitCode -eq -1 -and $watch.Elapsed.TotalSeconds -lt 40) `
             -Name 'UpdateValidation/ChildTimeoutStopsOwnProcess' -Failure "TimedOut=$($slow.TimedOut) Exit=$($slow.ExitCode) elapsed=$($watch.Elapsed.TotalSeconds)"
         Test-BRAVOCondition -Condition (Test-Path -LiteralPath (Join-Path $childDir 'logs\timeout.log')) -Name 'UpdateValidation/ChildTimeoutLogWritten' -Failure 'лог таймауту не записано'
+        Test-BRAVOCondition -Condition ($slow.PSObject.Properties['TreeNotContained'] -and -not $slow.TreeNotContained -and $run.PSObject.Properties['TreeNotContained'] -and -not $run.TreeNotContained) `
+            -Name 'UpdateValidation/ChildTreeNotContainedFalseWhenContained' -Failure 'TreeNotContained має бути $false, коли дерево завершено/нормальний вихід'
+
+        # Дерево: дитина породжує онука-«сплячого»; таймаут має прибрати ОБОХ (Job Object).
+        $pidFile = Join-Path $childDir 'grandchild.pid'
+        $tree = Invoke-BRAVOValTestCall -Name 'Invoke-BRAVOUpdateChildProcess' -Params @{
+            ScriptPath = $childScript; ScriptArgument = @('-Mode', 'Spawn', '-PidFile', $pidFile); TimeoutSeconds = 12
+        }
+        $grandchildId = 0
+        if (Test-Path -LiteralPath $pidFile) { $grandchildId = [int][IO.File]::ReadAllText($pidFile) }
+        Test-BRAVOCondition -Condition ($tree.TimedOut -and -not $tree.TreeNotContained -and $grandchildId -gt 0) `
+            -Name 'UpdateValidation/ChildTreeTimedOutAndContained' -Failure "TimedOut=$($tree.TimedOut) TreeNotContained=$($tree.TreeNotContained) grandchildPid=$grandchildId"
+        $stillAlive = $null
+        if ($grandchildId -gt 0) { $stillAlive = Get-Process -Id $grandchildId -ErrorAction SilentlyContinue; if ($null -ne $stillAlive -and $stillAlive.HasExited) { $stillAlive = $null } }
+        Test-BRAVOCondition -Condition ($grandchildId -gt 0 -and $null -eq $stillAlive) `
+            -Name 'UpdateValidation/ChildTreeGrandchildTerminated' -Failure "онук PID $grandchildId досі живий після таймауту"
     }
 
     # --- Статика: прапорці адаптера, RemoteSigned, без Bypass і кілу за ім'ям ---
