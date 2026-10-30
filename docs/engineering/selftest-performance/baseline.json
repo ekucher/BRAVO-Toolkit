@@ -1,0 +1,2596 @@
+{
+    "SchemaVersion":  1,
+    "Purpose":  "OPT-01 baseline of BRAVO SELF_TEST (Full). One run is not a median; aggregates over runs on different SHAs are an indicative range only.",
+    "GeneratedFrom":  "gh run view --log (job logs of ekucher/BRAVO-Toolkit ci.yml, job BRAVO_SELF_TEST.ps1 (push)); local logs from Full runs",
+    "ReferenceSha":  "1c45476c348086bd2d65f9d6e410a47ac347a003",
+    "ExcludedRuns":  [
+                         {
+                             "RunId":  "40594426661",
+                             "Sha":  "27fd69c6c0ecd7238ff92eb1acef7abba328bead",
+                             "Branch":  "master",
+                             "Reason":  "master (5.2.6) has older self-test without timing telemetry (1662 checks, no wall-clock table); not comparable with developer"
+                         }
+                     ],
+    "CiRuns":  [
+                   {
+                       "Source":  "github-actions",
+                       "RunId":  "40786219425",
+                       "JobId":  "123159952758",
+                       "Sha":  "1c45476c348086bd2d65f9d6e410a47ac347a003",
+                       "Branch":  "developer",
+                       "Event":  "push",
+                       "Role":  "reference",
+                       "JobStartUtc":  "2026-10-28T23:16:49Z",
+                       "JobEndUtc":  "2026-10-28T23:35:23Z",
+                       "RunnerImage":  "windows-2025-vs2026 20261021.278.1",
+                       "RunnerProvisioner":  "20261021.618",
+                       "Runner":  "GitHub-hosted windows-latest",
+                       "TotalWallClockSeconds":  1092.459,
+                       "Checks":  3945,
+                       "Failures":  0,
+                       "Passed":  true,
+                       "SumOfSuites":  {
+                                           "Seconds":  1090,
+                                           "Tests":  3945
+                                       },
+                       "Suites":  [
+                                      {
+                                          "Suite":  "Root (inline)",
+                                          "Tests":  1578,
+                                          "Seconds":  273.8
+                                      },
+                                      {
+                                          "Suite":  "Phase0",
+                                          "Tests":  9,
+                                          "Seconds":  0.1
+                                      },
+                                      {
+                                          "Suite":  "Governance",
+                                          "Tests":  235,
+                                          "Seconds":  100
+                                      },
+                                      {
+                                          "Suite":  "DataRestore",
+                                          "Tests":  157,
+                                          "Seconds":  21.2
+                                      },
+                                      {
+                                          "Suite":  "ServiceQuiescence",
+                                          "Tests":  65,
+                                          "Seconds":  3.8
+                                      },
+                                      {
+                                          "Suite":  "ServiceRecovery",
+                                          "Tests":  95,
+                                          "Seconds":  18.9
+                                      },
+                                      {
+                                          "Suite":  "ManifestStorage",
+                                          "Tests":  62,
+                                          "Seconds":  3.2
+                                      },
+                                      {
+                                          "Suite":  "Paths",
+                                          "Tests":  16,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogRotation",
+                                          "Tests":  96,
+                                          "Seconds":  1.4
+                                      },
+                                      {
+                                          "Suite":  "ConsoleUX",
+                                          "Tests":  39,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "Archive",
+                                          "Tests":  133,
+                                          "Seconds":  47.8
+                                      },
+                                      {
+                                          "Suite":  "BackupScope",
+                                          "Tests":  54,
+                                          "Seconds":  1
+                                      },
+                                      {
+                                          "Suite":  "BackupDestinations",
+                                          "Tests":  55,
+                                          "Seconds":  196
+                                      },
+                                      {
+                                          "Suite":  "SftpCredentialsRequired",
+                                          "Tests":  9,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogSync",
+                                          "Tests":  8,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceOwnLog",
+                                          "Tests":  47,
+                                          "Seconds":  9.9
+                                      },
+                                      {
+                                          "Suite":  "BazaSync",
+                                          "Tests":  222,
+                                          "Seconds":  9.3
+                                      },
+                                      {
+                                          "Suite":  "ClientGate",
+                                          "Tests":  17,
+                                          "Seconds":  0.5
+                                      },
+                                      {
+                                          "Suite":  "Operations",
+                                          "Tests":  79,
+                                          "Seconds":  6
+                                      },
+                                      {
+                                          "Suite":  "TraceArchive",
+                                          "Tests":  73,
+                                          "Seconds":  6.6
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceRepair",
+                                          "Tests":  113,
+                                          "Seconds":  7.6
+                                      },
+                                      {
+                                          "Suite":  "RestoreSynthetic",
+                                          "Tests":  15,
+                                          "Seconds":  5.2
+                                      },
+                                      {
+                                          "Suite":  "RestoreVerify",
+                                          "Tests":  8,
+                                          "Seconds":  2.1
+                                      },
+                                      {
+                                          "Suite":  "Status",
+                                          "Tests":  9,
+                                          "Seconds":  0.3
+                                      },
+                                      {
+                                          "Suite":  "ConfigLoader",
+                                          "Tests":  127,
+                                          "Seconds":  92.4
+                                      },
+                                      {
+                                          "Suite":  "Configuration",
+                                          "Tests":  222,
+                                          "Seconds":  5.8
+                                      },
+                                      {
+                                          "Suite":  "ConfigIntent",
+                                          "Tests":  48,
+                                          "Seconds":  9.1
+                                      },
+                                      {
+                                          "Suite":  "Configurator",
+                                          "Tests":  229,
+                                          "Seconds":  263.9
+                                      },
+                                      {
+                                          "Suite":  "ConfiguratorUI",
+                                          "Tests":  50,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "DiskSpace",
+                                          "Tests":  38,
+                                          "Seconds":  0.7
+                                      },
+                                      {
+                                          "Suite":  "ArchiveDiskSpace",
+                                          "Tests":  20,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceDiskSpace",
+                                          "Tests":  17,
+                                          "Seconds":  0.5
+                                      }
+                                  ],
+                       "TopIntervals":  [
+                                            {
+                                                "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  40.5
+                                            },
+                                            {
+                                                "Assertion":  "Documentation/RelativeLinksResolve",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  29.1
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  24.2
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  22.4
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  22
+                                            },
+                                            {
+                                                "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  19.2
+                                            },
+                                            {
+                                                "Assertion":  "Archive/501/S15LargeVolumeCountsAndCappedSummary",
+                                                "Suite":  "Archive",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.1
+                                            },
+                                            {
+                                                "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  16.1
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  15.5
+                                            },
+                                            {
+                                                "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                "Suite":  "ServiceRecovery",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.7
+                                            },
+                                            {
+                                                "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "DataRestore",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.7
+                                            },
+                                            {
+                                                "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.4
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.9
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerBundleWithoutDestinationFunctionsKeepsDeveloperBehaviour",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.9
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRetryAfterRefusalSucceeds",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.9
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.5
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.5
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.5
+                                            },
+                                            {
+                                                "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.3
+                                            },
+                                            {
+                                                "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                "Suite":  "Configurator",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  8.6
+                                            }
+                                        ]
+                   },
+                   {
+                       "Source":  "github-actions",
+                       "RunId":  "40775282314",
+                       "JobId":  "123122866012",
+                       "Sha":  "8d99ae302b86c06d1b750b31bb762e9f9bb8baef",
+                       "Branch":  "developer",
+                       "Event":  "push",
+                       "Role":  "neighbour",
+                       "JobStartUtc":  "2026-10-28T21:50:50Z",
+                       "JobEndUtc":  "2026-10-28T22:13:12Z",
+                       "RunnerImage":  "windows-2025-vs2026 20261021.278.1",
+                       "RunnerProvisioner":  "20261021.618",
+                       "Runner":  "GitHub-hosted windows-latest",
+                       "TotalWallClockSeconds":  1322.542,
+                       "Checks":  3944,
+                       "Failures":  0,
+                       "Passed":  true,
+                       "SumOfSuites":  {
+                                           "Seconds":  1320.4,
+                                           "Tests":  3944
+                                       },
+                       "Suites":  [
+                                      {
+                                          "Suite":  "Root (inline)",
+                                          "Tests":  1578,
+                                          "Seconds":  341.8
+                                      },
+                                      {
+                                          "Suite":  "Phase0",
+                                          "Tests":  9,
+                                          "Seconds":  0.1
+                                      },
+                                      {
+                                          "Suite":  "Governance",
+                                          "Tests":  235,
+                                          "Seconds":  132.8
+                                      },
+                                      {
+                                          "Suite":  "DataRestore",
+                                          "Tests":  157,
+                                          "Seconds":  28
+                                      },
+                                      {
+                                          "Suite":  "ServiceQuiescence",
+                                          "Tests":  64,
+                                          "Seconds":  4.6
+                                      },
+                                      {
+                                          "Suite":  "ServiceRecovery",
+                                          "Tests":  95,
+                                          "Seconds":  22.4
+                                      },
+                                      {
+                                          "Suite":  "ManifestStorage",
+                                          "Tests":  62,
+                                          "Seconds":  3.9
+                                      },
+                                      {
+                                          "Suite":  "Paths",
+                                          "Tests":  16,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogRotation",
+                                          "Tests":  96,
+                                          "Seconds":  2.2
+                                      },
+                                      {
+                                          "Suite":  "ConsoleUX",
+                                          "Tests":  39,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "Archive",
+                                          "Tests":  133,
+                                          "Seconds":  52.7
+                                      },
+                                      {
+                                          "Suite":  "BackupScope",
+                                          "Tests":  54,
+                                          "Seconds":  1.4
+                                      },
+                                      {
+                                          "Suite":  "BackupDestinations",
+                                          "Tests":  55,
+                                          "Seconds":  201.2
+                                      },
+                                      {
+                                          "Suite":  "SftpCredentialsRequired",
+                                          "Tests":  9,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogSync",
+                                          "Tests":  8,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceOwnLog",
+                                          "Tests":  47,
+                                          "Seconds":  12.3
+                                      },
+                                      {
+                                          "Suite":  "BazaSync",
+                                          "Tests":  222,
+                                          "Seconds":  12.5
+                                      },
+                                      {
+                                          "Suite":  "ClientGate",
+                                          "Tests":  17,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "Operations",
+                                          "Tests":  79,
+                                          "Seconds":  5.9
+                                      },
+                                      {
+                                          "Suite":  "TraceArchive",
+                                          "Tests":  73,
+                                          "Seconds":  8.2
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceRepair",
+                                          "Tests":  113,
+                                          "Seconds":  7.1
+                                      },
+                                      {
+                                          "Suite":  "RestoreSynthetic",
+                                          "Tests":  15,
+                                          "Seconds":  6
+                                      },
+                                      {
+                                          "Suite":  "RestoreVerify",
+                                          "Tests":  8,
+                                          "Seconds":  2.6
+                                      },
+                                      {
+                                          "Suite":  "Status",
+                                          "Tests":  9,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "ConfigLoader",
+                                          "Tests":  127,
+                                          "Seconds":  114.6
+                                      },
+                                      {
+                                          "Suite":  "Configuration",
+                                          "Tests":  222,
+                                          "Seconds":  7.2
+                                      },
+                                      {
+                                          "Suite":  "ConfigIntent",
+                                          "Tests":  48,
+                                          "Seconds":  11.1
+                                      },
+                                      {
+                                          "Suite":  "Configurator",
+                                          "Tests":  229,
+                                          "Seconds":  335.7
+                                      },
+                                      {
+                                          "Suite":  "ConfiguratorUI",
+                                          "Tests":  50,
+                                          "Seconds":  0.9
+                                      },
+                                      {
+                                          "Suite":  "DiskSpace",
+                                          "Tests":  38,
+                                          "Seconds":  1
+                                      },
+                                      {
+                                          "Suite":  "ArchiveDiskSpace",
+                                          "Tests":  20,
+                                          "Seconds":  1
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceDiskSpace",
+                                          "Tests":  17,
+                                          "Seconds":  0.8
+                                      }
+                                  ],
+                       "TopIntervals":  [
+                                            {
+                                                "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  50.6
+                                            },
+                                            {
+                                                "Assertion":  "Documentation/RelativeLinksResolve",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  40.4
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  29.8
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  25.1
+                                            },
+                                            {
+                                                "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  23.5
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  20.6
+                                            },
+                                            {
+                                                "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  20.2
+                                            },
+                                            {
+                                                "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "DataRestore",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  19.3
+                                            },
+                                            {
+                                                "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  18.6
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  16.8
+                                            },
+                                            {
+                                                "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                "Suite":  "ServiceRecovery",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  16.8
+                                            },
+                                            {
+                                                "Assertion":  "Archive/501/S15LargeVolumeCountsAndCappedSummary",
+                                                "Suite":  "Archive",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  16.6
+                                            },
+                                            {
+                                                "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.5
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.2
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.5
+                                            },
+                                            {
+                                                "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                "Suite":  "Configurator",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.1
+                                            },
+                                            {
+                                                "Assertion":  "Archive/OrchestrationRunsPhasesInContractOrder",
+                                                "Suite":  "Archive",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.7
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.2
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.2
+                                            },
+                                            {
+                                                "Assertion":  "Credentials/NoDirectTargetsReadOutsideResolver",
+                                                "Suite":  "MaintenanceOwnLog",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.9
+                                            }
+                                        ]
+                   },
+                   {
+                       "Source":  "github-actions",
+                       "RunId":  "40758005115",
+                       "JobId":  "123062008153",
+                       "Sha":  "f0ae2db918124a2723cab39d461e0136d7975612",
+                       "Branch":  "developer",
+                       "Event":  "push",
+                       "Role":  "neighbour",
+                       "JobStartUtc":  "2026-10-28T19:51:13Z",
+                       "JobEndUtc":  "2026-10-28T20:09:43Z",
+                       "RunnerImage":  "windows-2025-vs2026 20261021.278.1",
+                       "RunnerProvisioner":  "20261021.618",
+                       "Runner":  "GitHub-hosted windows-latest",
+                       "TotalWallClockSeconds":  1089.415,
+                       "Checks":  3942,
+                       "Failures":  0,
+                       "Passed":  true,
+                       "SumOfSuites":  {
+                                           "Seconds":  1086.8,
+                                           "Tests":  3942
+                                       },
+                       "Suites":  [
+                                      {
+                                          "Suite":  "Root (inline)",
+                                          "Tests":  1578,
+                                          "Seconds":  276.7
+                                      },
+                                      {
+                                          "Suite":  "Phase0",
+                                          "Tests":  9,
+                                          "Seconds":  0.1
+                                      },
+                                      {
+                                          "Suite":  "Governance",
+                                          "Tests":  233,
+                                          "Seconds":  99.6
+                                      },
+                                      {
+                                          "Suite":  "DataRestore",
+                                          "Tests":  157,
+                                          "Seconds":  25.3
+                                      },
+                                      {
+                                          "Suite":  "ServiceQuiescence",
+                                          "Tests":  64,
+                                          "Seconds":  7.4
+                                      },
+                                      {
+                                          "Suite":  "ServiceRecovery",
+                                          "Tests":  95,
+                                          "Seconds":  18.9
+                                      },
+                                      {
+                                          "Suite":  "ManifestStorage",
+                                          "Tests":  62,
+                                          "Seconds":  3.9
+                                      },
+                                      {
+                                          "Suite":  "Paths",
+                                          "Tests":  16,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogRotation",
+                                          "Tests":  96,
+                                          "Seconds":  1.6
+                                      },
+                                      {
+                                          "Suite":  "ConsoleUX",
+                                          "Tests":  39,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "Archive",
+                                          "Tests":  133,
+                                          "Seconds":  31
+                                      },
+                                      {
+                                          "Suite":  "BackupScope",
+                                          "Tests":  54,
+                                          "Seconds":  2
+                                      },
+                                      {
+                                          "Suite":  "BackupDestinations",
+                                          "Tests":  55,
+                                          "Seconds":  188.4
+                                      },
+                                      {
+                                          "Suite":  "SftpCredentialsRequired",
+                                          "Tests":  9,
+                                          "Seconds":  1.1
+                                      },
+                                      {
+                                          "Suite":  "LogSync",
+                                          "Tests":  8,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceOwnLog",
+                                          "Tests":  47,
+                                          "Seconds":  10.1
+                                      },
+                                      {
+                                          "Suite":  "BazaSync",
+                                          "Tests":  222,
+                                          "Seconds":  9.9
+                                      },
+                                      {
+                                          "Suite":  "ClientGate",
+                                          "Tests":  17,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "Operations",
+                                          "Tests":  79,
+                                          "Seconds":  6.2
+                                      },
+                                      {
+                                          "Suite":  "TraceArchive",
+                                          "Tests":  73,
+                                          "Seconds":  8.2
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceRepair",
+                                          "Tests":  113,
+                                          "Seconds":  7.7
+                                      },
+                                      {
+                                          "Suite":  "RestoreSynthetic",
+                                          "Tests":  15,
+                                          "Seconds":  5.3
+                                      },
+                                      {
+                                          "Suite":  "RestoreVerify",
+                                          "Tests":  8,
+                                          "Seconds":  2.2
+                                      },
+                                      {
+                                          "Suite":  "Status",
+                                          "Tests":  9,
+                                          "Seconds":  0.3
+                                      },
+                                      {
+                                          "Suite":  "ConfigLoader",
+                                          "Tests":  127,
+                                          "Seconds":  94.5
+                                      },
+                                      {
+                                          "Suite":  "Configuration",
+                                          "Tests":  222,
+                                          "Seconds":  5.8
+                                      },
+                                      {
+                                          "Suite":  "ConfigIntent",
+                                          "Tests":  48,
+                                          "Seconds":  9.2
+                                      },
+                                      {
+                                          "Suite":  "Configurator",
+                                          "Tests":  229,
+                                          "Seconds":  267
+                                      },
+                                      {
+                                          "Suite":  "ConfiguratorUI",
+                                          "Tests":  50,
+                                          "Seconds":  0.6
+                                      },
+                                      {
+                                          "Suite":  "DiskSpace",
+                                          "Tests":  38,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "ArchiveDiskSpace",
+                                          "Tests":  20,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceDiskSpace",
+                                          "Tests":  17,
+                                          "Seconds":  0.6
+                                      }
+                                  ],
+                       "TopIntervals":  [
+                                            {
+                                                "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  42
+                                            },
+                                            {
+                                                "Assertion":  "Documentation/RelativeLinksResolve",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  29
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  23.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  20.3
+                                            },
+                                            {
+                                                "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  19.1
+                                            },
+                                            {
+                                                "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "DataRestore",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.6
+                                            },
+                                            {
+                                                "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  16.9
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  15.5
+                                            },
+                                            {
+                                                "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                "Suite":  "ServiceRecovery",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  14.5
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerNeverOverwritesSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  14.1
+                                            },
+                                            {
+                                                "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.9
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13.4
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.4
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.2
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesSiteConfigWithoutBazaLocalChannel",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.4
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.4
+                                            },
+                                            {
+                                                "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  9.3
+                                            },
+                                            {
+                                                "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                "Suite":  "Configurator",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  8.8
+                                            },
+                                            {
+                                                "Assertion":  "Archive/501/S15LargeVolumeCountsAndCappedSummary",
+                                                "Suite":  "Archive",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  8.5
+                                            }
+                                        ]
+                   },
+                   {
+                       "Source":  "github-actions",
+                       "RunId":  "40609912681",
+                       "JobId":  "122558664925",
+                       "Sha":  "29d7d0ee7717d9143f440403e7119fe1d1e678d4",
+                       "Branch":  "developer",
+                       "Event":  "push",
+                       "Role":  "neighbour",
+                       "JobStartUtc":  "2026-10-28T00:37:18Z",
+                       "JobEndUtc":  "2026-10-28T01:01:14Z",
+                       "RunnerImage":  "windows-2025-vs2026 20261021.278.1",
+                       "RunnerProvisioner":  "20261021.618",
+                       "Runner":  "GitHub-hosted windows-latest",
+                       "TotalWallClockSeconds":  1415.799,
+                       "Checks":  3938,
+                       "Failures":  0,
+                       "Passed":  true,
+                       "SumOfSuites":  {
+                                           "Seconds":  1413.5,
+                                           "Tests":  3938
+                                       },
+                       "Suites":  [
+                                      {
+                                          "Suite":  "Root (inline)",
+                                          "Tests":  1578,
+                                          "Seconds":  355.9
+                                      },
+                                      {
+                                          "Suite":  "Phase0",
+                                          "Tests":  9,
+                                          "Seconds":  0.1
+                                      },
+                                      {
+                                          "Suite":  "Governance",
+                                          "Tests":  229,
+                                          "Seconds":  139.9
+                                      },
+                                      {
+                                          "Suite":  "DataRestore",
+                                          "Tests":  157,
+                                          "Seconds":  25.9
+                                      },
+                                      {
+                                          "Suite":  "ServiceQuiescence",
+                                          "Tests":  64,
+                                          "Seconds":  4.8
+                                      },
+                                      {
+                                          "Suite":  "ServiceRecovery",
+                                          "Tests":  95,
+                                          "Seconds":  23.9
+                                      },
+                                      {
+                                          "Suite":  "ManifestStorage",
+                                          "Tests":  62,
+                                          "Seconds":  4.9
+                                      },
+                                      {
+                                          "Suite":  "Paths",
+                                          "Tests":  16,
+                                          "Seconds":  0.3
+                                      },
+                                      {
+                                          "Suite":  "LogRotation",
+                                          "Tests":  96,
+                                          "Seconds":  2
+                                      },
+                                      {
+                                          "Suite":  "ConsoleUX",
+                                          "Tests":  39,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "Archive",
+                                          "Tests":  133,
+                                          "Seconds":  37
+                                      },
+                                      {
+                                          "Suite":  "BackupScope",
+                                          "Tests":  54,
+                                          "Seconds":  1.9
+                                      },
+                                      {
+                                          "Suite":  "BackupDestinations",
+                                          "Tests":  55,
+                                          "Seconds":  225.9
+                                      },
+                                      {
+                                          "Suite":  "SftpCredentialsRequired",
+                                          "Tests":  9,
+                                          "Seconds":  1.3
+                                      },
+                                      {
+                                          "Suite":  "LogSync",
+                                          "Tests":  8,
+                                          "Seconds":  0.5
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceOwnLog",
+                                          "Tests":  47,
+                                          "Seconds":  15.7
+                                      },
+                                      {
+                                          "Suite":  "BazaSync",
+                                          "Tests":  222,
+                                          "Seconds":  12.6
+                                      },
+                                      {
+                                          "Suite":  "ClientGate",
+                                          "Tests":  17,
+                                          "Seconds":  0.7
+                                      },
+                                      {
+                                          "Suite":  "Operations",
+                                          "Tests":  79,
+                                          "Seconds":  6.8
+                                      },
+                                      {
+                                          "Suite":  "TraceArchive",
+                                          "Tests":  73,
+                                          "Seconds":  8.9
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceRepair",
+                                          "Tests":  113,
+                                          "Seconds":  8.8
+                                      },
+                                      {
+                                          "Suite":  "RestoreSynthetic",
+                                          "Tests":  15,
+                                          "Seconds":  6
+                                      },
+                                      {
+                                          "Suite":  "RestoreVerify",
+                                          "Tests":  8,
+                                          "Seconds":  3
+                                      },
+                                      {
+                                          "Suite":  "Status",
+                                          "Tests":  9,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "ConfigLoader",
+                                          "Tests":  127,
+                                          "Seconds":  128.4
+                                      },
+                                      {
+                                          "Suite":  "Configuration",
+                                          "Tests":  222,
+                                          "Seconds":  8.6
+                                      },
+                                      {
+                                          "Suite":  "ConfigIntent",
+                                          "Tests":  48,
+                                          "Seconds":  12
+                                      },
+                                      {
+                                          "Suite":  "Configurator",
+                                          "Tests":  229,
+                                          "Seconds":  372.4
+                                      },
+                                      {
+                                          "Suite":  "ConfiguratorUI",
+                                          "Tests":  50,
+                                          "Seconds":  0.9
+                                      },
+                                      {
+                                          "Suite":  "DiskSpace",
+                                          "Tests":  38,
+                                          "Seconds":  1.1
+                                      },
+                                      {
+                                          "Suite":  "ArchiveDiskSpace",
+                                          "Tests":  20,
+                                          "Seconds":  1.2
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceDiskSpace",
+                                          "Tests":  17,
+                                          "Seconds":  0.8
+                                      }
+                                  ],
+                       "TopIntervals":  [
+                                            {
+                                                "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  59.2
+                                            },
+                                            {
+                                                "Assertion":  "Documentation/RelativeLinksResolve",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  46.7
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  27.6
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  27.4
+                                            },
+                                            {
+                                                "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  23.8
+                                            },
+                                            {
+                                                "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  22.2
+                                            },
+                                            {
+                                                "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  21.2
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  18.9
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  18.8
+                                            },
+                                            {
+                                                "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                "Suite":  "ServiceRecovery",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.6
+                                            },
+                                            {
+                                                "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "DataRestore",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.2
+                                            },
+                                            {
+                                                "Assertion":  "Credentials/NoDirectTargetsReadOutsideResolver",
+                                                "Suite":  "MaintenanceOwnLog",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  13
+                                            },
+                                            {
+                                                "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.9
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.8
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.6
+                                            },
+                                            {
+                                                "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                "Suite":  "Configurator",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/EveryOutboundChannelGatedByStorageEffective",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.3
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerNeverOverwritesSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.7
+                                            }
+                                        ]
+                   },
+                   {
+                       "Source":  "github-actions",
+                       "RunId":  "40588513317",
+                       "JobId":  "122486300693",
+                       "Sha":  "bdd78a513f0737345051109c4dadd9ba529c1719",
+                       "Branch":  "developer",
+                       "Event":  "push",
+                       "Role":  "neighbour",
+                       "JobStartUtc":  "2026-10-27T21:39:03Z",
+                       "JobEndUtc":  "2026-10-27T22:02:44Z",
+                       "RunnerImage":  "windows-2025-vs2026 20261021.278.1",
+                       "RunnerProvisioner":  "20261021.618",
+                       "Runner":  "GitHub-hosted windows-latest",
+                       "TotalWallClockSeconds":  1398.216,
+                       "Checks":  3932,
+                       "Failures":  0,
+                       "Passed":  true,
+                       "SumOfSuites":  {
+                                           "Seconds":  1395.9,
+                                           "Tests":  3932
+                                       },
+                       "Suites":  [
+                                      {
+                                          "Suite":  "Root (inline)",
+                                          "Tests":  1578,
+                                          "Seconds":  347.8
+                                      },
+                                      {
+                                          "Suite":  "Phase0",
+                                          "Tests":  9,
+                                          "Seconds":  0.1
+                                      },
+                                      {
+                                          "Suite":  "Governance",
+                                          "Tests":  223,
+                                          "Seconds":  131.5
+                                      },
+                                      {
+                                          "Suite":  "DataRestore",
+                                          "Tests":  157,
+                                          "Seconds":  26
+                                      },
+                                      {
+                                          "Suite":  "ServiceQuiescence",
+                                          "Tests":  64,
+                                          "Seconds":  4.7
+                                      },
+                                      {
+                                          "Suite":  "ServiceRecovery",
+                                          "Tests":  95,
+                                          "Seconds":  23.1
+                                      },
+                                      {
+                                          "Suite":  "ManifestStorage",
+                                          "Tests":  62,
+                                          "Seconds":  4.1
+                                      },
+                                      {
+                                          "Suite":  "Paths",
+                                          "Tests":  16,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogRotation",
+                                          "Tests":  96,
+                                          "Seconds":  2
+                                      },
+                                      {
+                                          "Suite":  "ConsoleUX",
+                                          "Tests":  39,
+                                          "Seconds":  0.8
+                                      },
+                                      {
+                                          "Suite":  "Archive",
+                                          "Tests":  133,
+                                          "Seconds":  39
+                                      },
+                                      {
+                                          "Suite":  "BackupScope",
+                                          "Tests":  54,
+                                          "Seconds":  1.4
+                                      },
+                                      {
+                                          "Suite":  "BackupDestinations",
+                                          "Tests":  55,
+                                          "Seconds":  240.1
+                                      },
+                                      {
+                                          "Suite":  "SftpCredentialsRequired",
+                                          "Tests":  9,
+                                          "Seconds":  0.2
+                                      },
+                                      {
+                                          "Suite":  "LogSync",
+                                          "Tests":  8,
+                                          "Seconds":  0.5
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceOwnLog",
+                                          "Tests":  47,
+                                          "Seconds":  15.3
+                                      },
+                                      {
+                                          "Suite":  "BazaSync",
+                                          "Tests":  222,
+                                          "Seconds":  12.5
+                                      },
+                                      {
+                                          "Suite":  "ClientGate",
+                                          "Tests":  17,
+                                          "Seconds":  0.7
+                                      },
+                                      {
+                                          "Suite":  "Operations",
+                                          "Tests":  79,
+                                          "Seconds":  6.6
+                                      },
+                                      {
+                                          "Suite":  "TraceArchive",
+                                          "Tests":  73,
+                                          "Seconds":  8.8
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceRepair",
+                                          "Tests":  113,
+                                          "Seconds":  8.6
+                                      },
+                                      {
+                                          "Suite":  "RestoreSynthetic",
+                                          "Tests":  15,
+                                          "Seconds":  6
+                                      },
+                                      {
+                                          "Suite":  "RestoreVerify",
+                                          "Tests":  8,
+                                          "Seconds":  3
+                                      },
+                                      {
+                                          "Suite":  "Status",
+                                          "Tests":  9,
+                                          "Seconds":  0.4
+                                      },
+                                      {
+                                          "Suite":  "ConfigLoader",
+                                          "Tests":  127,
+                                          "Seconds":  131.2
+                                      },
+                                      {
+                                          "Suite":  "Configuration",
+                                          "Tests":  222,
+                                          "Seconds":  8.6
+                                      },
+                                      {
+                                          "Suite":  "ConfigIntent",
+                                          "Tests":  48,
+                                          "Seconds":  12.1
+                                      },
+                                      {
+                                          "Suite":  "Configurator",
+                                          "Tests":  229,
+                                          "Seconds":  357
+                                      },
+                                      {
+                                          "Suite":  "ConfiguratorUI",
+                                          "Tests":  50,
+                                          "Seconds":  0.9
+                                      },
+                                      {
+                                          "Suite":  "DiskSpace",
+                                          "Tests":  38,
+                                          "Seconds":  1
+                                      },
+                                      {
+                                          "Suite":  "ArchiveDiskSpace",
+                                          "Tests":  20,
+                                          "Seconds":  1.1
+                                      },
+                                      {
+                                          "Suite":  "MaintenanceDiskSpace",
+                                          "Tests":  17,
+                                          "Seconds":  0.8
+                                      }
+                                  ],
+                       "TopIntervals":  [
+                                            {
+                                                "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  53.8
+                                            },
+                                            {
+                                                "Assertion":  "Documentation/RelativeLinksResolve",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  45.6
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  33.5
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  27.7
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  25.2
+                                            },
+                                            {
+                                                "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  22.1
+                                            },
+                                            {
+                                                "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                "Suite":  "Governance",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  20.6
+                                            },
+                                            {
+                                                "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  20.2
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  18.3
+                                            },
+                                            {
+                                                "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                "Suite":  "DataRestore",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.4
+                                            },
+                                            {
+                                                "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                "Suite":  "ServiceRecovery",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  17.2
+                                            },
+                                            {
+                                                "Assertion":  "Credentials/NoDirectTargetsReadOutsideResolver",
+                                                "Suite":  "MaintenanceOwnLog",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.6
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.5
+                                            },
+                                            {
+                                                "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  12.1
+                                            },
+                                            {
+                                                "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                "Suite":  "Root (inline)",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.7
+                                            },
+                                            {
+                                                "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                "Suite":  "Configurator",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.7
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.5
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  11.1
+                                            },
+                                            {
+                                                "Assertion":  "BackupDestinations/EveryOutboundChannelGatedByStorageEffective",
+                                                "Suite":  "BackupDestinations",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.9
+                                            },
+                                            {
+                                                "Assertion":  "Archive/OrchestrationRunsPhasesInContractOrder",
+                                                "Suite":  "Archive",
+                                                "Result":  "PASS",
+                                                "IntervalSeconds":  10.5
+                                            }
+                                        ]
+                   }
+               ],
+    "CiAggregate":  {
+                        "Runs":  5,
+                        "TotalWallClockSeconds":  {
+                                                      "N":  5,
+                                                      "Median":  1322.5,
+                                                      "Min":  1089.4,
+                                                      "Max":  1415.8
+                                                  },
+                        "Checks":  {
+                                       "N":  5,
+                                       "Median":  3942,
+                                       "Min":  3932,
+                                       "Max":  3945
+                                   },
+                        "SuiteSeconds":  {
+                                             "Root (inline)":  {
+                                                                   "N":  5,
+                                                                   "Median":  341.8,
+                                                                   "Min":  273.8,
+                                                                   "Max":  355.9
+                                                               },
+                                             "Phase0":  {
+                                                            "N":  5,
+                                                            "Median":  0.1,
+                                                            "Min":  0.1,
+                                                            "Max":  0.1
+                                                        },
+                                             "Governance":  {
+                                                                "N":  5,
+                                                                "Median":  131.5,
+                                                                "Min":  99.6,
+                                                                "Max":  139.9
+                                                            },
+                                             "DataRestore":  {
+                                                                 "N":  5,
+                                                                 "Median":  25.9,
+                                                                 "Min":  21.2,
+                                                                 "Max":  28
+                                                             },
+                                             "ServiceQuiescence":  {
+                                                                       "N":  5,
+                                                                       "Median":  4.7,
+                                                                       "Min":  3.8,
+                                                                       "Max":  7.4
+                                                                   },
+                                             "ServiceRecovery":  {
+                                                                     "N":  5,
+                                                                     "Median":  22.4,
+                                                                     "Min":  18.9,
+                                                                     "Max":  23.9
+                                                                 },
+                                             "ManifestStorage":  {
+                                                                     "N":  5,
+                                                                     "Median":  3.9,
+                                                                     "Min":  3.2,
+                                                                     "Max":  4.9
+                                                                 },
+                                             "Paths":  {
+                                                           "N":  5,
+                                                           "Median":  0.2,
+                                                           "Min":  0.2,
+                                                           "Max":  0.3
+                                                       },
+                                             "LogRotation":  {
+                                                                 "N":  5,
+                                                                 "Median":  2,
+                                                                 "Min":  1.4,
+                                                                 "Max":  2.2
+                                                             },
+                                             "ConsoleUX":  {
+                                                               "N":  5,
+                                                               "Median":  0.8,
+                                                               "Min":  0.6,
+                                                               "Max":  0.8
+                                                           },
+                                             "Archive":  {
+                                                             "N":  5,
+                                                             "Median":  39,
+                                                             "Min":  31,
+                                                             "Max":  52.7
+                                                         },
+                                             "BackupScope":  {
+                                                                 "N":  5,
+                                                                 "Median":  1.4,
+                                                                 "Min":  1,
+                                                                 "Max":  2
+                                                             },
+                                             "BackupDestinations":  {
+                                                                        "N":  5,
+                                                                        "Median":  201.2,
+                                                                        "Min":  188.4,
+                                                                        "Max":  240.1
+                                                                    },
+                                             "SftpCredentialsRequired":  {
+                                                                             "N":  5,
+                                                                             "Median":  0.2,
+                                                                             "Min":  0.2,
+                                                                             "Max":  1.3
+                                                                         },
+                                             "LogSync":  {
+                                                             "N":  5,
+                                                             "Median":  0.4,
+                                                             "Min":  0.4,
+                                                             "Max":  0.5
+                                                         },
+                                             "MaintenanceOwnLog":  {
+                                                                       "N":  5,
+                                                                       "Median":  12.3,
+                                                                       "Min":  9.9,
+                                                                       "Max":  15.7
+                                                                   },
+                                             "BazaSync":  {
+                                                              "N":  5,
+                                                              "Median":  12.5,
+                                                              "Min":  9.3,
+                                                              "Max":  12.6
+                                                          },
+                                             "ClientGate":  {
+                                                                "N":  5,
+                                                                "Median":  0.6,
+                                                                "Min":  0.5,
+                                                                "Max":  0.7
+                                                            },
+                                             "Operations":  {
+                                                                "N":  5,
+                                                                "Median":  6.2,
+                                                                "Min":  5.9,
+                                                                "Max":  6.8
+                                                            },
+                                             "TraceArchive":  {
+                                                                  "N":  5,
+                                                                  "Median":  8.2,
+                                                                  "Min":  6.6,
+                                                                  "Max":  8.9
+                                                              },
+                                             "MaintenanceRepair":  {
+                                                                       "N":  5,
+                                                                       "Median":  7.7,
+                                                                       "Min":  7.1,
+                                                                       "Max":  8.8
+                                                                   },
+                                             "RestoreSynthetic":  {
+                                                                      "N":  5,
+                                                                      "Median":  6,
+                                                                      "Min":  5.2,
+                                                                      "Max":  6
+                                                                  },
+                                             "RestoreVerify":  {
+                                                                   "N":  5,
+                                                                   "Median":  2.6,
+                                                                   "Min":  2.1,
+                                                                   "Max":  3
+                                                               },
+                                             "Status":  {
+                                                            "N":  5,
+                                                            "Median":  0.4,
+                                                            "Min":  0.3,
+                                                            "Max":  0.4
+                                                        },
+                                             "ConfigLoader":  {
+                                                                  "N":  5,
+                                                                  "Median":  114.6,
+                                                                  "Min":  92.4,
+                                                                  "Max":  131.2
+                                                              },
+                                             "Configuration":  {
+                                                                   "N":  5,
+                                                                   "Median":  7.2,
+                                                                   "Min":  5.8,
+                                                                   "Max":  8.6
+                                                               },
+                                             "ConfigIntent":  {
+                                                                  "N":  5,
+                                                                  "Median":  11.1,
+                                                                  "Min":  9.1,
+                                                                  "Max":  12.1
+                                                              },
+                                             "Configurator":  {
+                                                                  "N":  5,
+                                                                  "Median":  335.7,
+                                                                  "Min":  263.9,
+                                                                  "Max":  372.4
+                                                              },
+                                             "ConfiguratorUI":  {
+                                                                    "N":  5,
+                                                                    "Median":  0.9,
+                                                                    "Min":  0.6,
+                                                                    "Max":  0.9
+                                                                },
+                                             "DiskSpace":  {
+                                                               "N":  5,
+                                                               "Median":  1,
+                                                               "Min":  0.7,
+                                                               "Max":  1.1
+                                                           },
+                                             "ArchiveDiskSpace":  {
+                                                                      "N":  5,
+                                                                      "Median":  1,
+                                                                      "Min":  0.8,
+                                                                      "Max":  1.2
+                                                                  },
+                                             "MaintenanceDiskSpace":  {
+                                                                          "N":  5,
+                                                                          "Median":  0.8,
+                                                                          "Min":  0.5,
+                                                                          "Max":  0.8
+                                                                      }
+                                         },
+                        "TopIntervalSeconds":  {
+                                                   "Maintenance/OrchestrationScenariosShareOneChildProcess":  {
+                                                                                                                  "N":  5,
+                                                                                                                  "Median":  50.6,
+                                                                                                                  "Min":  40.5,
+                                                                                                                  "Max":  59.2,
+                                                                                                                  "PresentInTop20":  5
+                                                                                                              },
+                                                   "Documentation/RelativeLinksResolve":  {
+                                                                                              "N":  5,
+                                                                                              "Median":  40.4,
+                                                                                              "Min":  29,
+                                                                                              "Max":  46.7,
+                                                                                              "PresentInTop20":  5
+                                                                                          },
+                                                   "Framework/SelectiveSuitesHaveNoCrossSuiteDependency":  {
+                                                                                                               "N":  5,
+                                                                                                               "Median":  27.4,
+                                                                                                               "Min":  23.3,
+                                                                                                               "Max":  29.8,
+                                                                                                               "PresentInTop20":  5
+                                                                                                           },
+                                                   "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy":  {
+                                                                                                                                      "N":  5,
+                                                                                                                                      "Median":  25.1,
+                                                                                                                                      "Min":  20.3,
+                                                                                                                                      "Max":  33.5,
+                                                                                                                                      "PresentInTop20":  5
+                                                                                                                                  },
+                                                   "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig":  {
+                                                                                                                                      "N":  5,
+                                                                                                                                      "Median":  18.8,
+                                                                                                                                      "Min":  13.4,
+                                                                                                                                      "Max":  25.2,
+                                                                                                                                      "PresentInTop20":  5
+                                                                                                                                  },
+                                                   "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget":  {
+                                                                                                                  "N":  5,
+                                                                                                                  "Median":  22.1,
+                                                                                                                  "Min":  19.1,
+                                                                                                                  "Max":  23.8,
+                                                                                                                  "PresentInTop20":  5
+                                                                                                              },
+                                                   "Archive/501/S15LargeVolumeCountsAndCappedSummary":  {
+                                                                                                            "N":  3,
+                                                                                                            "Median":  16.6,
+                                                                                                            "Min":  8.5,
+                                                                                                            "Max":  17.1,
+                                                                                                            "PresentInTop20":  3
+                                                                                                        },
+                                                   "Health/OrchestrationRunsChecksInContractOrder":  {
+                                                                                                         "N":  5,
+                                                                                                         "Median":  20.2,
+                                                                                                         "Min":  16.1,
+                                                                                                         "Max":  21.2,
+                                                                                                         "PresentInTop20":  5
+                                                                                                     },
+                                                   "Framework/SectionBoundariesAreWellFormed":  {
+                                                                                                    "N":  5,
+                                                                                                    "Median":  18.3,
+                                                                                                    "Min":  15.5,
+                                                                                                    "Max":  20.6,
+                                                                                                    "PresentInTop20":  5
+                                                                                                },
+                                                   "ServiceRecovery/CharacterizationProbeAvailable":  {
+                                                                                                          "N":  5,
+                                                                                                          "Median":  16.8,
+                                                                                                          "Min":  13.7,
+                                                                                                          "Max":  17.6,
+                                                                                                          "PresentInTop20":  5
+                                                                                                      },
+                                                   "DataRestore/OrchestrationScenariosShareOneChildProcess":  {
+                                                                                                                  "N":  5,
+                                                                                                                  "Median":  17.4,
+                                                                                                                  "Min":  13.7,
+                                                                                                                  "Max":  19.3,
+                                                                                                                  "PresentInTop20":  5
+                                                                                                              },
+                                                   "Governance/GenericObjectListNeverWrappedInArraySubexpression":  {
+                                                                                                                        "N":  5,
+                                                                                                                        "Median":  18.6,
+                                                                                                                        "Min":  13.4,
+                                                                                                                        "Max":  22.2,
+                                                                                                                        "PresentInTop20":  5
+                                                                                                                    },
+                                                   "BackupDestinations/InstallerRefusesTamperedBundleBeforeImport":  {
+                                                                                                                         "N":  5,
+                                                                                                                         "Median":  11.3,
+                                                                                                                         "Min":  10.2,
+                                                                                                                         "Max":  11.9,
+                                                                                                                         "PresentInTop20":  5
+                                                                                                                     },
+                                                   "BackupDestinations/InstallerBundleWithoutDestinationFunctionsKeepsDeveloperBehaviour":  {
+                                                                                                                                                "N":  1,
+                                                                                                                                                "Median":  10.9,
+                                                                                                                                                "Min":  10.9,
+                                                                                                                                                "Max":  10.9,
+                                                                                                                                                "PresentInTop20":  1
+                                                                                                                                            },
+                                                   "BackupDestinations/InstallerRetryAfterRefusalSucceeds":  {
+                                                                                                                 "N":  1,
+                                                                                                                 "Median":  9.9,
+                                                                                                                 "Min":  9.9,
+                                                                                                                 "Max":  9.9,
+                                                                                                                 "PresentInTop20":  1
+                                                                                                             },
+                                                   "Framework/SectionIsolation.CleanRunPasses":  {
+                                                                                                     "N":  5,
+                                                                                                     "Median":  11.5,
+                                                                                                     "Min":  9.4,
+                                                                                                     "Max":  12.6,
+                                                                                                     "PresentInTop20":  5
+                                                                                                 },
+                                                   "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle":  {
+                                                                                                                      "N":  5,
+                                                                                                                      "Median":  12.2,
+                                                                                                                      "Min":  9.3,
+                                                                                                                      "Max":  12.8,
+                                                                                                                      "PresentInTop20":  5
+                                                                                                                  },
+                                                   "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle":  {
+                                                                                                                       "N":  5,
+                                                                                                                       "Median":  11.1,
+                                                                                                                       "Min":  9.5,
+                                                                                                                       "Max":  12.4,
+                                                                                                                       "PresentInTop20":  5
+                                                                                                                   },
+                                                   "Json/NoCollapsedArrayFromPipeline":  {
+                                                                                             "N":  5,
+                                                                                             "Median":  12.1,
+                                                                                             "Min":  9.3,
+                                                                                             "Max":  13.5,
+                                                                                             "PresentInTop20":  5
+                                                                                         },
+                                                   "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific":  {
+                                                                                                                "N":  5,
+                                                                                                                "Median":  11.1,
+                                                                                                                "Min":  8.6,
+                                                                                                                "Max":  12.3,
+                                                                                                                "PresentInTop20":  5
+                                                                                                            },
+                                                   "Archive/OrchestrationRunsPhasesInContractOrder":  {
+                                                                                                          "N":  2,
+                                                                                                          "Median":  10.6,
+                                                                                                          "Min":  10.5,
+                                                                                                          "Max":  10.7,
+                                                                                                          "PresentInTop20":  2
+                                                                                                      },
+                                                   "Credentials/NoDirectTargetsReadOutsideResolver":  {
+                                                                                                          "N":  3,
+                                                                                                          "Median":  12.6,
+                                                                                                          "Min":  9.9,
+                                                                                                          "Max":  13,
+                                                                                                          "PresentInTop20":  3
+                                                                                                      },
+                                                   "BackupDestinations/InstallerNeverOverwritesSiteConfigFromBundle":  {
+                                                                                                                           "N":  2,
+                                                                                                                           "Median":  12.4,
+                                                                                                                           "Min":  10.7,
+                                                                                                                           "Max":  14.1,
+                                                                                                                           "PresentInTop20":  2
+                                                                                                                       },
+                                                   "BackupDestinations/InstallerRefusesSiteConfigWithoutBazaLocalChannel":  {
+                                                                                                                                "N":  1,
+                                                                                                                                "Median":  9.4,
+                                                                                                                                "Min":  9.4,
+                                                                                                                                "Max":  9.4,
+                                                                                                                                "PresentInTop20":  1
+                                                                                                                            },
+                                                   "BackupDestinations/EveryOutboundChannelGatedByStorageEffective":  {
+                                                                                                                          "N":  2,
+                                                                                                                          "Median":  11.1,
+                                                                                                                          "Min":  10.9,
+                                                                                                                          "Max":  11.3,
+                                                                                                                          "PresentInTop20":  2
+                                                                                                                      }
+                                               }
+                    },
+    "LocalMachine":  {
+                         "Host":  "bravo-agent dev/test VM (hypervisor QEMU Q35)",
+                         "OS":  "Windows Server 2022 Standard Evaluation 10.0.20348",
+                         "PowerShell":  "5.1.20348.5756 (powershell.exe)",
+                         "CLR":  "4.0.30319.42000 (.NET Framework 4.8.4811.0)",
+                         "CPU":  "QEMU Virtual CPU version 2.5+, 16 cores / 16 logical, 3793 MHz",
+                         "RamMB":  32700,
+                         "Disk":  "2 x 160 GB virtual SSD (SAS), NTFS; C: system, D: data; worktrees are on C:",
+                         "DefenderRealTimeProtection":  true,
+                         "DefenderAntivirusEnabled":  true,
+                         "DefenderExclusions":  "not readable (administrator required); no policy was changed"
+                     },
+    "LocalRuns":  [
+                      {
+                          "Source":  "local-vm",
+                          "RunLabel":  "local-run1",
+                          "Sha":  "1c45476c348086bd2d65f9d6e410a47ac347a003",
+                          "Branch":  "developer (detached worktree selftest-baseline)",
+                          "Mode":  "Full, -NoPause",
+                          "TotalWallClockSeconds":  1045.504,
+                          "Checks":  3941,
+                          "Failures":  0,
+                          "Passed":  true,
+                          "SumOfSuites":  {
+                                              "Seconds":  1040.7,
+                                              "Tests":  3941
+                                          },
+                          "Suites":  [
+                                         {
+                                             "Suite":  "Root (inline)",
+                                             "Tests":  1577,
+                                             "Seconds":  304.9
+                                         },
+                                         {
+                                             "Suite":  "Phase0",
+                                             "Tests":  9,
+                                             "Seconds":  0.1
+                                         },
+                                         {
+                                             "Suite":  "Governance",
+                                             "Tests":  235,
+                                             "Seconds":  106.8
+                                         },
+                                         {
+                                             "Suite":  "DataRestore",
+                                             "Tests":  157,
+                                             "Seconds":  27.4
+                                         },
+                                         {
+                                             "Suite":  "ServiceQuiescence",
+                                             "Tests":  65,
+                                             "Seconds":  4.9
+                                         },
+                                         {
+                                             "Suite":  "ServiceRecovery",
+                                             "Tests":  95,
+                                             "Seconds":  21.3
+                                         },
+                                         {
+                                             "Suite":  "ManifestStorage",
+                                             "Tests":  62,
+                                             "Seconds":  4.5
+                                         },
+                                         {
+                                             "Suite":  "Paths",
+                                             "Tests":  16,
+                                             "Seconds":  0.1
+                                         },
+                                         {
+                                             "Suite":  "LogRotation",
+                                             "Tests":  96,
+                                             "Seconds":  1.5
+                                         },
+                                         {
+                                             "Suite":  "ConsoleUX",
+                                             "Tests":  39,
+                                             "Seconds":  0.6
+                                         },
+                                         {
+                                             "Suite":  "Archive",
+                                             "Tests":  133,
+                                             "Seconds":  29.9
+                                         },
+                                         {
+                                             "Suite":  "BackupScope",
+                                             "Tests":  54,
+                                             "Seconds":  1
+                                         },
+                                         {
+                                             "Suite":  "BackupDestinations",
+                                             "Tests":  55,
+                                             "Seconds":  134.8
+                                         },
+                                         {
+                                             "Suite":  "SftpCredentialsRequired",
+                                             "Tests":  9,
+                                             "Seconds":  0.1
+                                         },
+                                         {
+                                             "Suite":  "LogSync",
+                                             "Tests":  8,
+                                             "Seconds":  0.3
+                                         },
+                                         {
+                                             "Suite":  "MaintenanceOwnLog",
+                                             "Tests":  47,
+                                             "Seconds":  8.6
+                                         },
+                                         {
+                                             "Suite":  "BazaSync",
+                                             "Tests":  222,
+                                             "Seconds":  10.4
+                                         },
+                                         {
+                                             "Suite":  "ClientGate",
+                                             "Tests":  17,
+                                             "Seconds":  0.6
+                                         },
+                                         {
+                                             "Suite":  "Operations",
+                                             "Tests":  79,
+                                             "Seconds":  4.2
+                                         },
+                                         {
+                                             "Suite":  "TraceArchive",
+                                             "Tests":  73,
+                                             "Seconds":  11
+                                         },
+                                         {
+                                             "Suite":  "MaintenanceRepair",
+                                             "Tests":  113,
+                                             "Seconds":  5.7
+                                         },
+                                         {
+                                             "Suite":  "RestoreSynthetic",
+                                             "Tests":  15,
+                                             "Seconds":  6.7
+                                         },
+                                         {
+                                             "Suite":  "RestoreVerify",
+                                             "Tests":  8,
+                                             "Seconds":  2
+                                         },
+                                         {
+                                             "Suite":  "Status",
+                                             "Tests":  9,
+                                             "Seconds":  0.3
+                                         },
+                                         {
+                                             "Suite":  "ConfigLoader",
+                                             "Tests":  127,
+                                             "Seconds":  80.7
+                                         },
+                                         {
+                                             "Suite":  "Configuration",
+                                             "Tests":  222,
+                                             "Seconds":  5
+                                         },
+                                         {
+                                             "Suite":  "ConfigIntent",
+                                             "Tests":  45,
+                                             "Seconds":  6
+                                         },
+                                         {
+                                             "Suite":  "Configurator",
+                                             "Tests":  229,
+                                             "Seconds":  258.9
+                                         },
+                                         {
+                                             "Suite":  "ConfiguratorUI",
+                                             "Tests":  50,
+                                             "Seconds":  0.7
+                                         },
+                                         {
+                                             "Suite":  "DiskSpace",
+                                             "Tests":  38,
+                                             "Seconds":  0.7
+                                         },
+                                         {
+                                             "Suite":  "ArchiveDiskSpace",
+                                             "Tests":  20,
+                                             "Seconds":  0.8
+                                         },
+                                         {
+                                             "Suite":  "MaintenanceDiskSpace",
+                                             "Tests":  17,
+                                             "Seconds":  0.6
+                                         }
+                                     ],
+                          "TopIntervals":  [
+                                               {
+                                                   "Assertion":  "Maintenance/OrchestrationScenariosShareOneChildProcess",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  62.1
+                                               },
+                                               {
+                                                   "Assertion":  "Framework/SelectiveSuitesHaveNoCrossSuiteDependency",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  26.8
+                                               },
+                                               {
+                                                   "Assertion":  "Documentation/RelativeLinksResolve",
+                                                   "Suite":  "Governance",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  25.1
+                                               },
+                                               {
+                                                   "Assertion":  "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget",
+                                                   "Suite":  "Governance",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  19.8
+                                               },
+                                               {
+                                                   "Assertion":  "DataRestore/OrchestrationScenariosShareOneChildProcess",
+                                                   "Suite":  "DataRestore",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  19.5
+                                               },
+                                               {
+                                                   "Assertion":  "Governance/SelfTestClosureNarrowScopeSurvivesLargeCreatorScope",
+                                                   "Suite":  "Governance",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  17.3
+                                               },
+                                               {
+                                                   "Assertion":  "ServiceRecovery/CharacterizationProbeAvailable",
+                                                   "Suite":  "ServiceRecovery",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  17.2
+                                               },
+                                               {
+                                                   "Assertion":  "Health/OrchestrationRunsChecksInContractOrder",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  17
+                                               },
+                                               {
+                                                   "Assertion":  "Framework/SectionBoundariesAreWellFormed",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  16.7
+                                               },
+                                               {
+                                                   "Assertion":  "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy",
+                                                   "Suite":  "BackupDestinations",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  15
+                                               },
+                                               {
+                                                   "Assertion":  "Governance/GenericObjectListNeverWrappedInArraySubexpression",
+                                                   "Suite":  "Governance",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  13.9
+                                               },
+                                               {
+                                                   "Assertion":  "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig",
+                                                   "Suite":  "BackupDestinations",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  12.1
+                                               },
+                                               {
+                                                   "Assertion":  "Framework/Phase0FailStopsDomains.BootstrapIntegrityPassed",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  11.3
+                                               },
+                                               {
+                                                   "Assertion":  "Json/NoCollapsedArrayFromPipeline",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  10.9
+                                               },
+                                               {
+                                                   "Assertion":  "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific",
+                                                   "Suite":  "Configurator",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  8.7
+                                               },
+                                               {
+                                                   "Assertion":  "Archive/OrchestrationRunsPhasesInContractOrder",
+                                                   "Suite":  "Archive",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  8.4
+                                               },
+                                               {
+                                                   "Assertion":  "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle",
+                                                   "Suite":  "BackupDestinations",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  8.4
+                                               },
+                                               {
+                                                   "Assertion":  "Framework/SectionIsolation.CleanRunPasses",
+                                                   "Suite":  "Root (inline)",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  8
+                                               },
+                                               {
+                                                   "Assertion":  "BackupDestinations/EveryOutboundChannelGatedByStorageEffective",
+                                                   "Suite":  "BackupDestinations",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  7.9
+                                               },
+                                               {
+                                                   "Assertion":  "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle",
+                                                   "Suite":  "BackupDestinations",
+                                                   "Result":  "PASS",
+                                                   "IntervalSeconds":  7.3
+                                               }
+                                           ]
+                      }
+                  ],
+    "LocalAggregate":  {
+                           "Runs":  1,
+                           "TotalWallClockSeconds":  {
+                                                         "N":  1,
+                                                         "Median":  1045.5,
+                                                         "Min":  1045.5,
+                                                         "Max":  1045.5
+                                                     },
+                           "Checks":  {
+                                          "N":  1,
+                                          "Median":  3941,
+                                          "Min":  3941,
+                                          "Max":  3941
+                                      },
+                           "SuiteSeconds":  {
+                                                "Root (inline)":  {
+                                                                      "N":  1,
+                                                                      "Median":  304.9,
+                                                                      "Min":  304.9,
+                                                                      "Max":  304.9
+                                                                  },
+                                                "Phase0":  {
+                                                               "N":  1,
+                                                               "Median":  0.1,
+                                                               "Min":  0.1,
+                                                               "Max":  0.1
+                                                           },
+                                                "Governance":  {
+                                                                   "N":  1,
+                                                                   "Median":  106.8,
+                                                                   "Min":  106.8,
+                                                                   "Max":  106.8
+                                                               },
+                                                "DataRestore":  {
+                                                                    "N":  1,
+                                                                    "Median":  27.4,
+                                                                    "Min":  27.4,
+                                                                    "Max":  27.4
+                                                                },
+                                                "ServiceQuiescence":  {
+                                                                          "N":  1,
+                                                                          "Median":  4.9,
+                                                                          "Min":  4.9,
+                                                                          "Max":  4.9
+                                                                      },
+                                                "ServiceRecovery":  {
+                                                                        "N":  1,
+                                                                        "Median":  21.3,
+                                                                        "Min":  21.3,
+                                                                        "Max":  21.3
+                                                                    },
+                                                "ManifestStorage":  {
+                                                                        "N":  1,
+                                                                        "Median":  4.5,
+                                                                        "Min":  4.5,
+                                                                        "Max":  4.5
+                                                                    },
+                                                "Paths":  {
+                                                              "N":  1,
+                                                              "Median":  0.1,
+                                                              "Min":  0.1,
+                                                              "Max":  0.1
+                                                          },
+                                                "LogRotation":  {
+                                                                    "N":  1,
+                                                                    "Median":  1.5,
+                                                                    "Min":  1.5,
+                                                                    "Max":  1.5
+                                                                },
+                                                "ConsoleUX":  {
+                                                                  "N":  1,
+                                                                  "Median":  0.6,
+                                                                  "Min":  0.6,
+                                                                  "Max":  0.6
+                                                              },
+                                                "Archive":  {
+                                                                "N":  1,
+                                                                "Median":  29.9,
+                                                                "Min":  29.9,
+                                                                "Max":  29.9
+                                                            },
+                                                "BackupScope":  {
+                                                                    "N":  1,
+                                                                    "Median":  1,
+                                                                    "Min":  1,
+                                                                    "Max":  1
+                                                                },
+                                                "BackupDestinations":  {
+                                                                           "N":  1,
+                                                                           "Median":  134.8,
+                                                                           "Min":  134.8,
+                                                                           "Max":  134.8
+                                                                       },
+                                                "SftpCredentialsRequired":  {
+                                                                                "N":  1,
+                                                                                "Median":  0.1,
+                                                                                "Min":  0.1,
+                                                                                "Max":  0.1
+                                                                            },
+                                                "LogSync":  {
+                                                                "N":  1,
+                                                                "Median":  0.3,
+                                                                "Min":  0.3,
+                                                                "Max":  0.3
+                                                            },
+                                                "MaintenanceOwnLog":  {
+                                                                          "N":  1,
+                                                                          "Median":  8.6,
+                                                                          "Min":  8.6,
+                                                                          "Max":  8.6
+                                                                      },
+                                                "BazaSync":  {
+                                                                 "N":  1,
+                                                                 "Median":  10.4,
+                                                                 "Min":  10.4,
+                                                                 "Max":  10.4
+                                                             },
+                                                "ClientGate":  {
+                                                                   "N":  1,
+                                                                   "Median":  0.6,
+                                                                   "Min":  0.6,
+                                                                   "Max":  0.6
+                                                               },
+                                                "Operations":  {
+                                                                   "N":  1,
+                                                                   "Median":  4.2,
+                                                                   "Min":  4.2,
+                                                                   "Max":  4.2
+                                                               },
+                                                "TraceArchive":  {
+                                                                     "N":  1,
+                                                                     "Median":  11,
+                                                                     "Min":  11,
+                                                                     "Max":  11
+                                                                 },
+                                                "MaintenanceRepair":  {
+                                                                          "N":  1,
+                                                                          "Median":  5.7,
+                                                                          "Min":  5.7,
+                                                                          "Max":  5.7
+                                                                      },
+                                                "RestoreSynthetic":  {
+                                                                         "N":  1,
+                                                                         "Median":  6.7,
+                                                                         "Min":  6.7,
+                                                                         "Max":  6.7
+                                                                     },
+                                                "RestoreVerify":  {
+                                                                      "N":  1,
+                                                                      "Median":  2,
+                                                                      "Min":  2,
+                                                                      "Max":  2
+                                                                  },
+                                                "Status":  {
+                                                               "N":  1,
+                                                               "Median":  0.3,
+                                                               "Min":  0.3,
+                                                               "Max":  0.3
+                                                           },
+                                                "ConfigLoader":  {
+                                                                     "N":  1,
+                                                                     "Median":  80.7,
+                                                                     "Min":  80.7,
+                                                                     "Max":  80.7
+                                                                 },
+                                                "Configuration":  {
+                                                                      "N":  1,
+                                                                      "Median":  5,
+                                                                      "Min":  5,
+                                                                      "Max":  5
+                                                                  },
+                                                "ConfigIntent":  {
+                                                                     "N":  1,
+                                                                     "Median":  6,
+                                                                     "Min":  6,
+                                                                     "Max":  6
+                                                                 },
+                                                "Configurator":  {
+                                                                     "N":  1,
+                                                                     "Median":  258.9,
+                                                                     "Min":  258.9,
+                                                                     "Max":  258.9
+                                                                 },
+                                                "ConfiguratorUI":  {
+                                                                       "N":  1,
+                                                                       "Median":  0.7,
+                                                                       "Min":  0.7,
+                                                                       "Max":  0.7
+                                                                   },
+                                                "DiskSpace":  {
+                                                                  "N":  1,
+                                                                  "Median":  0.7,
+                                                                  "Min":  0.7,
+                                                                  "Max":  0.7
+                                                              },
+                                                "ArchiveDiskSpace":  {
+                                                                         "N":  1,
+                                                                         "Median":  0.8,
+                                                                         "Min":  0.8,
+                                                                         "Max":  0.8
+                                                                     },
+                                                "MaintenanceDiskSpace":  {
+                                                                             "N":  1,
+                                                                             "Median":  0.6,
+                                                                             "Min":  0.6,
+                                                                             "Max":  0.6
+                                                                         }
+                                            },
+                           "TopIntervalSeconds":  {
+                                                      "Maintenance/OrchestrationScenariosShareOneChildProcess":  {
+                                                                                                                     "N":  1,
+                                                                                                                     "Median":  62.1,
+                                                                                                                     "Min":  62.1,
+                                                                                                                     "Max":  62.1,
+                                                                                                                     "PresentInTop20":  1
+                                                                                                                 },
+                                                      "Framework/SelectiveSuitesHaveNoCrossSuiteDependency":  {
+                                                                                                                  "N":  1,
+                                                                                                                  "Median":  26.8,
+                                                                                                                  "Min":  26.8,
+                                                                                                                  "Max":  26.8,
+                                                                                                                  "PresentInTop20":  1
+                                                                                                              },
+                                                      "Documentation/RelativeLinksResolve":  {
+                                                                                                 "N":  1,
+                                                                                                 "Median":  25.1,
+                                                                                                 "Min":  25.1,
+                                                                                                 "Max":  25.1,
+                                                                                                 "PresentInTop20":  1
+                                                                                             },
+                                                      "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget":  {
+                                                                                                                     "N":  1,
+                                                                                                                     "Median":  19.8,
+                                                                                                                     "Min":  19.8,
+                                                                                                                     "Max":  19.8,
+                                                                                                                     "PresentInTop20":  1
+                                                                                                                 },
+                                                      "DataRestore/OrchestrationScenariosShareOneChildProcess":  {
+                                                                                                                     "N":  1,
+                                                                                                                     "Median":  19.5,
+                                                                                                                     "Min":  19.5,
+                                                                                                                     "Max":  19.5,
+                                                                                                                     "PresentInTop20":  1
+                                                                                                                 },
+                                                      "Governance/SelfTestClosureNarrowScopeSurvivesLargeCreatorScope":  {
+                                                                                                                             "N":  1,
+                                                                                                                             "Median":  17.3,
+                                                                                                                             "Min":  17.3,
+                                                                                                                             "Max":  17.3,
+                                                                                                                             "PresentInTop20":  1
+                                                                                                                         },
+                                                      "ServiceRecovery/CharacterizationProbeAvailable":  {
+                                                                                                             "N":  1,
+                                                                                                             "Median":  17.2,
+                                                                                                             "Min":  17.2,
+                                                                                                             "Max":  17.2,
+                                                                                                             "PresentInTop20":  1
+                                                                                                         },
+                                                      "Health/OrchestrationRunsChecksInContractOrder":  {
+                                                                                                            "N":  1,
+                                                                                                            "Median":  17,
+                                                                                                            "Min":  17,
+                                                                                                            "Max":  17,
+                                                                                                            "PresentInTop20":  1
+                                                                                                        },
+                                                      "Framework/SectionBoundariesAreWellFormed":  {
+                                                                                                       "N":  1,
+                                                                                                       "Median":  16.7,
+                                                                                                       "Min":  16.7,
+                                                                                                       "Max":  16.7,
+                                                                                                       "PresentInTop20":  1
+                                                                                                   },
+                                                      "BackupDestinations/InstallerExplicitDestinationConflictRefusedBeforeDeploy":  {
+                                                                                                                                         "N":  1,
+                                                                                                                                         "Median":  15,
+                                                                                                                                         "Min":  15,
+                                                                                                                                         "Max":  15,
+                                                                                                                                         "PresentInTop20":  1
+                                                                                                                                     },
+                                                      "Governance/GenericObjectListNeverWrappedInArraySubexpression":  {
+                                                                                                                           "N":  1,
+                                                                                                                           "Median":  13.9,
+                                                                                                                           "Min":  13.9,
+                                                                                                                           "Max":  13.9,
+                                                                                                                           "PresentInTop20":  1
+                                                                                                                       },
+                                                      "BackupDestinations/InstallerExplicitDestinationAcceptsCompatibleSiteConfig":  {
+                                                                                                                                         "N":  1,
+                                                                                                                                         "Median":  12.1,
+                                                                                                                                         "Min":  12.1,
+                                                                                                                                         "Max":  12.1,
+                                                                                                                                         "PresentInTop20":  1
+                                                                                                                                     },
+                                                      "Framework/Phase0FailStopsDomains.BootstrapIntegrityPassed":  {
+                                                                                                                        "N":  1,
+                                                                                                                        "Median":  11.3,
+                                                                                                                        "Min":  11.3,
+                                                                                                                        "Max":  11.3,
+                                                                                                                        "PresentInTop20":  1
+                                                                                                                    },
+                                                      "Json/NoCollapsedArrayFromPipeline":  {
+                                                                                                "N":  1,
+                                                                                                "Median":  10.9,
+                                                                                                "Min":  10.9,
+                                                                                                "Max":  10.9,
+                                                                                                "PresentInTop20":  1
+                                                                                            },
+                                                      "Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific":  {
+                                                                                                                   "N":  1,
+                                                                                                                   "Median":  8.7,
+                                                                                                                   "Min":  8.7,
+                                                                                                                   "Max":  8.7,
+                                                                                                                   "PresentInTop20":  1
+                                                                                                               },
+                                                      "Archive/OrchestrationRunsPhasesInContractOrder":  {
+                                                                                                             "N":  1,
+                                                                                                             "Median":  8.4,
+                                                                                                             "Min":  8.4,
+                                                                                                             "Max":  8.4,
+                                                                                                             "PresentInTop20":  1
+                                                                                                         },
+                                                      "BackupDestinations/InstallerE2EHarnessDeploysCurrentBundle":  {
+                                                                                                                         "N":  1,
+                                                                                                                         "Median":  8.4,
+                                                                                                                         "Min":  8.4,
+                                                                                                                         "Max":  8.4,
+                                                                                                                         "PresentInTop20":  1
+                                                                                                                     },
+                                                      "Framework/SectionIsolation.CleanRunPasses":  {
+                                                                                                        "N":  1,
+                                                                                                        "Median":  8,
+                                                                                                        "Min":  8,
+                                                                                                        "Max":  8,
+                                                                                                        "PresentInTop20":  1
+                                                                                                    },
+                                                      "BackupDestinations/EveryOutboundChannelGatedByStorageEffective":  {
+                                                                                                                             "N":  1,
+                                                                                                                             "Median":  7.9,
+                                                                                                                             "Min":  7.9,
+                                                                                                                             "Max":  7.9,
+                                                                                                                             "PresentInTop20":  1
+                                                                                                                         },
+                                                      "BackupDestinations/InstallerSeedIgnoresSiteConfigFromBundle":  {
+                                                                                                                          "N":  1,
+                                                                                                                          "Median":  7.3,
+                                                                                                                          "Min":  7.3,
+                                                                                                                          "Max":  7.3,
+                                                                                                                          "PresentInTop20":  1
+                                                                                                                      }
+                                                  }
+                       }
+}

@@ -52,7 +52,7 @@ function Copy-BRAVOConfigurationGraphDeep {
             $items += , (Copy-BRAVOConfigurationGraphDeep -InputObject $item)
         }
         # ',' зберігає це масивом навіть при 0/1 елементі (PowerShell 5.1
-        # unwrap-семантика одноелементних колекцій — .claude/rules/powershell.md).
+        # unwrap-семантика одноелементних колекцій — docs/engineering/powershell.md).
         return , $items
     }
 
@@ -751,7 +751,7 @@ function Test-BRAVOSecurityInvariantValueWeakened {
     # (BRAVO_CONFIG_LOADER.ps1, post-merge ефективна конфігурація) і які
     # deploy\Get-BRAVOConfigSiteDelta.ps1 мусить видимо позначати (DENY-UX,
     # issue #216 §9) — БЕЗ повторної незалежної копії цієї логіки
-    # (`.claude/rules/05-architecture.md`, "Політика дублікації": один
+    # (`docs/engineering/architecture.md`, "Політика дублікації": один
     # canonical owner на security-політику).
     #
     # Навмисно повертає лише bool-вердикт, без повідомлення: обидва

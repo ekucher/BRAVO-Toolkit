@@ -1869,7 +1869,7 @@ Test-BRAVOCondition `
 # класифікація САМА ПО СОБІ не надає доступу до BRAVO_ALLOW_WEAKENED_SECURITY
 # escape hatch (на відміну від requireAdministrator вище). BAZA
 # append-only/mutation-detection цілісність — той самий клас гарантії,
-# що .claude/rules/07-bravo-runtime-invariants.md вимагає окремого
+# що docs/engineering/runtime-invariants.md вимагає окремого
 # свідомого рішення власника для послаблення (як AutoArchiveMutationThreshold),
 # а не побічного входження через загальний клас-based escape hatch.
 # Незалежний рев'ювер (Wave 2, раунд 1) знайшов, що документація
@@ -3143,7 +3143,7 @@ try {
     }
 }
 
-# Issue #216 (Wave B/Agent E deploy-cutover audit): post-update-доказ,
+# Issue #216 (Wave B/E deploy-cutover audit): post-update-доказ,
 # що фізично залишений на диску застарілий BRAVO.config НЕ впливає на
 # ефективну конфігурацію production-entrypoint-а після успішного
 # Update-BRAVOServer.ps1. Update-BRAVOServer.ps1 НІКОЛИ не видаляє
@@ -3255,7 +3255,7 @@ try {
             "(logRetentionDays=999) взагалі читається з auto-derived BRAVO.config — інакше наступна перевірка " +
             "нічого не доводить; отримано '$postUpdateBaseline'")
 
-    # --- Основний доказ (Proof I, Agent E): production-entrypoint після
+    # --- Основний доказ (Proof I, потік E): production-entrypoint після
     # успішного Update-BRAVOServer.ps1, з фізично залишеним на диску
     # застарілим BRAVO.config, ІГНОРУЄ його повністю — ефективна
     # logRetentionDays лишається canonical-дефолтом (31), а не 999.

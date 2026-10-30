@@ -1,11 +1,11 @@
 ﻿Set-StrictMode -Version 2.0
 
-# Codex review PR #224 (P2, "Import the task-path normalizer into this
+# Рев'ю PR #224 (P2, "Import the task-path normalizer into this
 # module scope") + Config v2 pilot artifact regression, п'ятий раунд:
 # BRAVO.System — ЄДИНА optional-залежність цього файлу, потрібна ЛИШЕ
 # Test-BRAVOConfigurationAuthorizationTaskSchedulerPath (нижче). Перша
 # спроба фіксу зробила цей імпорт БЕЗУМОВНИМ на module-load-time (тут,
-# у preamble) — виправляло Codex-знахідку (Get-Module-presence guard
+# у preamble) — виправляло знахідку рев'ю (Get-Module-presence guard
 # ненадійний під PS 5.1 module session-state семантикою), але ввело
 # РЕГРЕСІЮ: deploy\New-BRAVOConfigV2PilotArtifact.ps1 НАВМИСНО не
 # бандлить modules\BRAVO.System\ (документований архітектурний
@@ -22,7 +22,7 @@
 # перевірки видимості. Це зберігає ОБИДВА інваріанти одночасно: Schema
 # завантажується без BRAVO.System, коли TaskPath не зачіпається (pilot-
 # артефакт), і TaskPath-валідатор надійно бачить ConvertTo-BRAVOTaskPath
-# незалежно від Get-Module-видимості деінде в процесі (Codex-фікс).
+# незалежно від Get-Module-видимості деінде в процесі (фікс за рев'ю).
 
 # BRAVO.Configuration.Schema — формальна схема Configuration v2 (#154, B2).
 #
@@ -189,7 +189,7 @@ function Get-BRAVOConfigurationSchemaValueCaption {
 function Add-BRAVOConfigurationSchemaLeaf {
     # Рекурсивний будівник схеми. Мутує передану hashtable $Schema —
     # повертати граф через pipeline не можна: PowerShell 5.1 розгорнув би
-    # проміжні колекції (.claude/rules/powershell.md).
+    # проміжні колекції (docs/engineering/powershell.md).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Node,
@@ -490,7 +490,7 @@ function Test-BRAVOConfigurationOverrideSchema {
 #
 # ЧОМУ ОКРЕМИЙ ШАР, А НЕ РОЗШИРЕННЯ ТИПОВОЇ ПЕРЕВІРКИ. Правильний ТИП
 # значення (String/Number/...) нічого не каже про те, чи ЦЕЙ шлях
-# узагалі дозволено перевизначати з site-шару — 05-architecture.md
+# узагалі дозволено перевизначати з site-шару — docs/engineering/architecture.md
 # вимагає одного канонічного власника на відповідальність, тому
 # авторизація живе тут (поруч зі схемою форми), а не дублюється в
 # BRAVO_CONFIG_LOADER.ps1 чи Configurator-і.
@@ -745,7 +745,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'logFileEncoding' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logFileFilter' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logFileNameTemplate' = @{ Class = 'DENY_INTERNAL_METADATA' }
-    # Codex review PR #224 (P2, "Preserve whitespace tolerance for legacy
+    # Рев'ю PR #224 (P2, "Preserve whitespace tolerance for legacy
     # LogLevel"): EnumTrimmed (не Enum) — той самий whitespace-tolerance
     # паритет, що defaultLogLevel уже отримав (PR #224 review, четвертий
     # раунд). Репо-wide пошук показує, що ЄДИНЕ production-читання
@@ -1133,7 +1133,7 @@ function Test-BRAVOConfigurationAuthorizationIntegerRange {
             Message = "${Path}: очікується ціле число без лапок (діапазон $Minimum..$Maximum), отримано $($Value.GetType().Name)."
         }
     }
-    # Codex review PR #224 (P2, "Preserve precision when checking integer
+    # Рев'ю PR #224 (P2, "Preserve precision when checking integer
     # ranges"): fractional-перевірка МУСИТЬ відбуватись у ТОМУ Ж домені,
     # що й сам $Value, коли це [decimal] — double має лише ~15-17
     # значущих десяткових цифр, тож звуження ВИСОКОточного decimal
@@ -1266,7 +1266,7 @@ function Test-BRAVOConfigurationAuthorizationUrlArray {
     # елемент, що не є рядком, чи невалідний URL відхиляє весь масив
     # (перше порушення — точний індекс у повідомленні).
     #
-    # Codex review PR #224 (P2, "Ignore blank lookup URL entries before
+    # Рев'ю PR #224 (P2, "Ignore blank lookup URL entries before
     # validating"): порожній/whitespace-елемент — семантично ВІДСУТНІЙ
     # lookup-запис, не помилка. Єдиний production-споживач
     # (BRAVO.Notifications.psm1, Get-BRAVOHostInformationConfiguration)
@@ -1352,7 +1352,7 @@ function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
         return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення мусить бути рядком (шлях Task Scheduler)." }
     }
 
-    # Codex review PR #224 (P2, "Import the task-path normalizer into this
+    # Рев'ю PR #224 (P2, "Import the task-path normalizer into this
     # module scope") + Config v2 pilot artifact regression, п'ятий раунд
     # (див. коментар біля Set-StrictMode на початку файлу): залежність
     # BRAVO.System — ЛІНИВА, імпортується САМЕ ТУТ, безпосередньо перед

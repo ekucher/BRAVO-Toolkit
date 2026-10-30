@@ -183,7 +183,7 @@ $taskInstallerText = [IO.File]::ReadAllText(
         ) `
         -Name "ConsoleUX/12-NoPauseSkipsWait" `
         -Failure "Wait-BRAVOManualExit має негайно повертатись при -NoPause"
-    # dev.18: реальний DEV-LIMS ручний (MANUAL) запуск довів, що
+    # dev.18: реальний HOST-11 ручний (MANUAL) запуск довів, що
     # [Console]::IsInputRedirected сам по собі помилково відхиляв
     # справжню операторську консоль ДО спроби RawUI.ReadKey — вікно
     # закривалось одразу після РЕЗУЛЬТАТ замість очікування. Тепер
@@ -209,7 +209,7 @@ $taskInstallerText = [IO.File]::ReadAllText(
     # виконується завжди, не може залежати від змінної gated-фрагмента.
     # --- Structural: [Console]::IsInputRedirected більше НЕ окрема
     # самостійна pre-check причина відхилити операторську консоль ДО
-    # спроби RawUI.ReadKey (реальний DEV-LIMS баг); UserInteractive
+    # спроби RawUI.ReadKey (реальний HOST-11 баг); UserInteractive
     # лишається єдиною такою причиною.
     Test-BRAVOCondition `
         -Condition (
@@ -217,7 +217,7 @@ $taskInstallerText = [IO.File]::ReadAllText(
             $waitManualExitText.Contains('[Environment]::UserInteractive')
         ) `
         -Name 'Console/ManualExitDoesNotPreSkipSolelyForInputRedirected' `
-        -Failure 'Wait-BRAVOManualExit НЕ повинна містити самостійну перевірку [Console]::IsInputRedirected — реальний DEV-LIMS MANUAL-запуск довів, що вона помилково відхиляла справжню операторську консоль до спроби RawUI.ReadKey'
+        -Failure 'Wait-BRAVOManualExit НЕ повинна містити самостійну перевірку [Console]::IsInputRedirected — реальний HOST-11 MANUAL-запуск довів, що вона помилково відхиляла справжню операторську консоль до спроби RawUI.ReadKey'
 
     Test-BRAVOCondition `
         -Condition (

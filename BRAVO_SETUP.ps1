@@ -439,7 +439,7 @@ try {
         Write-Host "  Зміцнення виконає повний запуск BRAVO_SETUP з правами адміністратора." -ForegroundColor Yellow
     }
 
-    # Discovery джерел (CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md): показуємо
+    # Discovery джерел (ТЗ ARCHIV_LIMS_MONOLITH): показуємо
     # завжди, це лише read-only читання вже обчисленого
     # $global:bravoDiscoveryResult з BRAVO.config — жодних нових операцій.
     if ($null -ne $global:bravoDiscoveryResult) {

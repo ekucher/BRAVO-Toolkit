@@ -346,7 +346,7 @@ function Get-BRAVODirectories {
             (@($taMaskSession.State.MoveFileCalls) -contains '/trace/Trace[[]1].mdz.new -> /trace/Trace[1].mdz')
         ) -Name 'TraceArchive/SftpPublishEscapesWinSCPFileMasks' -Failure "ім'я з [ ] має передаватись у WinSCP екранованим (PutFiles-джерело, RemoveFiles, MoveFile-джерело), сусідній Trace1.mdz недоторканий; факт: error=$($taMaskResult.Error) final=$($taMaskSession.State.RemoteSizes['/trace/Trace[1].mdz']) decoy=$($taMaskSession.State.RemoteSizes['/trace/Trace1.mdz']) put=$(@($taMaskSession.State.PutFilesLocalArgs) -join ',') rm=$(@($taMaskSession.State.RemoveFilesCalls) -join ',') mv=$(@($taMaskSession.State.MoveFileCalls) -join ',')"
 
-        # --- РЕГРЕСІЯ (реальний DEV-LIMS): remote-каталог /trace/ не існував,
+        # --- РЕГРЕСІЯ (реальний HOST-11): remote-каталог /trace/ не існував,
         # session.PutFiles його НЕ створює, і кожен прогін падав із
         # "Cannot create remote file '/trace/....new.filepart'. No such file
         # or directory" -> exit 60 обслуговування, яке відпрацювало. Каталог
@@ -508,6 +508,47 @@ function Get-BRAVODirectories {
             (Test-Path -LiteralPath $taOrchDeferredFile) -and
             (Test-Path -LiteralPath (Join-Path $taOrchDeferred 'Trace_20260817.mdz'))
         ) -Name 'TraceArchive/OrchestratorWithoutSessionDefersUploadKeepsSources' -Failure "без SFTP-сесії: архів оновлюється локально, передача відкладена, .out збережені"
+
+        # --- Session=$null + -RemoteDisabled (SFTP свідомо вимкнено конфігурацією):
+        # відкладення логується INFO, а не WARNING (інакше щоночі exit 10 у
+        # local-only конфігурації); лічильник і збереження джерел без змін.
+        $taRemoteOffDir = Join-Path $traceArchiveTestRoot "orch-remote-off\Trace"
+        [void](New-Item -ItemType Directory -Path $taRemoteOffDir -Force)
+        $taRemoteOffFile = Join-Path $taRemoteOffDir 'TraceBIS_20260818_120000.out'
+        [IO.File]::WriteAllText($taRemoteOffFile, 'remote disabled')
+        $taRemoteOffLog = New-Object 'System.Collections.Generic.List[string]'
+        $taRemoteOffLogger = & { param($L) { param($Message, $Level) [void]$L.Add("[$Level] $Message") }.GetNewClosure() } $taRemoteOffLog
+        $taRemoteOffResult = & $traceArchiveModule { param($d, $z, $ap, $p, $rd, $lg) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $null -RemoteDirectory $rd -RemoteDisabled -Logger $lg } $taRemoteOffDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword 'trace' $taRemoteOffLogger
+        Test-BRAVOCondition -Condition (
+            @($taRemoteOffLog | Where-Object { $_ -like '`[WARNING`]*' -or $_ -like '`[ERROR`]*' }).Count -eq 0 -and
+            @($taRemoteOffLog | Where-Object { $_ -like '`[INFO`]*' -and $_ -like '*відкладено*' }).Count -eq 1 -and
+            [int]$taRemoteOffResult.UploadsDeferred -eq 1 -and
+            [int]$taRemoteOffResult.ArchivesUpdated -eq 1 -and
+            [int]$taRemoteOffResult.SourcesDeleted -eq 0 -and
+            [int]$taRemoteOffResult.Errors -eq 0 -and
+            (Test-Path -LiteralPath $taRemoteOffFile)
+        ) -Name 'TraceArchive/RemoteDisabledDeferralLogsInfoNotWarning' -Failure "SFTP вимкнено конфігурацією: відкладення передачі має бути INFO без WARNING/ERROR, UploadsDeferred=1, .out збережено; журнал: $($taRemoteOffLog -join ' | ')"
+
+        # --- Регрес-захист: Session=$null БЕЗ -RemoteDisabled (SFTP увімкнено, але
+        # сесії немає: креденшли/WinSCP/мережа) — WARNING, як і раніше.
+        $taSessOffDir = Join-Path $traceArchiveTestRoot "orch-session-off\Trace"
+        [void](New-Item -ItemType Directory -Path $taSessOffDir -Force)
+        $taSessOffFile = Join-Path $taSessOffDir 'TraceBIS_20260819_120000.out'
+        [IO.File]::WriteAllText($taSessOffFile, 'session unavailable')
+        $taSessOffLog = New-Object 'System.Collections.Generic.List[string]'
+        $taSessOffLogger = & { param($L) { param($Message, $Level) [void]$L.Add("[$Level] $Message") }.GetNewClosure() } $taSessOffLog
+        $taSessOffResult = & $traceArchiveModule { param($d, $z, $ap, $p, $rd, $lg) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $null -RemoteDirectory $rd -Logger $lg } $taSessOffDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword 'trace' $taSessOffLogger
+        Test-BRAVOCondition -Condition (
+            @($taSessOffLog | Where-Object { $_ -like '`[WARNING`]*' -and $_ -like '*відкладено*' }).Count -eq 1 -and
+            [int]$taSessOffResult.UploadsDeferred -eq 1 -and
+            [int]$taSessOffResult.SourcesDeleted -eq 0 -and
+            (Test-Path -LiteralPath $taSessOffFile)
+        ) -Name 'TraceArchive/SessionUnavailableStillWarns' -Failure "SFTP увімкнено, сесії немає: відкладення передачі має лишатись WARNING; журнал: $($taSessOffLog -join ' | ')"
+
+        # --- Статичний контракт: обидва виклики движка (Trace і exchangAPI) у
+        # Runtime передають прапор, похідний від storageEffective.SFTP.Enabled.
+        $taRemoteDisabledFlagCalls = [regex]::Matches($traceArchiveScriptText, '-RemoteDisabled:\(-not \[bool\]\$storageEffective\.SFTP\.Enabled\)').Count
+        Test-BRAVOCondition -Condition ($taRemoteDisabledFlagCalls -eq 2) -Name 'TraceArchive/RuntimeCallsPassRemoteDisabledFromStorageEffective' -Failure "обидва виклики Invoke-BRAVOTraceArchiveMaintenance (Trace, exchangAPI) мають передавати -RemoteDisabled:(-not [bool]`$storageEffective.SFTP.Enabled); знайдено: $taRemoteDisabledFlagCalls"
 
         # ===== P5 (2026-09): RawSourceRetentionDays grace-період =====
         # RawSourceRetentionDays=0 (дефолт, не передається явно) —

@@ -47,7 +47,7 @@ $script:BRAVOConfiguratorModelDependencyRoot = Split-Path -Path $PSScriptRoot -P
 Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop -Scope Local
 Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop -Scope Local
 
-# Codex review PR #224 (P2, "Preserve typed values in synthesized recovery
+# Рев'ю PR #224 (P2, "Preserve typed values in synthesized recovery
 # rows") — Get-BRAVOConfiguratorRecoveryValueType нижче. Локальна копія
 # TypeCode-переліків (не той самий $script:-стан, що
 # BRAVO.Configuration.Schema.psm1 тримає для integer-range-валідації —
@@ -225,7 +225,7 @@ function Resolve-BRAVOConfiguratorSuppliedLeafOverride {
 function Get-BRAVOConfiguratorSuppliedLeafRepresentations {
     <#
     .SYNOPSIS
-        Codex review PR #224 (P2, "Inspect every representation when
+        Рев'ю PR #224 (P2, "Inspect every representation when
         generating recovery rows"): канонічна (ЄДИНА) перерахунок УСІХ
         supplied-представлень одного canonical leaf-шляху в сирому
         LocalOverrides-шарі — на відміну від
@@ -702,7 +702,7 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
 function Get-BRAVOConfiguratorRecoveryValueType {
     <#
     .SYNOPSIS
-        Codex review PR #224 (P2, "Preserve typed values in synthesized
+        Рев'ю PR #224 (P2, "Preserve typed values in synthesized
         recovery rows"): визначає Configurator-дескрипторний Type
         ('Boolean'/'Integer'/'Number'/'StringArray'/'NumberArray'/'String')
         із фактичного .NET-типу supplied-значення для синтезованого
@@ -895,7 +895,7 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $isDenyClass = $class.StartsWith('DENY_')
         if (-not $isValidatorClass -and -not $isDenyClass) { continue }
 
-        # Codex review PR #224 (P2, "Inspect every representation when
+        # Рев'ю PR #224 (P2, "Inspect every representation when
         # generating recovery rows"): раніше тут викликався
         # Resolve-BRAVOConfiguratorSuppliedLeafOverride, що повертає ЛИШЕ
         # ОДНЕ (найдовше/пріоритетне) supplied-представлення canonical
@@ -933,7 +933,7 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $violation = @($violatingViolation)
         $reason = [string]$violatingViolation.Reason
 
-        # Codex review PR #224 (P2, "Preserve typed values in synthesized
+        # Рев'ю PR #224 (P2, "Preserve typed values in synthesized
         # recovery rows"): Type МУСИТЬ відповідати фактичному .NET-типу
         # значення, яке Get-BRAVOConfiguratorModel реально покладе в
         # $Setting.OverrideValue для ЦЬОГО descriptor.Path — а це завжди

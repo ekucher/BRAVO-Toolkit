@@ -1033,6 +1033,8 @@
     $artifactProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_ARTIFACT_PROV_{0}" -f [guid]::NewGuid().ToString('N'))
     $artifactProbeStale = ''
     $artifactProbeFresh = ''
+    $artifactProbeLightweightTag = ''
+    $artifactProbeAnnotatedTag = ''
     $artifactProbeLimitation = ''
     $artifactProbeReady = $false
     try {
@@ -1068,6 +1070,14 @@
                 $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stamp' --quiet 2>&1
                 $artifactProbeFresh = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'HEAD' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
 
+                # Тег релізу (D8): на тому самому чистому штампі lightweight-тег
+                # відхиляється, annotated — ні.
+                $null = & git -C $artifactProbeRoot tag v4.5.0 2>&1
+                $artifactProbeLightweightTag = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'v4.5.0' -ExpectedTag 'v4.5.0' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+                $null = & git -C $artifactProbeRoot tag -d v4.5.0 2>&1
+                $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' tag -a v4.5.0 -m 'BRAVO-Toolkit 4.5.0' 2>&1
+                $artifactProbeAnnotatedTag = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'v4.5.0' -ExpectedTag 'v4.5.0' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+
                 # СТАЛЕ: штамп зачіпає ще й код, тобто провенанс його не описує.
                 [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'code.txt'), "v2`r`n", $utf8NoBomArtifact)
                 $null = & git -C $artifactProbeRoot add -A 2>&1
@@ -1094,6 +1104,21 @@
         -Name "ReleaseArtifact/AcceptsCleanStampProvenance" `
         -EnvironmentLimitation $artifactProbeLimitation `
         -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має відхиляти чистий коміт-штамп (змінені лише VERSION.json і RUNTIME_MANIFEST.json); вивід: $artifactProbeFresh"
+
+    Test-BRAVOCondition `
+        -Condition ($artifactProbeLightweightTag.Contains('RELEASE_TAG_NOT_ANNOTATED')) `
+        -Name "ReleaseArtifact/RejectsLightweightReleaseTag" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 з -ExpectedTag має відмовляти на lightweight-тегу (маркер RELEASE_TAG_NOT_ANNOTATED, RELEASE_POLICY.md 15); вивід: $artifactProbeLightweightTag"
+
+    # Annotated-тег проходить перевірку тега й доходить до провенансу:
+    # позитивний випадок — відсутність обох маркерів, а не код виходу
+    # (фікстура не є справжнім комплектом).
+    Test-BRAVOCondition `
+        -Condition (-not $artifactProbeAnnotatedTag.Contains('RELEASE_TAG_NOT_ANNOTATED') -and -not $artifactProbeAnnotatedTag.Contains('PROVENANCE_')) `
+        -Name "ReleaseArtifact/AcceptsAnnotatedReleaseTag" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має відхиляти annotated-тег на чистому штампі; вивід: $artifactProbeAnnotatedTag"
 
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація
@@ -1444,7 +1469,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
 #     що вважається функцією — див. Find-BRAVODocReferenceProblem),
 #     файл/каталог — tracked, модуль — каталогом у modules/.
 #     Історичні документи (CHANGELOG, ROADMAP, TODO_FEATURES, docs/ з
-#     датованими evidence/runbook/design і .claude/) свідомо називають
+#     датованими evidence/runbook/design) свідомо називають
 #     старі й заплановані назви та не перевіряються.
 #  3. Літеральний приклад — fenced-блок (зокрема в пункті списку),
 #     HTML-коментар, екранована розмітка (`\[`), placeholder (<...>, %VAR%,
@@ -1540,12 +1565,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             if (-not $m.Success) { break }
             $first = $m.Value[0]
             if ($first -eq [char]'\') {
-                $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = 2; Kind = 'Escape' }))
+                $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = 2; Kind = 'Escape' }))
                 $pos = $m.Index + 2
                 continue
             }
             if ($first -eq [char]'<') {
-                $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = $m.Length; Kind = 'Comment' }))
+                $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = $m.Length; Kind = 'Comment' }))
                 $pos = $m.Index + $m.Length
                 continue
             }
@@ -1561,8 +1586,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             if ($content.Length -ge 2 -and $content.StartsWith(' ') -and $content.EndsWith(' ') -and $content.Trim().Length -gt 0) {
                 $content = $content.Substring(1, $content.Length - 2)
             }
-            $spans.Add((New-Object PSObject -Property @{ Index = $contentStart; Content = $content; Start = $m.Index; End = $close.Index + $runLength }))
-            $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = $close.Index + $runLength - $m.Index; Kind = 'Code' }))
+            $spans.Add(([pscustomobject]@{ Index = $contentStart; Content = $content; Start = $m.Index; End = $close.Index + $runLength }))
+            $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = $close.Index + $runLength - $m.Index; Kind = 'Code' }))
             $pos = $close.Index + $runLength
         }
         $masked = New-Object Text.StringBuilder
@@ -1581,7 +1606,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         }
         [void]$masked.Append($Text.Substring($cursor))
         [void]$visible.Append($Text.Substring($cursor))
-        return New-Object PSObject -Property @{ Masked = $masked.ToString(); Visible = $visible.ToString(); CodeSpans = $spans }
+        return [pscustomobject]@{ Masked = $masked.ToString(); Visible = $visible.ToString(); CodeSpans = $spans }
     }
 
     function Get-BRAVODocModel {
@@ -1618,7 +1643,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
                         $close.Groups[1].Value[0] -eq $fence.FenceChar -and $close.Groups[1].Value.Length -ge $fence.FenceLength) {
                         $fence = $null
                     }
-                    $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                    $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                     continue
                 }
                 # Контейнер (пункт списку чи цитата) скінчився — з ним і блок;
@@ -1633,12 +1658,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             $blank = ($body.Trim().Length -eq 0)
             if ($inComment) {
                 if ($line.Contains('-->')) { $inComment = $false }
-                $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                 continue
             }
             if ($blank) {
                 $previousQuote = $quoteDepth
-                $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $false; Kind = 'Blank'; Block = ''; Container = 0; Quote = $quoteDepth }))
+                $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $false; Kind = 'Blank'; Block = ''; Container = 0; Quote = $quoteDepth }))
                 continue
             }
             while ($containers.Count -gt 0 -and $indent -lt $containers[$containers.Count - 1]) { $containers.RemoveAt($containers.Count - 1) }
@@ -1678,21 +1703,21 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
                 if ($column - $base -le 3) {
                     $open = [regex]::Match($rest, '^(`{3,}(?=[^`]*$)|~{3,})')
                     if ($open.Success) {
-                        $fence = New-Object PSObject -Property @{
+                        $fence = [pscustomobject]@{
                             FenceChar = $open.Groups[1].Value[0]; FenceLength = $open.Groups[1].Value.Length
                             Indent = $base; Quote = $quoteDepth
                         }
-                        $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                        $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                         continue
                     }
                     if ($rest.StartsWith('<!--')) {
                         $inComment = -not $rest.Substring(4).Contains('-->')
-                        $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                        $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                         continue
                     }
                 }
             }
-            $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $false; Kind = $kind; Block = $block; Container = $base; Quote = $quoteDepth }))
+            $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $false; Kind = $kind; Block = $block; Container = $base; Quote = $quoteDepth }))
         }
 
         # Абзаци (послідовні непорожні рендерні рядки) як один текст із мапою
@@ -1706,7 +1731,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         $paragraphs = New-Object Collections.Generic.List[object]
         $current = New-Object Collections.Generic.List[object]
         $entries = New-Object Collections.Generic.List[object]
-        $separator = New-Object PSObject -Property @{ Number = 0; Text = ''; IsCode = $true }
+        $separator = [pscustomobject]@{ Number = 0; Text = ''; IsCode = $true }
         foreach ($line in $lines) {
             if ($line.Kind -eq 'Heading') {
                 $entries.Add($separator)
@@ -1719,19 +1744,19 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             $entries.Add($line)
         }
         # Сторож наприкінці закриває останній абзац.
-        $entries.Add((New-Object PSObject -Property @{ Number = 0; Text = ''; IsCode = $true }))
+        $entries.Add(([pscustomobject]@{ Number = 0; Text = ''; IsCode = $true }))
         foreach ($entry in $entries) {
             if ($entry.IsCode -or [string]::IsNullOrEmpty($entry.Text.Trim())) {
                 if ($current.Count -gt 0) {
                     $sb = New-Object Text.StringBuilder
                     $offsets = New-Object Collections.Generic.List[object]
                     foreach ($line in $current) {
-                        $offsets.Add((New-Object PSObject -Property @{ Offset = $sb.Length; Number = $line.Number }))
+                        $offsets.Add(([pscustomobject]@{ Offset = $sb.Length; Number = $line.Number }))
                         [void]$sb.Append($line.Text).Append("`n")
                     }
                     $paragraphText = $sb.ToString()
                     $projection = Get-BRAVODocInlineProjection -Text $paragraphText
-                    $paragraphs.Add((New-Object PSObject -Property @{
+                    $paragraphs.Add(([pscustomobject]@{
                                 Lines = $current; Text = $paragraphText; Offsets = $offsets
                                 Masked = $projection.Masked; Visible = $projection.Visible; CodeSpans = $projection.CodeSpans
                             }))
@@ -1741,7 +1766,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             }
             $current.Add($entry)
         }
-        $model = New-Object PSObject -Property @{ Source = $source; Lines = $lines; Paragraphs = $paragraphs }
+        $model = [pscustomobject]@{ Source = $source; Lines = $lines; Paragraphs = $paragraphs }
         $docModelCache[$FullPath] = $model
         return $model
     }
@@ -1954,12 +1979,18 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         param([string]$Text)
         $starts = New-Object Collections.Generic.List[int]
         $stack = New-Object Collections.Generic.Stack[int]
-        foreach ($bracket in [regex]::Matches($Text, '[\[\]]')) {
-            if ($bracket.Value -eq '[') { $stack.Push($bracket.Index); continue }
-            if ($stack.Count -eq 0) { continue }
-            $open = $stack.Pop()
-            $next = $bracket.Index + 1
-            if ($next -lt $Text.Length -and ($Text[$next] -eq [char]'(' -or $Text[$next] -eq [char]'[')) { $starts.Add($open) }
+        # IndexOfAny замість [regex]::Matches: той самий лінійний прохід по
+        # дужках без об'єкта Match на кожну дужку.
+        $bracketChars = [char[]]@([char]'[', [char]']')
+        $at = $Text.IndexOfAny($bracketChars)
+        while ($at -ge 0) {
+            if ($Text[$at] -eq [char]'[') { $stack.Push($at) }
+            elseif ($stack.Count -gt 0) {
+                $open = $stack.Pop()
+                $next = $at + 1
+                if ($next -lt $Text.Length -and ($Text[$next] -eq [char]'(' -or $Text[$next] -eq [char]'[')) { $starts.Add($open) }
+            }
+            $at = $Text.IndexOfAny($bracketChars, $at + 1)
         }
         $starts.Sort()
         return ,$starts
@@ -2470,8 +2501,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         # ROADMAP P3.2a, ще не реалізовано.
         @{ Kind = 'Planned'; Target = 'BRAVO_UPDATE.ps1' },
         @{ Kind = 'Planned'; Target = 'modules/BRAVO.Update' },
-        # Evidence у гілці evidence/219c55b-rc4-devlims-acceptance-pass.
-        @{ Kind = 'ExternalBranch'; Target = 'docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md' },
+        # Evidence у гілці evidence/219c55b-rc4-host11-acceptance-pass.
+        @{ Kind = 'ExternalBranch'; Target = 'docs/BRAVO_DATA_RESTORE_RC4_HOST11_ACCEPTANCE_20260820.md' },
         # TOFU-базова лінія, створюється на кожному сервері (.gitignore).
         @{ Kind = 'RuntimeGenerated'; Target = 'Tools/TOOLS_INTEGRITY.json' },
         @{ Kind = 'RuntimeGenerated'; Target = 'TOOLS_INTEGRITY.json' },
@@ -3344,7 +3375,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsLegacyReaderCallCaseInsensitively ---
-    # Codex-знахідка (gate-review): PowerShell розв'язує імена команд
+    # Знахідка рев'ю (gate-review): PowerShell розв'язує імена команд
     # регістронезалежно, тож інший регістр символів мусить так само
     # провалювати гейт, а не пройти через ordinal-порівняння.
     $legacyReaderCaseInsensitiveFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
@@ -3369,7 +3400,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateScansAllRootEntryScriptsNotOnlyAutoexecList ---
-    # Codex-знахідка (gate-review): попередня версія сканувала лише 14
+    # Знахідка рев'ю (gate-review): попередня версія сканувала лише 14
     # AUTOEXEC-цілей (Get-BRAVOProductionEntryPointRelativePath), пропускаючи
     # кореневі тонкі entrypoint-обгортки поза цим списком (напр.
     # BRAVO_ARCHIV.ps1/BRAVO_HEALTH.ps1/BRAVO_MAINTENANCE.ps1/
@@ -3396,7 +3427,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresCommentOnlyLegacyReaderMention ---
-    # Codex-знахідка (gate-review, R3): текстовий пошук бачив би цю появу
+    # Знахідка рев'ю (gate-review, R3): текстовий пошук бачив би цю появу
     # назви функції в коментарі як FAIL, хоча жодного виклику команди тут
     # немає — гейт мусить розбирати AST і зіставляти лише СПРАВЖНІ виклики
     # команд, а не будь-яку текстову появу імені.
@@ -3422,7 +3453,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateScansDeployDirectoryForLegacyReaderCalls ---
-    # Codex-знахідка (gate-review): deploy\ раніше не сканувався ЗОВСІМ —
+    # Знахідка рев'ю (gate-review): deploy\ раніше не сканувався ЗОВСІМ —
     # не-migration скрипт (напр. deploy\Install-BRAVOServer.ps1) міг би
     # напряму викликати legacy-рідер без жодного FAIL.
     $legacyReaderDeployFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
@@ -3477,7 +3508,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsSimpleVariableIndirectionLegacyReaderCall ---
-    # Codex-знахідка (gate-review, R4): `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader`
+    # Знахідка рев'ю (gate-review, R4): `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader`
     # обходить пряме зіставлення CommandAst.GetCommandName() (повертає null
     # для команди-змінної). Гейт мусить ловити принаймні цю просту форму
     # непрямого виклику через локальне присвоєння рядкового літералу.
@@ -3528,7 +3559,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresReassignedIndirectionVariable ---
-    # Codex-знахідка (gate-review, R5): попередня версія тримала плаский
+    # Знахідка рев'ю (gate-review, R5): попередня версія тримала плаский
     # HashSet імен змінних на весь файл — reassignment тієї самої змінної
     # на щось безпечне ПІСЛЯ ризикового присвоєння хибно провалював би
     # гейт, хоча реально виконується лише безпечна команда.
@@ -3579,7 +3610,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateNarrowsCanonicalLoaderExemptionToSanctionedCallSites ---
-    # Codex-знахідка (gate-review, R5): попередня версія повністю
+    # Знахідка рев'ю (gate-review, R5): попередня версія повністю
     # виключала BRAVO_CONFIG_LOADER.ps1 зі сканування, ховаючи МАЙБУТНІЙ
     # негвардований виклик десь-інде в тому самому файлі. Тепер файл
     # сканується, як усі інші, але звіряється проти точного переліку
@@ -3636,7 +3667,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateResolvesIndirectionThroughParentScope ---
-    # Codex-знахідка (gate-review, R6): попередня версія вимагала точної
+    # Знахідка рев'ю (gate-review, R6): попередня версія вимагала точної
     # рівності ScriptBlockAst — присвоєння на рівні модуля/скрипта й
     # виклик через ту саму змінну ВСЕРЕДИНІ вкладеної функції реально
     # резолвиться лексично (PowerShell читає змінну з батьківського
@@ -3692,7 +3723,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller ---
-    # Codex-знахідка (gate-review, R7): перевірка санкціонованої пари за
+    # Знахідка рев'ю (gate-review, R7): перевірка санкціонованої пари за
     # ІМЕНЕМ охоплюючої функції не бачить, що конкретний виклик реально
     # guard'ований — другий, негвардований виклик Import-BravoLegacyPrimaryConfiguration
     # десь-інде всередині ТІЄЇ Ж Import-BravoConfiguration проходив би
@@ -3725,7 +3756,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateTreatsCompoundAssignmentAsNonReplacing ---
-    # Codex-знахідка (gate-review, R8) — РЕАЛЬНИЙ баг у самій реалізації
+    # Знахідка рев'ю (gate-review, R8) — РЕАЛЬНИЙ баг у самій реалізації
     # гейту (не крайовий випадок статичного аналізу): складене присвоєння
     # (`+=`) не ЗАМІНЮЄ значення змінної, а доповнює його, але попередня
     # версія записувала будь-який AssignmentStatementAst як повну заміну —
@@ -3754,7 +3785,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateIgnoresScriptBlockLiteralAssignment ---
-    # Codex-знахідка (gate-review, R9) — РЕАЛЬНИЙ false-positive баг у
+    # Знахідка рев'ю (gate-review, R9) — РЕАЛЬНИЙ false-positive баг у
     # самій реалізації гейту: рекурсивний FindAll шукав StringConstantExpressionAst
     # будь-де в правій частині присвоєння, включно з УСЕРЕДИНІ вкладеного
     # scriptblock-виразу. `$cmd = { 'Read-...' }` записувало ризиковий
@@ -3783,7 +3814,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateNormalizesScopeQualifiedVariableName ---
-    # Codex-знахідка (gate-review, R9): VariablePath.UserPath включає
+    # Знахідка рев'ю (gate-review, R9): VariablePath.UserPath включає
     # scope-префікс (`script:`) як частину рядка — `$script:reader` і
     # `$reader` (яке PowerShell реально резолвить з батьківського scope
     # до того самого значення) порівнювались як РІЗНІ імена, тож ця
@@ -3810,7 +3841,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     }
 
     # --- ReleaseGate/CutoverGateRespectsExplicitScriptScopeQualifierAtCallSite ---
-    # Codex-знахідка (gate-review, R10) — прямий регрес від R9: нормалізація
+    # Знахідка рев'ю (gate-review, R10) — прямий регрес від R9: нормалізація
     # scope-префіксу знімала ЗМІСТ явного кваліфікатора В МІСЦІ ВИКЛИКУ.
     # `& $script:reader` ЦІЛЕСПРЯМОВАНО звертається лише до script-scope
     # (кореня файлу), навіть коли вкладена функція має власне
@@ -3836,6 +3867,187 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             -Failure "явний `$script: кваліфікатор у МІСЦІ ВИКЛИКУ (`& `$script:reader) мусить цілеспрямовано резолвитись зі script-scope, навіть коли вкладена функція має власне незакваліфіковане `$reader — гейт не сміє пропускати цей виклик лише тому, що знайшов найближче (але семантично неправильне) локальне присвоєння"
     } finally {
         Remove-Item -LiteralPath $legacyReaderExplicitScopeFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ======================================================================
+    # ReleaseGate/LegacyReaderMatrix/* (issue #239): загрозо-орієнтована
+    # матриця обходів гейта LEGACY_READER_ISOLATION. Кожен клас обходу з
+    # docs\design\BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md має тут рядок-
+    # характеризацію на синтетичному тексті скрипта (у тимчасовому корені,
+    # продакшн-файли не чіпаються).
+    #   DETECTED       - гейт ловить обхід (регресія гейта провалить тест).
+    #   CLEAN          - коректно дозволена конструкція (немає хибного FAIL).
+    #   MISSED         - ВІДОМЕ ОБМЕЖЕННЯ: гейт обхід НЕ бачить. Рядок
+    #                    фіксує поточну поведінку; покращення гейта мусить
+    #                    свідомо змінити цей рядок разом з матрицею.
+    #   FALSE-POSITIVE - ВІДОМЕ ОБМЕЖЕННЯ: гейт хибно провалює безпечний код.
+    # Рішення власника про зупинку ітерацій над гейтом - issue #239.
+    # ======================================================================
+    function Get-BRAVOLegacyReaderMatrixVerdict {
+        param([string]$RelativePath, [string]$Text)
+        $matrixRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+        try {
+            $matrixFilePath = Join-Path $matrixRoot $RelativePath
+            [void][IO.Directory]::CreateDirectory((Split-Path -Parent $matrixFilePath))
+            [IO.File]::WriteAllText($matrixFilePath, $Text, (New-Object Text.UTF8Encoding($false)))
+            $matrixResult = Test-BRAVOConfigV2CutoverGates -Root $matrixRoot -ProductionEntryPointRelativePath @('entry.ps1')
+            return (@($matrixResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains($RelativePath + ' (') }).Count -gt 0)
+        } finally {
+            Remove-Item -LiteralPath $matrixRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $matrixModule = 'modules\BRAVO.Matrix\BRAVO.Matrix.psm1'
+    $matrixLoader = 'BRAVO_CONFIG_LOADER.ps1'
+    $matrixSanctionedLoader = @'
+function Read-BRAVOLegacyPrimaryRawOverrides { param($ConfigPath) }
+function Import-BravoLegacyPrimaryConfiguration { param($ConfigPath); $x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath $ConfigPath }
+function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyPrimaryAutoDetect); if (-not $DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }
+'@
+    $matrixRows = @(
+        # --- Виявлені класи ---
+        @{ Id = 'D01.DirectCall'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }' },
+        @{ Id = 'D02.DirectCallOtherCase'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { read-bravolegacyprimaryrawoverrides -ConfigPath X }' },
+        @{ Id = 'D03.SecondReaderFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }' },
+        @{ Id = 'D04.QuotedCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & 'Read-BRAVOLegacyPrimaryRawOverrides' -ConfigPath X }" },
+        @{ Id = 'D05.NestedScriptBlock'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Invoke-Command -ScriptBlock { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X } }' },
+        @{ Id = 'D06.StringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r -ConfigPath X }" },
+        @{ Id = 'D07.DotSourceVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; . `$r -ConfigPath X }" },
+        @{ Id = 'D08.ParentScopeVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction F { & `$r }" },
+        @{ Id = 'D09.ScriptQualifiedCallAtRoot'; Kind = 'DETECTED'; Path = $matrixModule; Text = "`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction F { & `$script:r }" },
+        @{ Id = 'D10.ParseErrorFailsClosed'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { if ( ' },
+        @{ Id = 'D11.SecondCallFromSanctionedCaller'; Kind = 'DETECTED'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nfunction Import-BravoLegacyPrimaryConfiguration { `$y = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Z }") },
+        @{ Id = 'D12.UnsanctionedCallInsideLoader'; Kind = 'DETECTED'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nfunction Invoke-Rogue { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Y }") },
+        # --- Коректно дозволене ---
+        @{ Id = 'C01.SanctionedLoaderCallSites'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixSanctionedLoader },
+        @{ Id = 'C02.CommentAndStringMention'; Kind = 'CLEAN'; Path = $matrixModule; Text = "# Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { 'Read-BRAVOLegacyPrimaryRawOverrides' }" },
+        @{ Id = 'C03.SafeReassignmentShadowsRiskyLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$c = 'Get-ChildItem'; & `$c }" },
+        # --- Gap 3: alias (виправлено в цьому PR) ---
+        @{ Id = 'A01.SetAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
+        @{ Id = 'A02.NewAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
+        @{ Id = 'A03.NamedNameValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A04.NamedValueBeforeName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -Value Read-BRAVOLegacyPrimaryRawOverrides -Name rdr`nfunction F { rdr }" },
+        @{ Id = 'A05.ColonBoundParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name:rdr -Value:Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A06.NamedWithOptionAndForce'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides -Option ReadOnly -Force`nfunction F { rdr }" },
+        @{ Id = 'A07.PositionalWithTrailingOption'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides -Option AllScope`nfunction F { rdr }" },
+        @{ Id = 'A08.OptionBeforePositionalValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Option ReadOnly rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A09.AliasToSecondReaderFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias imp Import-BravoLegacyPrimaryConfiguration`nfunction F { imp -ConfigPath X }" },
+        @{ Id = 'A10.CallThroughCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { & rdr }" },
+        @{ Id = 'A11.QuotedArguments'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name 'rdr' -Value 'read-bravolegacyprimaryrawoverrides'`nfunction F { RDR }" },
+        @{ Id = 'A12.AbbreviatedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Na rdr -Va Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A13.CallBeforeDefinitionOffset'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { rdr }`nSet-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides" },
+        @{ Id = 'A14.AliasToBenignCommand'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Get-ChildItem`nfunction F { rdr -Path X }" },
+        @{ Id = 'A15.AliasDefinedButNeverCalled'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides" },
+        @{ Id = 'A16.SanctionedLoaderWithBenignAlias'; Kind = 'CLEAN'; Path = $matrixLoader; Text = ($matrixSanctionedLoader + "`nSet-Alias gci2 Get-ChildItem") },
+        @{ Id = 'A21.VerboseSwitchBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Verbose rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A22.DebugAndWhatIfAndConfirmSwitches'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -Debug -WhatIf -Confirm:`$false rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A23.VerboseSwitchWithNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Verbose -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A24.ModuleQualifiedSetAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Microsoft.PowerShell.Utility\Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A25.ModuleQualifiedNewAliasOtherCase'; Kind = 'DETECTED'; Path = $matrixModule; Text = "microsoft.powershell.utility\new-alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A26.VerboseAliasVbBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -vb rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A27.DebugAliasDbBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -db rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A28.WhatIfAliasWiBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -wi rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A29.ConfirmAliasCfBeforePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -cf rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A30.SwitchAliasesBetweenNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Value Read-BRAVOLegacyPrimaryRawOverrides -VB -DB -WI -Name rdr`nfunction F { rdr }" },
+        @{ Id = 'A31.ValueTypedErrorActionAliasConsumesValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -ea SilentlyContinue rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A32.ValueTypedVariableAliasesConsumeValues'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias -ev e1 -ov o1 -pv p1 -ob 2 -infa Ignore rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A33.SwitchAliasesWithBenignAliasTarget'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias -vb -db -wi -cf rdr Get-ChildItem`nfunction F { rdr -Path X }" },
+        @{ Id = 'A34.SalBuiltinAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "sal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A35.NalBuiltinAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A36.SalBuiltinAliasNamed'; Kind = 'DETECTED'; Path = $matrixModule; Text = "SAL -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A37.NalBuiltinAliasNamedWithSwitchAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal -vb -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A38.ModuleQualifiedSalBuiltinAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Microsoft.PowerShell.Utility\sal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A39.SalAndNalToBenignCommand'; Kind = 'CLEAN'; Path = $matrixModule; Text = "sal rdr Get-ChildItem`nnal rdr2 Get-ChildItem`nfunction F { rdr -Path X; rdr2 -Path X }" },
+        @{ Id = 'A40.ParenthesizedAliasValuePositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A41.ParenthesizedAliasValueNamed'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A42.CastAndNestedParenAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr ([string](('Read-BRAVOLegacyPrimaryRawOverrides')))`nfunction F { rdr }" },
+        @{ Id = 'A43.ParenthesizedAliasNameAndValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "sal ('rdr') ('Read-BRAVOLegacyPrimaryRawOverrides')`nfunction F { rdr }" },
+        @{ Id = 'A44.ParenthesizedBenignAliasValue'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr ('Get-ChildItem')`nfunction F { rdr -Path X }" },
+        @{ Id = 'A45.SubExpressionAliasValueNotUnwrapped'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias rdr (`$('Read-BRAVOLegacyPrimaryRawOverrides'))`nfunction F { rdr }" },
+        @{ Id = 'T04.ParenthesizedTypedStringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = ('Read-BRAVOLegacyPrimaryRawOverrides'); & `$r }" },
+        @{ Id = 'T05.ParenthesizedUntypedVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = (('Read-BRAVOLegacyPrimaryRawOverrides')); & `$r }" },
+        @{ Id = 'T06.CastRightHandSideVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = [string]'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T07.ParenthesizedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$r = ('Get-ChildItem'); & `$r }" },
+        # --- QA-001: літерал-змінна з іменем alias-а рідера (виправлено в цьому PR) ---
+        @{ Id = 'A46.AliasNameInLiteralVariableCallOperator'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'rdr'; & `$cmd" },
+        @{ Id = 'A47.AliasNameInLiteralVariableNewAliasInFunction'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; & `$cmd -ConfigPath X }" },
+        @{ Id = 'A48.AliasNameInLiteralVariableNalDotInvocation'; Kind = 'DETECTED'; Path = $matrixModule; Text = "nal rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; . `$cmd }" },
+        @{ Id = 'A49.AliasNameInTypedParenVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { [string]`$cmd = ('rdr'); & `$cmd }" },
+        @{ Id = 'A50.AliasNameVariableNotAssignedToReaderAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'other'; & `$cmd }" },
+        @{ Id = 'A51.UnrelatedAliasNameInVariable'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem`nfunction F { `$cmd = 'gci2'; & `$cmd -Path X }" },
+        @{ Id = 'A52.AliasNameVariableSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { `$cmd = 'rdr'; `$cmd = 'Get-ChildItem'; & `$cmd }" },
+        # --- рев'ю PR #497 (F1/F2): рядки в подвійних лапках та параметризована ціль команди ---
+        @{ Id = 'T08.DoubleQuotedAliasValue'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr `"Read-BRAVOLegacyPrimaryRawOverrides`"; rdr" },
+        @{ Id = 'T09.DoubleQuotedTypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T10.DoubleQuotedUntypedRightHandSide'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$r = `"Read-BRAVOLegacyPrimaryRawOverrides`"; & `$r }" },
+        @{ Id = 'T11.ParenthesizedAliasNameAfterSetAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; & ('rdr')" },
+        @{ Id = 'T12.ParenthesizedLiteralVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'rdr'; & (`$cmd)" },
+        @{ Id = 'T13.ParenthesizedDirectReaderName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & ('Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
+        @{ Id = 'T14.DoubleQuotedDirectReaderCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `"Read-BRAVOLegacyPrimaryRawOverrides`" -ConfigPath X }" },
+        @{ Id = 'T15.ExpandableStringWithNestedExpressionBenignName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$n = 'Get'; `$r = `"`$n-ChildItem`"; & `$r }" },
+        @{ Id = 'T16.ParenthesizedBenignCommandName'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & ('Get-Date') }" },
+        @{ Id = 'T17.ParenthesizedBenignAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias gci2 Get-ChildItem; & ('gci2') -Path X" },
+        @{ Id = 'T18.ParenthesizedVariableOfBenignLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides; `$cmd = 'other'; & (`$cmd)" }
+        # --- друге рев'ю PR #497 (G1/G2/G3): каст у дужках, сеттер аліаса в дужках, function-drive ---
+        @{ Id = 'T19.CastVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; & ([string]`$cmd) }" },
+        @{ Id = 'T20.NestedCastParenVariableCallTarget'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; & (([string](`$cmd))) }" },
+        @{ Id = 'T21.CastVariableBenignLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$cmd = 'Get-Date'; & ([string]`$cmd) }" },
+        @{ Id = 'T22.ParenthesizedSetAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('Set-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T23.CastNewAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ([string]'New-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T24.ParenthesizedModuleQualifiedSetAliasSetter'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('Microsoft.PowerShell.Utility\Set-Alias') rdr Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T25.ParenthesizedShortSetterWithNamedParameters'; Kind = 'DETECTED'; Path = $matrixModule; Text = "& ('sal') -Name rdr -Value Read-BRAVOLegacyPrimaryRawOverrides; rdr" },
+        @{ Id = 'T26.ParenthesizedSetAliasBenign'; Kind = 'CLEAN'; Path = $matrixModule; Text = "& ('Set-Alias') gci2 Get-ChildItem; gci2 -Path X" },
+        @{ Id = 'T27.FunctionDriveUnbracedHyphenNameIsNotReaderCall'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `$function:Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
+        @{ Id = 'T28.FunctionDriveReaderBracedName'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:Read-BRAVOLegacyPrimaryRawOverrides} -ConfigPath X }" },
+        @{ Id = 'T29.FunctionDriveReaderDotSource'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { . `${function:Import-BravoLegacyPrimaryConfiguration} -ConfigPath X }" },
+        @{ Id = 'T30.FunctionDriveBenignFunction'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `$function:Get-Foo }" },
+        # --- третє рев'ю PR #497: нормалізація drive-залишку, alias-drive, залишкові ліміти ---
+        @{ Id = 'T31.FunctionDriveGlobalQualified'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:global:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T32.FunctionDriveScriptQualified'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:script:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T33.FunctionDriveLeadingBackslash'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { & `${function:\Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T34.FunctionDriveGlobalDotSource'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { . `${function:global:Read-BRAVOLegacyPrimaryRawOverrides} }" },
+        @{ Id = 'T35.AliasDriveReaderAlias'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias zz Read-BRAVOLegacyPrimaryRawOverrides; function F { & `${alias:zz} }" },
+        @{ Id = 'T36.AliasDriveBenignAlias'; Kind = 'CLEAN'; Path = $matrixModule; Text = "Set-Alias zz Get-ChildItem; function F { & `${alias:zz} }" },
+        @{ Id = 'T37.FunctionDriveBracedBenignFunction'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `${function:Get-Foo} }" },
+        @{ Id = 'T38.FunctionDriveBracedBenignGlobalQualified'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { & `${function:global:Get-Foo} }" },
+        @{ Id = 'G8.FunctionDriveStoredInVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$f = `${function:Read-BRAVOLegacyPrimaryRawOverrides}; & `$f }" },
+        @{ Id = 'G9.FunctionDriveInvokeMethod'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `${function:Read-BRAVOLegacyPrimaryRawOverrides}.Invoke() }" },
+        @{ Id = 'A17.AliasChain'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Alias a1 Read-BRAVOLegacyPrimaryRawOverrides`nSet-Alias a2 a1`nfunction F { a2 }" },
+        @{ Id = 'A18.AliasValueFromVariable'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$v = 'Read-BRAVOLegacyPrimaryRawOverrides'`nSet-Alias rdr `$v`nfunction F { rdr }" },
+        @{ Id = 'A19.SetItemAliasProvider'; Kind = 'MISSED'; Path = $matrixModule; Text = "Set-Item -Path Alias:rdr -Value Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr }" },
+        @{ Id = 'A20.SplattedSetAlias'; Kind = 'MISSED'; Path = $matrixModule; Text = "`$p = @{ Name = 'rdr'; Value = 'Read-BRAVOLegacyPrimaryRawOverrides' }`nSet-Alias @p`nfunction F { rdr }" },
+        # --- Gap 8: типізована змінна (виправлено в цьому PR) ---
+        @{ Id = 'T01.TypedStringVariable'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [string]`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T02.TypedWithValidationAttribute'; Kind = 'DETECTED'; Path = $matrixModule; Text = "function F { [ValidateNotNull()][string]`$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$r }" },
+        @{ Id = 'T03.TypedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; [string]`$r = 'Get-ChildItem'; & `$r }" },
+        # --- Відомі обмеження (рішення власника, issue #239) ---
+        @{ Id = 'G1.ExecutionOrderVsTextOffset'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & `$cmd }`n`$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'`nF" },
+        @{ Id = 'G2.NoGuardControlFlowCheck'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`nfunction Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); Import-BravoLegacyPrimaryConfiguration -ConfigPath X }" },
+        @{ Id = 'G4.MutuallyExclusiveIfElse'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { param(`$u); if (`$u) { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides' } else { `$cmd = 'Get-ChildItem' }; & `$cmd }" },
+        @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
+        @{ Id = 'G6.NonLiteralReassignmentDoesNotShadow'; Kind = 'FALSE-POSITIVE'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd = Get-SafeCommand; & `$cmd }" },
+        @{ Id = 'G7a.ScriptQualifiedAssignmentInFunctionCalledElsewhere'; Kind = 'MISSED'; Path = $matrixModule; Text = "function Set-It { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides' }`nfunction Use-It { & `$script:r }" },
+        @{ Id = 'G7b.ScriptQualifiedAssignmentAndCallSameFunction'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$script:r }" },
+        # --- Додаткові класи, виявлені під час аналізу (не з переліку #239) ---
+        @{ Id = 'X1.StringConcatenation'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacy' + 'PrimaryRawOverrides'; & `$c }" },
+        # X2: `& 'iex' '<літерал>'` (квотоване ім'я через оператор виклику) обходить і цей гейт, і
+        # ci/Test-BRAVOForbiddenPattern.ps1 (його регекс вимагає пропуск одразу після iex/Invoke-Expression).
+        @{ Id = 'X2.QuotedInvokeExpressionWithLiteral'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & 'iex' 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' }" },
+        @{ Id = 'X3.GetCommandSubexpression'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & (Get-Command 'Read-BRAVOLegacyPrimaryRawOverrides') -ConfigPath X }" },
+        @{ Id = 'X4.ModuleQualifiedName'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { BRAVO.Configuration\Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }" },
+        @{ Id = 'X5.FileOutsideScanTargets'; Kind = 'MISSED'; Path = 'ci\Rogue.ps1'; Text = 'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X' },
+        @{ Id = 'X6.UninspectedCommandStringNotExecutableAsWritten'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { powershell.exe -NoProfile -Command 'Read-BRAVOLegacyPrimaryRawOverrides' }" },
+        @{ Id = 'X7.ParameterSuppliedName'; Kind = 'MISSED'; Path = $matrixModule; Text = 'function F { param($c); & $c }' },
+        @{ Id = 'X8.HashtableMemberAsCommand'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$h = @{ c = 'Read-BRAVOLegacyPrimaryRawOverrides' }; & `$h.c }" }
+    )
+    foreach ($matrixRow in $matrixRows) {
+        $matrixViolation = Get-BRAVOLegacyReaderMatrixVerdict -RelativePath $matrixRow.Path -Text $matrixRow.Text
+        $matrixExpectViolation = ($matrixRow.Kind -eq 'DETECTED' -or $matrixRow.Kind -eq 'FALSE-POSITIVE')
+        $matrixLabel = if ($matrixRow.Kind -eq 'MISSED' -or $matrixRow.Kind -eq 'FALSE-POSITIVE') { 'KnownLimit.' + $matrixRow.Kind } else { $matrixRow.Kind }
+        Test-BRAVOCondition `
+            -Condition ($matrixViolation -eq $matrixExpectViolation) `
+            -Name ("ReleaseGate/LegacyReaderMatrix/" + $matrixRow.Id + "." + $matrixLabel) `
+            -Failure ("рядок матриці " + $matrixRow.Id + " (" + $matrixRow.Kind + "): очікувано violation=" + $matrixExpectViolation + ", отримано " + $matrixViolation + ". Для KnownLimit-рядків зміну результату (покращення гейта) треба свідомо відобразити тут і в docs\design\BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md (issue #239)")
     }
 
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
@@ -4683,13 +4895,13 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/ValidateOnlyNeverPersistsDiscov
         -Name "Governance/ValidateOnlyDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
 
-    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежний Codex
-    # review PR #207, знайдений ПІСЛЯ фіксу вище): Import-
+    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежне
+    # рев'ю PR #207, знайдений ПІСЛЯ фіксу вище): Import-
     # BRAVODiscoveryBaseline сам може мігрувати legacy-baseline файл у
     # canonical розташування (запис у $StateRoot) незалежно від
     # -ConfirmDiscoveryBaseline — на самому лише виклику під час читання.
     # Перевірка вище (Save-BRAVODiscoveryBaseline guard) цей шлях не
-    # покриває: Codex явно вказав, що "the new regex test also misses
+    # покриває: рев'ю явно вказало, що "the new regex test also misses
     # this path". -ReadOnly:$ValidateOnly у виклику нижче — фікс.
     Test-BRAVOCondition `
         -Condition (
@@ -6774,9 +6986,16 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
         $closureProbe = & {
             param([int]$GlobalLimit)
             $MaximumVariableCount = $GlobalLimit * 4
+            # Змінні створюються звичайними присвоєннями (dot-source згенерованого
+            # блоку в ЦІЙ області), а не Set-Variable -Name у циклі: Set-Variable
+            # трактує -Name як шаблон і щоразу скануює всі змінні області —
+            # квадратична вартість (~19 с на 8448 змінних проти ~0.3 с). Кількість,
+            # імена й значення змінних, область і ефект на closure ті самі.
+            $closurePadBuilder = New-Object System.Text.StringBuilder
             for ($padIndex = 0; $padIndex -lt ($GlobalLimit + 256); $padIndex++) {
-                Set-Variable -Name ("closurePad$padIndex") -Value $padIndex
+                [void]$closurePadBuilder.Append('$closurePad').Append($padIndex).Append('=').Append($padIndex).Append(';')
             }
+            . ([scriptblock]::Create($closurePadBuilder.ToString()))
             $closureDependency = New-Object System.Collections.Generic.List[string]
             $directCallback = { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure()
             $narrowCallback = & { param($closureDependency) { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure() } $closureDependency
@@ -6803,3 +7022,379 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
 }
 
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope' } }
+if (Enter-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree') { try {
+
+# =====================================================================
+# У продуктовому дереві немає файлів AI-агентів
+# =====================================================================
+# Файли агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json) вилучено
+# з репозиторію; цей guard не дає їм повернутись. Політика - єдина
+# канонічна реалізація ci\BRAVOAgentFilePolicy.ps1 (її ж застосовує гейт
+# AGENT_FILES_IN_ARTIFACT у ci\New-BRAVOReleaseArtifact.ps1).
+#
+# Джерело істини:
+#   * корінь є верхом git work tree (git доступний) -> git-індекс
+#     (git ls-files): на машині розробника ігнорований/неперевіряний локальний
+#     .claude\ легітимний, неприпустимо лише щоб файл знову став tracked.
+#     Збій git у цьому режимі - FAIL (fail closed), а не пропуск;
+#   * інакше (встановлений комплект / staging без git, git відсутній, корінь
+#     не верх репозиторію) -> файлова система під коренем (разом із
+#     порожніми й прихованими каталогами).
+# Верх work tree визначається порожнім `git rev-parse --show-prefix`, а не
+# порівнянням рядків шляху: тимчасові каталоги Windows мають короткі (8.3)
+# імена, і рядкове порівняння з довгим шляхом від git давало б хибний режим.
+. (Join-Path $root 'ci\BRAVOAgentFilePolicy.ps1')
+
+function Get-BRAVOSelfTestAgentFileScan {
+    # GitCommandName існує лише для проби відсутнього git (без зміни PATH self-test).
+    param([Parameter(Mandatory = $true)][string]$TreeRoot, [string]$GitCommandName = 'git')
+
+    $scan = [pscustomobject]@{ Mode = ''; Violations = @(); Error = '' }
+    $gitCommand = @(Get-Command -Name $GitCommandName -CommandType Application -ErrorAction SilentlyContinue)
+    $useGit = $false
+    $previousErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($gitCommand.Count -gt 0) {
+            $insideOutput = (& git -C $TreeRoot rev-parse --is-inside-work-tree 2>$null | Out-String).Trim()
+            $insideExit = $LASTEXITCODE
+            if ($insideExit -eq 0 -and $insideOutput -eq 'true') {
+                $prefixOutput = (& git -C $TreeRoot rev-parse --show-prefix 2>$null | Out-String).Trim()
+                if ($LASTEXITCODE -ne 0) {
+                    $scan.Error = "git rev-parse --show-prefix завершився з кодом $LASTEXITCODE"
+                    return $scan
+                }
+                $useGit = ($prefixOutput.Length -eq 0)
+            } elseif (Test-Path -LiteralPath (Join-Path $TreeRoot '.git')) {
+                # Є ознака репозиторію, але git його не розпізнав: не вгадуємо.
+                $scan.Error = "у корені є .git, але git rev-parse завершився з кодом $insideExit (вивід: '$insideOutput')"
+                return $scan
+            }
+        }
+
+        if ($useGit) {
+            $scan.Mode = 'git-index'
+            $listing = & git -C $TreeRoot -c core.quotepath=off ls-files -z 2>$null | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                $scan.Error = "git ls-files -z завершився з кодом $LASTEXITCODE"
+                return $scan
+            }
+            $trackedPaths = @($listing.Split([char]0) | Where-Object { $_.Length -gt 0 })
+            $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $trackedPaths)
+        } else {
+            $scan.Mode = 'filesystem'
+            try {
+                $scan.Violations = @(Get-BRAVOAgentFilePolicyViolation -RelativePath (Get-BRAVOAgentFilePolicyTreePath -Root $TreeRoot))
+            } catch {
+                $scan.Error = "не вдалося перелічити дерево: $($_.Exception.Message)"
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    return $scan
+}
+
+# --- Чиста політика: заборонені форми ---
+$agentPolicyForbidden = @(
+    '.claude', '.claude/settings.json', '.claude\settings.json', 'sub/.CLAUDE/x', 'a\b\.codex', '.codex/config.toml',
+    'CLAUDE.md', 'claude.md', 'sub/AGENTS.md', 'docs\Agents.MD', '.mcp.json', 'x/y/.MCP.JSON'
+)
+$agentPolicyLookalikes = @(
+    'docs/agents/issue-tracker.md', 'CLAUDE.md.example', 'my.claude/x', 'x.codex', 'x.codex/y.txt', 'docs/AGENTS-notes.md',
+    'docs\CLAUDE-notes.md', 'claude.md.txt', 'mcp.json', '.mcp.json.bak', 'docs/claude/x.md', 'README.md', ''
+)
+$agentPolicyForbiddenHit = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $agentPolicyForbidden)
+$agentPolicyLookalikeHit = @(Get-BRAVOAgentFilePolicyViolation -RelativePath $agentPolicyLookalikes)
+Test-BRAVOCondition `
+    -Condition ($agentPolicyForbiddenHit.Count -eq $agentPolicyForbidden.Count) `
+    -Name 'Governance/NoAgentFilesInTree.PolicyFlagsEveryForbiddenForm' `
+    -Failure ("політика мусить позначати КОЖНУ заборонену форму (обидва роздільники, будь-який регістр, будь-яка глибина); позначено " +
+        "$($agentPolicyForbiddenHit.Count) з $($agentPolicyForbidden.Count): [" + [string]::Join(', ', $agentPolicyForbiddenHit) + "]")
+Test-BRAVOCondition `
+    -Condition ($agentPolicyLookalikeHit.Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.PolicyIgnoresLookalikes' `
+    -Failure ("схожі імена (CLAUDE.md.example, my.claude/x, x.codex, docs/agents/..., docs/AGENTS-notes.md) НЕ є порушенням; хибно позначено: [" +
+        [string]::Join(', ', $agentPolicyLookalikeHit) + "]")
+
+# --- Режим файлової системи: фікстура у TEMP ---
+$agentFixtureDirty = ''
+$agentFixtureClean = ''
+$agentFixtureDirtyScan = $null
+$agentFixtureCleanScan = $null
+try {
+    $agentFixtureDirty = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_DIRTY_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentFixtureClean = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_CLEAN_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentUtf8NoBom = New-Object Text.UTF8Encoding($false)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureDirty '.claude'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty '.claude\settings.json'), "{}`r`n", $agentUtf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty 'CLAUDE.md'), "x`r`n", $agentUtf8NoBom)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureDirty 'sub\.codex'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureDirty 'ok.txt'), "x`r`n", $agentUtf8NoBom)
+
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureClean 'docs\agents'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'docs\agents\issue-tracker.md'), "x`r`n", $agentUtf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'CLAUDE.md.example'), "x`r`n", $agentUtf8NoBom)
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentFixtureClean 'my.claude'))
+    [IO.File]::WriteAllText((Join-Path $agentFixtureClean 'my.claude\x'), "x`r`n", $agentUtf8NoBom)
+
+    $agentFixtureDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureDirty
+    $agentFixtureCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentFixtureClean
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentFixtureDirty)) { Remove-Item -LiteralPath $agentFixtureDirty -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not [string]::IsNullOrEmpty($agentFixtureClean)) { Remove-Item -LiteralPath $agentFixtureClean -Recurse -Force -ErrorAction SilentlyContinue }
+}
+$agentFixtureDirtyHit = if ($null -ne $agentFixtureDirtyScan) { @($agentFixtureDirtyScan.Violations) } else { @() }
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $agentFixtureDirtyScan -and $agentFixtureDirtyScan.Mode -eq 'filesystem' -and $agentFixtureDirtyScan.Error -eq '' -and
+        $agentFixtureDirtyHit.Count -eq 4 -and
+        ($agentFixtureDirtyHit -contains '.claude') -and ($agentFixtureDirtyHit -contains '.claude\settings.json') -and
+        ($agentFixtureDirtyHit -contains 'CLAUDE.md') -and ($agentFixtureDirtyHit -contains 'sub\.codex')
+    ) `
+    -Name 'Governance/NoAgentFilesInTree.FilesystemFixtureFlagged' `
+    -Failure ("фікстура без git (.claude\settings.json, CLAUDE.md, порожній sub\.codex) мусить давати рівно 4 порушення в режимі filesystem; отримано: [" +
+        [string]::Join(', ', $agentFixtureDirtyHit) + "] режим=$(if ($null -ne $agentFixtureDirtyScan) { $agentFixtureDirtyScan.Mode } else { '<немає>' }) помилка=$(if ($null -ne $agentFixtureDirtyScan) { $agentFixtureDirtyScan.Error } else { '' })")
+Test-BRAVOCondition `
+    -Condition ($null -ne $agentFixtureCleanScan -and $agentFixtureCleanScan.Mode -eq 'filesystem' -and $agentFixtureCleanScan.Error -eq '' -and @($agentFixtureCleanScan.Violations).Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.FilesystemCleanFixtureNotFlagged' `
+    -Failure ("чиста фікстура (лише схожі імена) не повинна давати порушень; отримано: [" +
+        $(if ($null -ne $agentFixtureCleanScan) { [string]::Join(', ', @($agentFixtureCleanScan.Violations)) } else { '<немає>' }) + "]")
+
+# --- Режим git-індексу: тимчасовий репозиторій ---
+# Production-сервери запускають self-test без git: тоді перевірка позначається
+# НЕДОСТУПНО через -EnvironmentLimitation (існуюча конвенція, див.
+# ReleaseArtifact/RejectsStaleProvenanceContent), а не мовчки проходить.
+# Спершу доводимо наявність git: без нього жоден git-залежний фікстурний крок
+# (включно з builder-фікстурами нижче) не виконується - виклик відсутньої
+# команди дав би CommandNotFoundException і обірвав би секцію ДО перевірки
+# реального дерева.
+$agentGitAvailable = (@(Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue).Count -gt 0)
+$agentNoGitLimitation = ''
+if (-not $agentGitAvailable) { $agentNoGitLimitation = 'git відсутній на цьому хості (встановлений комплект без git); git-залежні фікстури не виконувались' }
+
+# Проба відсутнього git (незалежно від наявності справжнього): корінь із каталогом
+# .git та неіснуючою командою git мусить перевірятись у режимі filesystem без
+# винятку - так поводиться встановлений комплект без git.
+$agentNoGitProbeRoot = ''
+$agentNoGitDirtyScan = $null
+$agentNoGitCleanScan = $null
+try {
+    $agentNoGitProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_NOGIT_{0}" -f [guid]::NewGuid().ToString('N'))
+    $agentNoGitBogus = 'no-such-git-' + [guid]::NewGuid().ToString('N')
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'clean\.git'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.git'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $agentNoGitProbeRoot 'dirty\.claude'))
+    $agentNoGitCleanScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'clean') -GitCommandName $agentNoGitBogus
+    $agentNoGitDirtyScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentNoGitProbeRoot 'dirty') -GitCommandName $agentNoGitBogus
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentNoGitProbeRoot)) { Remove-Item -LiteralPath $agentNoGitProbeRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $agentNoGitCleanScan -and $agentNoGitCleanScan.Mode -eq 'filesystem' -and $agentNoGitCleanScan.Error -eq '' -and @($agentNoGitCleanScan.Violations).Count -eq 0 -and
+        $null -ne $agentNoGitDirtyScan -and $agentNoGitDirtyScan.Mode -eq 'filesystem' -and $agentNoGitDirtyScan.Error -eq '' -and @($agentNoGitDirtyScan.Violations).Count -eq 1
+    ) `
+    -Name 'Governance/NoAgentFilesInTree.GitAbsentFallsBackToFilesystemWithoutException' `
+    -Failure "без git (імітація неіснуючою командою) перевірка мусить іти у режимі filesystem без винятку; очікується: clean=0 (.git не порушення), dirty=1 (.claude). Отримано clean=$(if ($null -ne $agentNoGitCleanScan) { @($agentNoGitCleanScan.Violations).Count } else { '<немає>' }) dirty=$(if ($null -ne $agentNoGitDirtyScan) { @($agentNoGitDirtyScan.Violations).Count } else { '<немає>' })"
+
+$agentGitFixture = ''
+$agentGitLimitation = $agentNoGitLimitation
+$agentGitReady = $false
+$agentGitUntrackedScan = $null
+$agentGitTrackedScan = $null
+$agentGitSubdirScan = $null
+if ($agentGitAvailable) {
+try {
+    $agentGitFixture = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_GIT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($agentGitFixture)
+    $agentUtf8NoBomGit = New-Object Text.UTF8Encoding($false)
+    $previousErrorActionAgentGit = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & git -C $agentGitFixture -c init.defaultBranch=master init --quiet 2>&1
+        $agentGitReady = ($LASTEXITCODE -eq 0)
+        if ($agentGitReady) {
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture '.gitignore'), ".claude/`r`n", $agentUtf8NoBomGit)
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'ok.txt'), "x`r`n", $agentUtf8NoBomGit)
+            [void][IO.Directory]::CreateDirectory((Join-Path $agentGitFixture '.claude'))
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture '.claude\settings.json'), "{}`r`n", $agentUtf8NoBomGit)
+            [void][IO.Directory]::CreateDirectory((Join-Path $agentGitFixture 'sub'))
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'sub\a.txt'), "x`r`n", $agentUtf8NoBomGit)
+            $null = & git -C $agentGitFixture add -A 2>&1
+            $agentGitReady = ($LASTEXITCODE -eq 0)
+        }
+        if ($agentGitReady) {
+            # Ігнорований untracked .claude\ є, але в індексі його немає.
+            $agentGitUntrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+            # Підкаталог репозиторію не є верхом work tree -> режим файлової системи.
+            $agentGitSubdirScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot (Join-Path $agentGitFixture 'sub')
+            [IO.File]::WriteAllText((Join-Path $agentGitFixture 'CLAUDE.md'), "x`r`n", $agentUtf8NoBomGit)
+            $null = & git -C $agentGitFixture add -f CLAUDE.md 2>&1
+            $agentGitReady = ($LASTEXITCODE -eq 0)
+        }
+        if ($agentGitReady) {
+            $agentGitTrackedScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $agentGitFixture
+        } else {
+            $agentGitLimitation = 'git недоступний або не може створити тимчасовий репозиторій'
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionAgentGit
+    }
+} finally {
+    if (-not [string]::IsNullOrEmpty($agentGitFixture)) { Remove-Item -LiteralPath $agentGitFixture -Recurse -Force -ErrorAction SilentlyContinue }
+}
+}
+$agentGitUntrackedOk = ($null -ne $agentGitUntrackedScan -and $agentGitUntrackedScan.Mode -eq 'git-index' -and $agentGitUntrackedScan.Error -eq '' -and @($agentGitUntrackedScan.Violations).Count -eq 0)
+$agentGitTrackedOk = ($null -ne $agentGitTrackedScan -and $agentGitTrackedScan.Mode -eq 'git-index' -and $agentGitTrackedScan.Error -eq '' -and
+    @($agentGitTrackedScan.Violations).Count -eq 1 -and @($agentGitTrackedScan.Violations)[0] -eq 'CLAUDE.md')
+$agentGitSubdirOk = ($null -ne $agentGitSubdirScan -and $agentGitSubdirScan.Mode -eq 'filesystem' -and $agentGitSubdirScan.Error -eq '')
+Test-BRAVOCondition `
+    -Condition ($agentGitUntrackedOk -and $agentGitTrackedOk) `
+    -Name 'Governance/NoAgentFilesInTree.GitIndexFlagsTrackedIgnoresIgnoredUntracked' `
+    -EnvironmentLimitation $agentGitLimitation `
+    -Failure ("у git-режимі tracked CLAUDE.md мусить бути порушенням, а ігнорований untracked .claude\ - ні. untracked-ok=$agentGitUntrackedOk (режим=$(if ($null -ne $agentGitUntrackedScan) { $agentGitUntrackedScan.Mode } else { '<немає>' }), помилка=$(if ($null -ne $agentGitUntrackedScan) { $agentGitUntrackedScan.Error } else { '' })), " +
+        "tracked-ok=$agentGitTrackedOk (порушень=$(if ($null -ne $agentGitTrackedScan) { [string]::Join(', ', @($agentGitTrackedScan.Violations)) } else { '<немає>' }))")
+Test-BRAVOCondition `
+    -Condition $agentGitSubdirOk `
+    -Name 'Governance/NoAgentFilesInTree.SubdirectoryOfRepoUsesFilesystemMode' `
+    -EnvironmentLimitation $agentGitLimitation `
+    -Failure "корінь, що не є верхом git work tree (підкаталог репозиторію), мусить перевірятись у режимі filesystem; режим=$(if ($null -ne $agentGitSubdirScan) { $agentGitSubdirScan.Mode } else { '<немає>' })"
+
+# --- Гейт AGENT_FILES_IN_ARTIFACT у ci\New-BRAVOReleaseArtifact.ps1 ---
+# Фікстура-репозиторій: база з (або без) CLAUDE.md + чистий коміт-штамп
+# (змінені лише VERSION.json і RUNTIME_MANIFEST.json), щоб провенанс пройшов
+# і збірка дійшла до розпакованого staging. Маркер ASCII (кодова сторінка
+# stderr дочірнього процесу), як у ReleaseArtifact/RejectsStaleProvenanceContent.
+$agentBuilderLimitation = $agentNoGitLimitation
+$agentBuilderDirtyOutput = ''
+$agentBuilderCleanOutput = ''
+$agentBuilderRoots = @('', '')
+if ($agentGitAvailable) {
+try {
+    $agentBuilderRoots = @(
+        (Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_ART_D_{0}" -f [guid]::NewGuid().ToString('N'))),
+        (Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AGENTFILES_ART_C_{0}" -f [guid]::NewGuid().ToString('N')))
+    )
+    $agentBuilderUtf8 = New-Object Text.UTF8Encoding($false)
+    $previousErrorActionAgentBuilder = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        for ($agentBuilderIndex = 0; $agentBuilderIndex -lt 2; $agentBuilderIndex++) {
+            $agentBuilderRoot = $agentBuilderRoots[$agentBuilderIndex]
+            [void][IO.Directory]::CreateDirectory($agentBuilderRoot)
+            $null = & git -C $agentBuilderRoot -c init.defaultBranch=master init --quiet 2>&1
+            if ($LASTEXITCODE -ne 0) { $agentBuilderLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'; break }
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'code.txt'), "v1`r`n", $agentBuilderUtf8)
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'RUNTIME_MANIFEST.json'), "{}`r`n", $agentBuilderUtf8)
+            if ($agentBuilderIndex -eq 0) { [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'CLAUDE.md'), "x`r`n", $agentBuilderUtf8) }
+            $zeroCommit = '0000000000000000000000000000000000000000'
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'VERSION.json'),
+                ('{{"product":"BRAVO-Toolkit","packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $zeroCommit.Substring(0, 7), $zeroCommit), $agentBuilderUtf8)
+            $null = & git -C $agentBuilderRoot add -A 2>&1
+            $null = & git -C $agentBuilderRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'code' --quiet 2>&1
+            $agentBuilderBase = (& git -C $agentBuilderRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $agentBuilderBase -notmatch '^[0-9a-f]{40}$') { $agentBuilderLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'; break }
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'VERSION.json'),
+                ('{{"product":"BRAVO-Toolkit","packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $agentBuilderBase.Substring(0, 7), $agentBuilderBase), $agentBuilderUtf8)
+            [IO.File]::WriteAllText((Join-Path $agentBuilderRoot 'RUNTIME_MANIFEST.json'), "{ }`r`n", $agentBuilderUtf8)
+            $null = & git -C $agentBuilderRoot add -A 2>&1
+            $null = & git -C $agentBuilderRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stamp' --quiet 2>&1
+            $agentBuilderOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $agentBuilderRoot -Ref 'HEAD' -OutputDir (Join-Path $agentBuilderRoot 'out') 2>&1 | Out-String
+            if ($agentBuilderIndex -eq 0) { $agentBuilderDirtyOutput = $agentBuilderOutput } else { $agentBuilderCleanOutput = $agentBuilderOutput }
+        }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionAgentBuilder
+    }
+} finally {
+    foreach ($agentBuilderCleanup in $agentBuilderRoots) {
+        if (-not [string]::IsNullOrEmpty($agentBuilderCleanup)) { Remove-Item -LiteralPath $agentBuilderCleanup -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+}
+Test-BRAVOCondition `
+    -Condition ($agentBuilderDirtyOutput.Contains('AGENT_FILES_IN_ARTIFACT:') -and $agentBuilderDirtyOutput.Contains('CLAUDE.md')) `
+    -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactRejectsCommittedAgentFile' `
+    -EnvironmentLimitation $agentBuilderLimitation `
+    -Failure "ci\New-BRAVOReleaseArtifact.ps1 мусить відмовляти (маркер AGENT_FILES_IN_ARTIFACT з іменем файлу), коли ref містить закомічений CLAUDE.md; вивід: $agentBuilderDirtyOutput"
+Test-BRAVOCondition `
+    -Condition (-not $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT:') -and $agentBuilderCleanOutput.Contains('AGENT_FILES_IN_ARTIFACT (')) `
+    -Name 'Governance/NoAgentFilesInTree.ReleaseArtifactAcceptsTreeWithoutAgentFiles' `
+    -EnvironmentLimitation $agentBuilderLimitation `
+    -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має спрацьовувати AGENT_FILES_IN_ARTIFACT на дереві без файлів агентів, а гейт мусить явно підтвердити проходження (рядок 'Гейт AGENT_FILES_IN_ARTIFACT (...)', ASCII-маркер 'AGENT_FILES_IN_ARTIFACT ('); вивід: $agentBuilderCleanOutput"
+
+# --- Реальне дерево ---
+$agentRealScan = Get-BRAVOSelfTestAgentFileScan -TreeRoot $root
+$agentRealHit = @($agentRealScan.Violations)
+Test-BRAVOCondition `
+    -Condition ($agentRealScan.Error -eq '' -and $agentRealHit.Count -eq 0) `
+    -Name 'Governance/NoAgentFilesInTree.RealTreeHasNoAgentFiles' `
+    -Failure ("продуктове дерево (режим: $($agentRealScan.Mode)) не повинно містити файлів AI-агентів (.claude/, .codex/, AGENTS.md, CLAUDE.md, .mcp.json); " +
+        "порушення ($($agentRealHit.Count)): [" + [string]::Join(', ', @($agentRealHit | Select-Object -First 10)) + "] помилка перевірки: '$($agentRealScan.Error)'")
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/NoAgentFilesInTree' } }
+
+if (Enter-BRAVOSelfTestSection -Name 'StaticAnalysis/SiteIdentifierGuard') { try {
+
+    # 5.2.6 (D7): guard реальних ідентифікаторів майданчиків у
+    # ci\Test-BRAVOForbiddenPattern.ps1 має ловити значення і всередині
+    # складених токенів (суфікс, розширення, UNC-шлях, злиття з іншим
+    # словом на межі регістру), і в UTF-16-файлах, але не заглушки. Перевірка на СИНТЕТИЧНИХ токенах через
+    # -ExtraIdentifierHash: справжні значення в self-test не потрапляють.
+    $identifierGuardScript = Join-Path $root 'ci\Test-BRAVOForbiddenPattern.ps1'
+    $identifierProbeSha256 = [Security.Cryptography.SHA256]::Create()
+    $identifierProbeHashes = @(
+        foreach ($probeToken in @('ZZPROBE-HOST', '198.51.100.77', 'ZZPROBEHOST')) {
+            -join ($identifierProbeSha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($probeToken.ToUpperInvariant())) | ForEach-Object { $_.ToString('x2') })
+        }
+    )
+    $identifierProbeSha256.Dispose()
+    $identifierProbeScenarios = @(
+        @{ Label = 'PlaceholderOnly'; Encoding = 'UTF8'; Text = "Хост HOST-11, майданчик SITE-A, адреса 203.0.113.10."; ExpectViolation = $false },
+        @{ Label = 'ExactToken'; Encoding = 'UTF8'; Text = "Прогін на zzprobe-host завершився."; ExpectViolation = $true },
+        @{ Label = 'UnderscoreSuffix'; Encoding = 'UTF8'; Text = "Копія ZZPROBE-HOST_backup створена."; ExpectViolation = $true },
+        @{ Label = 'UncPathWithDomain'; Encoding = 'UTF8'; Text = "Шлях \\ZZPROBE-HOST.example.invalid\share\BRAVO"; ExpectViolation = $true },
+        @{ Label = 'IpWithExtension'; Encoding = 'UTF8'; Text = "Файл 198.51.100.77.log збережено."; ExpectViolation = $true },
+        @{ Label = 'Utf16Le'; Encoding = 'Unicode'; Text = "Звіт з ZZPROBE-HOST у UTF-16."; ExpectViolation = $true },
+        @{ Label = 'CamelCaseCompound'; Encoding = 'UTF8'; Text = "Каталог BRAVO-ZzprobeHostAcceptance створено."; ExpectViolation = $true },
+        @{ Label = 'UpperPrefixCompound'; Encoding = 'UTF8'; Text = "Каталог BRAVOZzprobeHostLogs створено."; ExpectViolation = $true },
+        # Межа регістру всередині слова не ділить: 'Hosting' — не 'Host'.
+        @{ Label = 'CamelCaseNoBoundary'; Encoding = 'UTF8'; Text = "Сервіс ZzprobeHosting працює."; ExpectViolation = $false },
+        # Кеш вердиктів чутливий до регістру: той самий токен в одному
+        # регістрі раніше в тексті не ховає злиття на межі регістру.
+        @{ Label = 'CaseSensitiveCache'; Encoding = 'UTF8'; Text = "Каталоги ZZPROBEHOSTLOGS і ZzprobeHostLogs."; ExpectViolation = $true }
+    )
+    $identifierProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_IDENTIFIER_GUARD_PROBE_{0}" -f [guid]::NewGuid().ToString('N'))
+    $identifierProbeResults = @{}
+    try {
+        [void][IO.Directory]::CreateDirectory($identifierProbeRoot)
+        # Маркер кореня репозиторію для власної перевірки скрипта.
+        [IO.File]::WriteAllText((Join-Path $identifierProbeRoot 'BRAVO_SELF_TEST.ps1'), '', (New-Object Text.UTF8Encoding($true)))
+        $probeDocPath = Join-Path $identifierProbeRoot 'PROBE.md'
+        $previousErrorAction = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            foreach ($scenario in $identifierProbeScenarios) {
+                if ($scenario.Encoding -eq 'Unicode') {
+                    [IO.File]::WriteAllText($probeDocPath, $scenario.Text, [Text.Encoding]::Unicode)
+                } else {
+                    [IO.File]::WriteAllText($probeDocPath, $scenario.Text, (New-Object Text.UTF8Encoding($false)))
+                }
+                $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $identifierGuardScript -Root $identifierProbeRoot -ExtraIdentifierHash ($identifierProbeHashes -join ',') 2>&1
+                $identifierProbeResults[$scenario.Label] = $LASTEXITCODE
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorAction
+        }
+    } finally {
+        Remove-Item -LiteralPath $identifierProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($scenario in $identifierProbeScenarios) {
+        $probeExitCode = $identifierProbeResults[$scenario.Label]
+        Test-BRAVOCondition `
+            -Condition ((($probeExitCode -ne 0) -eq $scenario.ExpectViolation) -and $null -ne $probeExitCode) `
+            -Name "StaticAnalysis/SiteIdentifierGuard[$($scenario.Label)]" `
+            -Failure "ci\Test-BRAVOForbiddenPattern.ps1: сценарій $($scenario.Label) — очікувалось $(if ($scenario.ExpectViolation) { 'порушення (код не 0)' } else { 'чистий прохід (код 0)' }), отримано код $probeExitCode"
+    }
+
+} catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'StaticAnalysis/SiteIdentifierGuard' } }
