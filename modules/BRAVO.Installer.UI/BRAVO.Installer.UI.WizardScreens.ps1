@@ -864,6 +864,10 @@ function Complete-BRAVOInstallerExecution {
     $Context.Exec = $null
     $vm = ConvertTo-BRAVOInstallerResultViewModel -Result $Result -Operation $Context.Wizard.Operation -NoResultReason $Reason
     $Context.LastResultViewModel = $vm
+    # Успішний Install у нестандартний каталог: запам'ятовуємо підтверджений root у
+    # ГОЛОВНОМУ контексті (Finish скидає лише стан майстра), інакше State піде у default.
+    $installedRoot = Get-BRAVOInstallerConfirmedInstallRoot -Result $Result -Plan $Context.Wizard.Plan -Operation $Context.Wizard.Operation
+    if (-not [string]::IsNullOrEmpty($installedRoot)) { $Context.RuntimeRoot = $installedRoot }
     if ($vm.RepeatBlocked) { $Context.RepeatBlocked = $true }
     Set-BRAVOInstallerNavEnabled -Context $Context -Enabled $true
     Set-BRAVOInstallerBusy -Context $Context -Busy $false -Text ''

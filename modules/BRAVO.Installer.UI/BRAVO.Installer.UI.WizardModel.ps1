@@ -1001,3 +1001,21 @@ function Get-BRAVOInstallerPlanSelfTest {
     }
     $false
 }
+
+function Get-BRAVOInstallerConfirmedInstallRoot {
+    <#
+    .SYNOPSIS
+        Каталог, який оператор підтвердив у плані й у який Install успішно
+        встановив BRAVO. Повертає '' для будь-якого іншого результату (не Install,
+        не Success/SuccessWithWarnings, немає плану): тоді головний контекст не
+        змінюється. Результат потрібен, щоб State після встановлення в нестандартний
+        каталог не перевіряв стандартний і не показував «не встановлено».
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Result, [AllowNull()][object]$Plan, [string]$Operation = '')
+    $status = [string](Get-BRAVOInstallerProperty -InputObject $Result -Name 'status' -Default '')
+    if ($status -ne 'Success' -and $status -ne 'SuccessWithWarnings') { return '' }
+    $action = [string](Get-BRAVOInstallerProperty -InputObject $Result -Name 'action' -Default $Operation)
+    if ($action -ne 'Install') { return '' }
+    [string](Get-BRAVOInstallerProperty -InputObject $Plan -Name 'runtimeRoot' -Default '')
+}
