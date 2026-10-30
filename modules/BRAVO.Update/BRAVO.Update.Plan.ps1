@@ -192,6 +192,20 @@ function Format-BRAVOUpdateByteSize {
 
 # --- Передумови й fingerprint ------------------------------------------------
 
+function Resolve-BRAVOUpdateTaskRuntimeRoot {
+    # Корінь, з ефективної конфігурації якого визначається область керованих задач (TaskPath + імена).
+    # Install ставить у ЩЕ НЕ ІСНУЮЧИЙ корінь: його BRAVO_CONFIG_LOADER.ps1 немає (adapter кине виняток), а виконувати конфігурацію
+    # з цілі до розгортання не можна. Тому для Install область задач бере ДОВІРЕНА конфігурація запущеного комплекту (toolkit,
+    # цілісність якого перевіряє guard), а не ціль. Для Update/Repair - корінь установки.
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Action = '', [Parameter(Mandatory = $true)][string]$RuntimeRoot, [string]$ToolkitRoot = '')
+    if ($Action -ceq 'Install') {
+        if ([string]::IsNullOrWhiteSpace($ToolkitRoot)) { $ToolkitRoot = [string]$script:BRAVOUpdateToolkitRoot }
+        if (-not [string]::IsNullOrWhiteSpace($ToolkitRoot)) { return $ToolkitRoot }
+    }
+    return $RuntimeRoot
+}
+
 function Get-BRAVODeploymentPreconditions {
     # Впорядкований набір вхідних даних fingerprint-а (CONTRACTS §5). Порядок і
     # імена полів фіксовані: fingerprint — це SHA-256 канонічного JSON цього
@@ -202,9 +216,12 @@ function Get-BRAVODeploymentPreconditions {
         [Parameter(Mandatory = $true)][string]$StateRoot,
         [string]$ArtifactSha256 = '',
         [string]$ManifestSha256 = '',
-        [hashtable]$Adapter = $null
+        [hashtable]$Adapter = $null,
+        # Корінь для області задач (Install: комплект, не ціль); порожній = RuntimeRoot.
+        [string]$TaskRuntimeRoot = ''
     )
-    $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $RuntimeRoot
+    if ([string]::IsNullOrWhiteSpace($TaskRuntimeRoot)) { $TaskRuntimeRoot = $RuntimeRoot }
+    $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $TaskRuntimeRoot
     $taskInputs = 'Unknown'
     if ($null -ne $tasks) {
         $taskInputs = @(foreach ($task in @($tasks)) { $task.name + '=' + $(if ($task.enabled) { 'enabled' } else { 'disabled' }) })
@@ -585,7 +602,8 @@ function New-BRAVODeploymentPlan {
 
     # --- Передумови й fingerprint ---
     $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $RuntimeRoot -StateRoot $StateRoot `
-        -ArtifactSha256 ([string]$sourceValues['artifactSha256']) -ManifestSha256 ([string]$sourceValues['manifestSha256']) -Adapter $Adapter
+        -ArtifactSha256 ([string]$sourceValues['artifactSha256']) -ManifestSha256 ([string]$sourceValues['manifestSha256']) -Adapter $Adapter `
+        -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Action -RuntimeRoot $RuntimeRoot)
     $fingerprint = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
 
     # --- Тести ---
@@ -693,7 +711,8 @@ function Test-BRAVODeploymentPlanCurrent {
         if ($null -ne $artifactProperty -and $null -ne $artifactProperty.Value) { $artifact = [string]$artifactProperty.Value }
         if ($null -ne $manifestProperty -and $null -ne $manifestProperty.Value) { $manifest = [string]$manifestProperty.Value }
         $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $RuntimeRoot -StateRoot $StateRoot `
-            -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Adapter
+            -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Adapter `
+            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'action' -Default '')) -RuntimeRoot $RuntimeRoot)
         $current = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
         $fingerprintMatches = ($current -eq ([string]$Plan.preconditionsFingerprint).ToUpperInvariant())
         if (-not $fingerprintMatches) {

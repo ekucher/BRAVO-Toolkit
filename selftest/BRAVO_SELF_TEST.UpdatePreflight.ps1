@@ -79,6 +79,37 @@
             $rootAware = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $rootAwareArgs
             $runningFinding = @(@($rootAware.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' -and $_.severity -cne 'Ok' })
             Test-BRAVOCondition -Condition (($taskSeen.Roots.Count -ge 1) -and (@($taskSeen.Roots | Where-Object { $_ -cne $rt }).Count -eq 0) -and ($runningFinding.Count -ge 1)) -Name 'UpdatePreflight/ManagedTasksReceiveTargetRuntimeRoot' -Failure ('roots=' + ($taskSeen.Roots -join ',') + ' running=' + $runningFinding.Count)
+            # Install: область задач - з довіреної конфігурації комплекту, не з цілі. Production-подібний adapter: ефективна конфігурація
+            # кидає виняток для кореня цілі (loader ще не існує) і працює лише для кореня комплекту.
+            $closureRt2 = $rt
+            $fakeToolkit = Join-Path $pfTSite 'Комплект toolkit'
+            [void](New-Item -ItemType Directory -Path $fakeToolkit -Force)
+            $closureToolkit = $fakeToolkit
+            $installTaskRoots = @{ Roots = (New-Object System.Collections.Generic.List[string]); Running = $false }
+            $prodLikeTasks = {
+                param([string]$TaskPath, [string]$RuntimeRoot)
+                $installTaskRoots.Roots.Add([string]$RuntimeRoot)
+                if ($RuntimeRoot -ceq $closureRt2) { throw 'BRAVO_CONFIG_LOADER.ps1 відсутній у цільовому runtime' }
+                if ($installTaskRoots.Running) { return @([pscustomobject]@{ name = 'BRAVO_Archive'; state = 'Running'; enabled = $true }) }
+                return @([pscustomobject]@{ name = 'BRAVO_Archive'; state = 'Ready'; enabled = $true })
+            }.GetNewClosure()
+            $installArgs = @{ Operation = 'Install'; RuntimeRoot = $rt; StateRoot = $st; LockRoot = $lk; OperationLockPath = $opLock; ToolkitRoot = $fakeToolkit
+                StagingRoot = $sg; BackupRoot = $bk; Adapter = @{ GetPreflightEnvironment = $envOk; GetManagedTasks = $prodLikeTasks } }
+            $installCalm = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $installArgs
+            $calmBlocker = @(@($installCalm.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' -and $_.severity -ceq 'Blocker' })
+            $calmOk = @(@($installCalm.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' -and $_.severity -ceq 'Ok' })
+            Test-BRAVOCondition -Condition (($calmBlocker.Count -eq 0) -and ($calmOk.Count -eq 1) -and (@($installTaskRoots.Roots | Where-Object { $_ -cne $fakeToolkit }).Count -eq 0)) -Name 'UpdatePreflight/InstallTaskScopeFromToolkitNotTarget' -Failure ('blocker=' + $calmBlocker.Count + ' ok=' + $calmOk.Count + ' roots=' + ($installTaskRoots.Roots -join ','))
+            $installTaskRoots.Running = $true
+            $installBusy = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $installArgs
+            $busyBlocker = @(@($installBusy.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' -and $_.severity -ceq 'Blocker' })
+            Test-BRAVOCondition -Condition ($busyBlocker.Count -eq 1) -Name 'UpdatePreflight/InstallRunningDefaultTaskBlocks' -Failure ('blocker=' + $busyBlocker.Count)
+            $updateArgs = $installArgs.Clone(); $updateArgs['Operation'] = 'Update'
+            $installTaskRoots.Roots.Clear()
+            $null = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } $updateArgs
+            Test-BRAVOCondition -Condition (($installTaskRoots.Roots.Count -ge 1) -and (@($installTaskRoots.Roots | Where-Object { $_ -cne $rt }).Count -eq 0)) -Name 'UpdatePreflight/UpdateTaskScopeFromTargetRoot' -Failure ('roots=' + ($installTaskRoots.Roots -join ','))
+            $planInstallRoot = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Install' -RuntimeRoot $r -ToolkitRoot $k } $rt $fakeToolkit
+            $planUpdateRoot = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Update' -RuntimeRoot $r -ToolkitRoot $k } $rt $fakeToolkit
+            Test-BRAVOCondition -Condition (($planInstallRoot -ceq $fakeToolkit) -and ($planUpdateRoot -ceq $rt)) -Name 'UpdatePreflight/TaskRuntimeRootResolverByAction' -Failure ($planInstallRoot + ' | ' + $planUpdateRoot)
             $planSeen = @{ Roots = (New-Object System.Collections.Generic.List[string]) }
             $planAdapter = @{ GetManagedTasks = { param([string]$TaskPath, [string]$RuntimeRoot) $planSeen.Roots.Add([string]$RuntimeRoot); @() }.GetNewClosure() }
             $null = & $pfTModule { param($r, $s, $a) Get-BRAVODeploymentPreconditions -RuntimeRoot $r -StateRoot $s -Adapter $a } $rt $st $planAdapter
