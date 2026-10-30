@@ -165,6 +165,33 @@ function Get-BRAVOExitCodeSeverity {
     return 'ERROR'
 }
 
+function Get-BRAVOExitCodeStatus {
+    <#
+        Канонічна проєкція коду завершення на поле status machine-readable
+        статус-файла (BRAVO.Status; набір OK | WARNINGS | ERROR): 0 -> OK,
+        10 і 20 -> WARNINGS, решта -> ERROR (#479).
+
+        Деривується ЛИШЕ з Get-BRAVOExitCodeSeverity — друге незалежне
+        відображення код -> status неприпустиме: SUCCESS -> OK,
+        WARNING -> WARNINGS, ERROR/CRITICAL -> ERROR. Рішення власника D-A:
+        код 20 (SkippedLockBusy) дає WARNINGS, а не ERROR — відкладене
+        виконання не є відмовою (узгоджено з severity WARNING вище). Схема
+        status-файла лишається v1: набір значень поля status не змінюється.
+
+        BRAVO.Status сам імпортує цей модуль як залежність, тому запис
+        статусу не залежить від того, що імпортовано в сесії викликача.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][int]$Code)
+
+    switch (Get-BRAVOExitCodeSeverity -Code $Code) {
+        'SUCCESS' { return 'OK' }
+        'WARNING' { return 'WARNINGS' }
+        default { return 'ERROR' }
+    }
+}
+
 function Get-BRAVOExitCodeName {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][int]$Code)
@@ -178,5 +205,6 @@ function Get-BRAVOExitCodeName {
 Export-ModuleMember -Function @(
     'Resolve-BRAVOExitCode',
     'Get-BRAVOExitCodeName',
-    'Get-BRAVOExitCodeSeverity'
+    'Get-BRAVOExitCodeSeverity',
+    'Get-BRAVOExitCodeStatus'
 )
