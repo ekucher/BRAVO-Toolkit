@@ -565,7 +565,7 @@ try {
         $s = New-UpdRbInstallScenario -Name 'inst-ok'
         $r = Invoke-UpdRbRollback -Scenario $s
         Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and -not (Test-Path -LiteralPath $s.Runtime) -and -not (Test-Path -LiteralPath $s.VersionState) -and (Read-UpdRbJournal -Scenario $s).state -eq 'RolledBack') -Name 'UpdateRollback/Install/RemovesOwnedAndRoot' -Failure "install rollback: файли, каталоги й створений корінь видалено, state повернуто до absent; status=$($r.status) $($r.rollback.message)"
-        Test-BRAVOCondition -Condition ((@(Get-UpdRbLog) | Select-Object -First 1) -eq 'Disable' -and $r.taskActivation.state -eq 'Inactive') -Name 'UpdateRollback/Install/TasksDisabledFirst' -Failure 'задачі вимикаються першими; taskActivation=Inactive'
+        Test-BRAVOCondition -Condition (@(Get-UpdRbLog).Count -eq 0 -and $r.taskActivation.state -eq 'Inactive') -Name 'UpdateRollback/Install/NoQuiesceWithoutSchedulerIntent' -Failure 'без intent ConfigureScheduler install-відкат не торкається задач (жодних Disable/LiveRead); taskActivation=Inactive'
 
         Reset-UpdRbStubs
         $s = New-UpdRbInstallScenario -Name 'inst-keys' -DeployKeysRecord
@@ -835,6 +835,33 @@ if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath(
         $r = Invoke-UpdRbRollback -Scenario $s
         $s.Journal.runtimeRoot = $s.Runtime
         Test-BRAVOCondition -Condition ($r.status -eq 'Critical' -and (Get-UpdRbTreeHash -Root $fakeRoot) -eq $fakeBefore -and (Test-Path -LiteralPath $s.Runtime) -and @(Get-UpdRbLog).Count -eq 0) -Name 'UpdateRollback/Forged/InstallForeignRuntimeRoot' -Failure "Install: підмінений корінь -> Critical без дій; status=$($r.status) $($r.rollback.message)"
+    }
+
+    # --- Install-відкат не виконує конфігурацію з недобудованого runtime (P1 PR bot) ---
+    & {
+        $mkAdapter = {
+            param($Calls)
+            @{
+                GetEffectiveConfiguration = { param($RuntimeRoot) $Calls.Add('GetEffectiveConfiguration'); throw 'config loader з недобудованого runtime виконувати не можна' }.GetNewClosure()
+                GetManagedTasks = { param($TaskPath, $RuntimeRoot) $Calls.Add('GetManagedTasks'); throw 'scope з конфігурації' }.GetNewClosure()
+                SetTaskEnabled = { param($TaskPath, $Name, $Enabled, $RuntimeRoot) $Calls.Add('SetTaskEnabled:' + $Name + ':' + $Enabled); [pscustomobject]@{ Success = $true; Message = '' } }.GetNewClosure()
+            }
+        }
+        # Збій на ранній фазі (немає ConfigureScheduler intent): задач немає, adapter не викликається.
+        Reset-UpdRbStubs
+        $s = New-UpdRbInstallScenario -Name 'inst-early'
+        $calls = New-Object System.Collections.Generic.List[string]
+        $r = Invoke-UpdRbRollback -Scenario $s -Adapter (& $mkAdapter $calls)
+        Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and -not (Test-Path -LiteralPath $s.Runtime) -and $calls.Count -eq 0) -Name 'UpdateRollback/Install/EarlyFailureNoConfigCodeRolledBack' -Failure "ранній збій install: RolledBack, корінь видалено, adapter не викликано; status=$($r.status) calls=$($calls -join ',') $($r.rollback.message)"
+
+        # createdTasks: вимикаються напряму; конфігурація (scope) не завантажується.
+        Reset-UpdRbStubs
+        $s = New-UpdRbInstallScenario -Name 'inst-created'
+        [void](Invoke-UpdRbCall -Name 'Add-BRAVOUpdateJournalPhaseIntent' -Arguments @{ Journal = $s.Journal; Phase = 'ConfigureScheduler'; StateRoot = $s.State })
+        [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalField' -Arguments @{ Journal = $s.Journal; Name = 'createdTasks'; Value = @([pscustomobject]@{ path = '\BRAVO\'; name = 'BRAVO_A' }); StateRoot = $s.State })
+        $calls = New-Object System.Collections.Generic.List[string]
+        $r = Invoke-UpdRbRollback -Scenario $s -Adapter (& $mkAdapter $calls)
+        Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and -not (Test-Path -LiteralPath $s.Runtime) -and (@($calls) -contains 'SetTaskEnabled:BRAVO_A:False') -and (@($calls) -notcontains 'GetEffectiveConfiguration') -and (@($calls) -notcontains 'GetManagedTasks')) -Name 'UpdateRollback/Install/CreatedTasksDisabledWithoutConfigLoad' -Failure "createdTasks вимикаються без читання конфігурації; status=$($r.status) calls=$($calls -join ',') $($r.rollback.message)"
     }
 
     # --- Прямий виклик Invoke-BRAVOInstallRollback з недовіреним журналом ---
