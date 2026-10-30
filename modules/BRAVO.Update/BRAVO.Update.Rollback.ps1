@@ -462,6 +462,49 @@ function Restore-BRAVOVersionState {
 # Відкат clean install (ENGINE_DESIGN §9.3)
 # ---------------------------------------------------------------------------
 
+function Invoke-BRAVORollbackInstallQuiesce {
+    <#
+    .SYNOPSIS
+        Quiesce для відкату clean install: { Mode, Disabled[], Failed[], IsComplete }.
+    .DESCRIPTION
+        До install керованих задач не було, тож «свої» — лише journal.createdTasks.
+        Вимикаються напряму через adapter.SetTaskEnabled (RuntimeRoot НЕ передається:
+        adapter тоді бере область з довіреного ToolkitRoot, а не виконує
+        BRAVO_CONFIG_LOADER.ps1 з недобудованого target runtime). Без запису
+        createdTasks і без intent ConfigureScheduler задач цієї операції існувати не
+        може -> Mode=Skipped. Intent є, а імена не записані (crash посеред
+        реєстрації; runtime на цьому етапі вже розгорнутий) -> запасний шлях
+        Disable-BRAVOAllManagedTasks з RuntimeRoot журналу.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Journal,
+        [Parameter(Mandatory = $true)][hashtable]$Adapter
+    )
+
+    $disabled = New-Object System.Collections.Generic.List[string]
+    $failed = New-Object System.Collections.Generic.List[string]
+    $created = @(Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'createdTasks' -Default @())
+    $intent = $false
+    foreach ($phaseEntry in @($Journal.phases)) { if ([string]$phaseEntry.phase -ceq 'ConfigureScheduler') { $intent = $true } }
+    $mode = 'Skipped'
+    if ($created.Count -gt 0) {
+        $mode = 'CreatedTasks'
+        foreach ($task in $created) {
+            $taskPath = [string](Get-BRAVOUpdatePropertyValue -InputObject $task -Name 'path' -Default '')
+            $taskName = [string](Get-BRAVOUpdatePropertyValue -InputObject $task -Name 'name' -Default '')
+            if ([string]::IsNullOrWhiteSpace($taskName)) { [void]$failed.Add('запис createdTasks без імені'); continue }
+            $set = Set-BRAVOReconcileTaskEnabled -Adapter $Adapter -TaskPath $taskPath -Name $taskName -Enabled $false
+            if ($set.Success) { [void]$disabled.Add($taskName) } else { [void]$failed.Add($taskName + ': ' + [string]$set.Message) }
+        }
+    } elseif ($intent) {
+        $mode = 'AllManaged'
+        $result = Disable-BRAVOAllManagedTasks -Adapter $Adapter -RuntimeRoot ([string](Get-BRAVOUpdatePropertyValue -InputObject $Journal -Name 'runtimeRoot' -Default ''))
+        if (-not [bool](Get-BRAVOUpdatePropertyValue -InputObject $result -Name 'IsComplete' -Default $false)) { [void]$failed.Add('Disable-BRAVOAllManagedTasks не завершено') }
+    }
+    return [pscustomobject]@{ Mode = $mode; Disabled = @($disabled.ToArray()); Failed = @($failed.ToArray()); IsComplete = ($failed.Count -eq 0) }
+}
+
 function Test-BRAVORollbackJournalTrust {
     <#
     .SYNOPSIS
@@ -627,9 +670,11 @@ function Invoke-BRAVOInstallRollback {
     # Результат Disable-BRAVOAllManagedTasks не можна лишати в pipeline:
     # він потрапив би у вихід функції й зламав би форму результату.
     try {
-        $installDisable = Disable-BRAVOAllManagedTasks -Adapter $Adapter
-        if ($null -ne $installDisable -and $installDisable.PSObject.Properties['IsComplete'] -and -not $installDisable.IsComplete) {
-            [void]$problems.Add('Не всі створені задачі вдалося вимкнути.')
+        # Лише задачі ЦІЄЇ операції (journal.createdTasks); без intent ConfigureScheduler
+        # задач немає взагалі. Конфігурацію з недобудованого target runtime не виконуємо.
+        $installQuiesce = Invoke-BRAVORollbackInstallQuiesce -Journal $Journal -Adapter $Adapter
+        if (-not $installQuiesce.IsComplete) {
+            [void]$problems.Add('Не всі створені задачі вдалося вимкнути: ' + (@($installQuiesce.Failed) -join '; '))
         }
     } catch {
         [void]$problems.Add('Не вдалося вимкнути створені задачі: ' + $_.Exception.Message)
@@ -1016,6 +1061,12 @@ function Invoke-BRAVORollback {
         # бути УВІМКНЕНІ: відкат файлів під працюючими задачами дав би змішаний runtime.
         # Вимикаємо все керованe, перечитуємо живий стан; не підтверджено -> збій (Critical).
         [void](& $step 'Rollback.QuiesceTasks' {
+            if ($rb.Action -ceq 'Install') {
+                # Install: лише задачі цієї операції; конфігурацію з недобудованого runtime не виконуємо.
+                $installQuiesce = Invoke-BRAVORollbackInstallQuiesce -Journal $rb.Journal -Adapter $rb.Adapter
+                if (-not $installQuiesce.IsComplete) { throw ('Не вдалося вимкнути задачі, створені установкою: ' + (@($installQuiesce.Failed) -join '; ')) }
+                return
+            }
             $disableArguments = @{ Adapter = $rb.Adapter; RuntimeRoot = $rb.RuntimeRoot }
             if ($null -ne $rb.SchedulerSnapshot) { $disableArguments.Snapshot = $rb.SchedulerSnapshot }
             $disableResult = Disable-BRAVOAllManagedTasks @disableArguments
