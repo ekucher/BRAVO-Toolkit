@@ -831,7 +831,8 @@ function Test-BRAVOUpdatePlanStillCurrent {
         $manifest = [string](Get-BRAVOUpdatePropertyValue -InputObject $source -Name 'manifestSha256' -Default '')
         $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $Context.Paths.RuntimeRoot -StateRoot $Context.Paths.StateRoot `
             -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Context.Adapter `
-            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')) -RuntimeRoot ([string]$Context.Paths.RuntimeRoot))
+            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')) -RuntimeRoot ([string]$Context.Paths.RuntimeRoot)) `
+            -TaskFallbackRoot $(if ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '') -ceq 'Repair') { [string]$script:BRAVOUpdateToolkitRoot } else { '' })
         $own = [string]$Context.OperationId
         $preconditions.openJournalIds = @(@($preconditions.openJournalIds) | Where-Object { [string]$_ -cne $own })
         $current = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
@@ -1216,7 +1217,16 @@ function Invoke-BRAVOUpdateEnterOperationLock {
             if (-not $Context.Adapter.ContainsKey('GetManagedTasks') -or $null -eq $Context.Adapter['GetManagedTasks']) {
                 throw (New-BRAVOUpdateTypedException -Message 'Стан керованих задач недоступний (adapter без GetManagedTasks).' -Kind Blocked -FindingId 'Scheduler.TasksUnknown' -Action 'Перевірте доступ до Task Scheduler.')
             }
-            $tasks = @(& $Context.Adapter['GetManagedTasks'] '' (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')) -RuntimeRoot ([string]$Context.Paths.RuntimeRoot)))
+            $taskAction = [string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'action' -Default '')
+            $taskRoot = Resolve-BRAVOUpdateTaskRuntimeRoot -Action $taskAction -RuntimeRoot ([string]$Context.Paths.RuntimeRoot)
+            try {
+                $tasks = @(& $Context.Adapter['GetManagedTasks'] '' $taskRoot)
+            } catch {
+                # Repair пошкодженого runtime: його конфігурація може не читатись - область задач із довіреного комплекту.
+                if (($taskAction -ceq 'Repair') -and (-not [string]::IsNullOrWhiteSpace([string]$script:BRAVOUpdateToolkitRoot)) -and ($taskRoot -cne [string]$script:BRAVOUpdateToolkitRoot)) {
+                    $tasks = @(& $Context.Adapter['GetManagedTasks'] '' ([string]$script:BRAVOUpdateToolkitRoot))
+                } else { throw }
+            }
             foreach ($task in $tasks) {
                 if ($null -eq $task) { continue }
                 $state = [string](Get-BRAVOUpdatePropertyValue -InputObject $task -Name 'State' -Default '')

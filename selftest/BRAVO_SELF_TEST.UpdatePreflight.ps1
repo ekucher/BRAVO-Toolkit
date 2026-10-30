@@ -110,6 +110,41 @@
             $planInstallRoot = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Install' -RuntimeRoot $r -ToolkitRoot $k } $rt $fakeToolkit
             $planUpdateRoot = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Update' -RuntimeRoot $r -ToolkitRoot $k } $rt $fakeToolkit
             Test-BRAVOCondition -Condition (($planInstallRoot -ceq $fakeToolkit) -and ($planUpdateRoot -ceq $rt)) -Name 'UpdatePreflight/TaskRuntimeRootResolverByAction' -Failure ($planInstallRoot + ' | ' + $planUpdateRoot)
+            # Repair пошкодженого runtime: область задач - з довіреного комплекту (loader цілі може бути відсутній); здоровий Repair - з цілі.
+            $repairRoots = @{ Roots = (New-Object System.Collections.Generic.List[string]) }
+            $closureRt3 = $rt
+            $repairTasks = {
+                param([string]$TaskPath, [string]$RuntimeRoot)
+                $repairRoots.Roots.Add([string]$RuntimeRoot)
+                if ($RuntimeRoot -ceq $closureRt3) { throw 'BRAVO_CONFIG_LOADER.ps1 пошкоджено в цільовому runtime' }
+                return @([pscustomobject]@{ name = 'BRAVO_Archive'; state = 'Ready'; enabled = $true })
+            }.GetNewClosure()
+            foreach ($integrityCase in @('Invalid', 'Unknown')) {
+                $repairRoots.Roots.Clear()
+                $damagedState = [pscustomobject]@{ integrity = [pscustomobject]@{ status = $integrityCase } }
+                $repairDamaged = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } @{ Operation = 'Repair'; RuntimeRoot = $rt; StateRoot = $st; LockRoot = $lk; OperationLockPath = $opLock; ToolkitRoot = $fakeToolkit
+                    StagingRoot = $sg; BackupRoot = $bk; InstallationState = $damagedState; Adapter = @{ GetPreflightEnvironment = $envOk; GetManagedTasks = $repairTasks } }
+                $damagedRunning = @(@($repairDamaged.findings) | Where-Object { $_.id -ceq 'Preflight.RunningTasks' })
+                Test-BRAVOCondition -Condition (($damagedRunning.Count -eq 1) -and ($damagedRunning[0].severity -ceq 'Ok') -and (@($repairRoots.Roots | Where-Object { $_ -cne $fakeToolkit }).Count -eq 0)) -Name ('UpdatePreflight/RepairDamagedTaskScopeFromToolkit-' + $integrityCase) -Failure ('roots=' + ($repairRoots.Roots -join ',') + ' sev=' + ($damagedRunning | ForEach-Object { $_.severity }))
+            }
+            $repairRoots.Roots.Clear()
+            $validState = [pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Valid' } }
+            $null = & $pfTModule { param($x) Test-BRAVODeploymentPreflight @x } @{ Operation = 'Repair'; RuntimeRoot = $rt; StateRoot = $st; LockRoot = $lk; OperationLockPath = $opLock; ToolkitRoot = $fakeToolkit
+                StagingRoot = $sg; BackupRoot = $bk; InstallationState = $validState; Adapter = @{ GetPreflightEnvironment = $envOk; GetManagedTasks = $repairTasks } }
+            Test-BRAVOCondition -Condition (($repairRoots.Roots.Count -ge 1) -and (@($repairRoots.Roots | Where-Object { $_ -cne $rt }).Count -eq 0)) -Name 'UpdatePreflight/HealthyRepairTaskScopeFromTarget' -Failure ('roots=' + ($repairRoots.Roots -join ','))
+            # Repair -Scope Scheduler при порушеній цілісності: Blocker 33 (немає бекапу файлів, відкат не пройде еталон); Scope All дозволено.
+            $schedInvalid = & $call @{ Operation = 'Repair'; Scope = 'Scheduler'; InstallationState = ([pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Invalid' } }) }
+            $scopeFinding = @(@($schedInvalid.findings) | Where-Object { $_.id -ceq 'Preflight.RepairScope' })
+            Test-BRAVOCondition -Condition (($scopeFinding.Count -eq 1) -and ($scopeFinding[0].severity -ceq 'Blocker') -and ($scopeFinding[0].exitCodeHint -eq 33) -and ($scopeFinding[0].action -like '*Scope All*') -and (-not $schedInvalid.canProceed)) -Name 'UpdatePreflight/RepairSchedulerScopeBlockedOnInvalidIntegrity' -Failure ('findings=' + $scopeFinding.Count)
+            $allInvalid = & $call @{ Operation = 'Repair'; Scope = 'All'; InstallationState = ([pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Invalid' } }) }
+            $schedValid = & $call @{ Operation = 'Repair'; Scope = 'Scheduler'; InstallationState = $validState }
+            Test-BRAVOCondition -Condition ((@(@($allInvalid.findings) | Where-Object { $_.id -ceq 'Preflight.RepairScope' }).Count -eq 0) -and (@(@($schedValid.findings) | Where-Object { $_.id -ceq 'Preflight.RepairScope' }).Count -eq 0)) -Name 'UpdatePreflight/RepairScopeAllOrHealthySchedulerAllowed' -Failure 'Scope All і здоровий Scheduler не блокуються'
+            $planFallback = & $pfTModule { param($r, $s, $a, $k) Get-BRAVODeploymentPreconditions -RuntimeRoot $r -StateRoot $s -Adapter $a -TaskFallbackRoot $k } $rt $st @{ GetManagedTasks = $repairTasks } $fakeToolkit
+            Test-BRAVOCondition -Condition (@($planFallback.managedTasks) -contains 'BRAVO_Archive=enabled') -Name 'UpdatePreflight/PlanPreconditionsFallBackToToolkitTasks' -Failure ('managedTasks=' + ($planFallback.managedTasks -join ','))
+            $resolverRepairInvalid = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Repair' -RuntimeRoot $r -ToolkitRoot $k -IntegrityStatus 'Invalid' } $rt $fakeToolkit
+            $resolverRepairValid = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Repair' -RuntimeRoot $r -ToolkitRoot $k -IntegrityStatus 'Valid' } $rt $fakeToolkit
+            $resolverUpdateInvalid = & $pfTModule { param($r, $k) Resolve-BRAVOUpdateTaskRuntimeRoot -Action 'Update' -RuntimeRoot $r -ToolkitRoot $k -IntegrityStatus 'Invalid' } $rt $fakeToolkit
+            Test-BRAVOCondition -Condition (($resolverRepairInvalid -ceq $fakeToolkit) -and ($resolverRepairValid -ceq $rt) -and ($resolverUpdateInvalid -ceq $rt)) -Name 'UpdatePreflight/TaskRuntimeRootResolverRepairIntegrity' -Failure ($resolverRepairInvalid + ' | ' + $resolverRepairValid + ' | ' + $resolverUpdateInvalid)
             $planSeen = @{ Roots = (New-Object System.Collections.Generic.List[string]) }
             $planAdapter = @{ GetManagedTasks = { param([string]$TaskPath, [string]$RuntimeRoot) $planSeen.Roots.Add([string]$RuntimeRoot); @() }.GetNewClosure() }
             $null = & $pfTModule { param($r, $s, $a) Get-BRAVODeploymentPreconditions -RuntimeRoot $r -StateRoot $s -Adapter $a } $rt $st $planAdapter

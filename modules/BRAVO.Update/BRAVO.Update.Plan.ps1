@@ -198,8 +198,11 @@ function Resolve-BRAVOUpdateTaskRuntimeRoot {
     # з цілі до розгортання не можна. Тому для Install область задач бере ДОВІРЕНА конфігурація запущеного комплекту (toolkit,
     # цілісність якого перевіряє guard), а не ціль. Для Update/Repair - корінь установки.
     [CmdletBinding()]
-    param([AllowEmptyString()][string]$Action = '', [Parameter(Mandatory = $true)][string]$RuntimeRoot, [string]$ToolkitRoot = '')
-    if ($Action -ceq 'Install') {
+    param([AllowEmptyString()][string]$Action = '', [Parameter(Mandatory = $true)][string]$RuntimeRoot, [string]$ToolkitRoot = '', [string]$IntegrityStatus = '')
+    # Repair пошкодженого runtime (integrity Invalid/Unknown): його BRAVO_CONFIG_LOADER.ps1/модулі конфігурації можуть бути відсутні або
+    # підмінені, тож область задач визначає довірений код комплекту (як для Install); здоровий Repair і Update - як і раніше з цілі.
+    $useToolkit = ($Action -ceq 'Install') -or (($Action -ceq 'Repair') -and (@('Invalid', 'Unknown') -ccontains $IntegrityStatus))
+    if ($useToolkit) {
         if ([string]::IsNullOrWhiteSpace($ToolkitRoot)) { $ToolkitRoot = [string]$script:BRAVOUpdateToolkitRoot }
         if (-not [string]::IsNullOrWhiteSpace($ToolkitRoot)) { return $ToolkitRoot }
     }
@@ -218,10 +221,15 @@ function Get-BRAVODeploymentPreconditions {
         [string]$ManifestSha256 = '',
         [hashtable]$Adapter = $null,
         # Корінь для області задач (Install: комплект, не ціль); порожній = RuntimeRoot.
-        [string]$TaskRuntimeRoot = ''
+        [string]$TaskRuntimeRoot = '',
+        # Запасний корінь (комплект) для Repair: якщо область задач з цілі не прочитана (пошкоджений loader), пробуємо довірений.
+        [string]$TaskFallbackRoot = ''
     )
     if ([string]::IsNullOrWhiteSpace($TaskRuntimeRoot)) { $TaskRuntimeRoot = $RuntimeRoot }
     $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $TaskRuntimeRoot
+    if (($null -eq $tasks) -and (-not [string]::IsNullOrWhiteSpace($TaskFallbackRoot)) -and ($TaskFallbackRoot -cne $TaskRuntimeRoot)) {
+        $tasks = Get-BRAVOUpdatePlanManagedTaskList -Adapter $Adapter -RuntimeRoot $TaskFallbackRoot
+    }
     $taskInputs = 'Unknown'
     if ($null -ne $tasks) {
         $taskInputs = @(foreach ($task in @($tasks)) { $task.name + '=' + $(if ($task.enabled) { 'enabled' } else { 'disabled' }) })
@@ -603,7 +611,8 @@ function New-BRAVODeploymentPlan {
     # --- Передумови й fingerprint ---
     $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $RuntimeRoot -StateRoot $StateRoot `
         -ArtifactSha256 ([string]$sourceValues['artifactSha256']) -ManifestSha256 ([string]$sourceValues['manifestSha256']) -Adapter $Adapter `
-        -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Action -RuntimeRoot $RuntimeRoot)
+        -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action $Action -RuntimeRoot $RuntimeRoot -IntegrityStatus ([string](Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $InstallationState -Name 'integrity') -Name 'status' -Default ''))) `
+        -TaskFallbackRoot $(if ($Action -ceq 'Repair') { [string]$script:BRAVOUpdateToolkitRoot } else { '' })
     $fingerprint = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
 
     # --- Тести ---
@@ -712,7 +721,8 @@ function Test-BRAVODeploymentPlanCurrent {
         if ($null -ne $manifestProperty -and $null -ne $manifestProperty.Value) { $manifest = [string]$manifestProperty.Value }
         $preconditions = Get-BRAVODeploymentPreconditions -RuntimeRoot $RuntimeRoot -StateRoot $StateRoot `
             -ArtifactSha256 $artifact -ManifestSha256 $manifest -Adapter $Adapter `
-            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'action' -Default '')) -RuntimeRoot $RuntimeRoot)
+            -TaskRuntimeRoot (Resolve-BRAVOUpdateTaskRuntimeRoot -Action ([string](Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'action' -Default '')) -RuntimeRoot $RuntimeRoot) `
+            -TaskFallbackRoot $(if ([string](Get-BRAVOUpdatePropertyValue -InputObject $Plan -Name 'action' -Default '') -ceq 'Repair') { [string]$script:BRAVOUpdateToolkitRoot } else { '' })
         $current = Get-BRAVOUpdatePreconditionsFingerprint -Preconditions $preconditions
         $fingerprintMatches = ($current -eq ([string]$Plan.preconditionsFingerprint).ToUpperInvariant())
         if (-not $fingerprintMatches) {
