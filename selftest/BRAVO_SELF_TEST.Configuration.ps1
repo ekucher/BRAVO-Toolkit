@@ -808,7 +808,7 @@
         }
 
         # --- Delta/SecurityWeakeningOverrideSurfacedNotSuppressed ---
-        # Issue #216 (Agent D, міграційний шлях 5.2 -> 5.3): дельта-інструмент
+        # Issue #216 (потік D, міграційний шлях 5.2 -> 5.3): дельта-інструмент
         # НЕ дублює й НЕ обходить перевірку безпеки — 'DENY'-класифіковане
         # значення (напр. backupConsistency.Mode='Direct', замість канонічного
         # 'VSS') має з'явитись у виводі дельти як звичайний Changed-рядок
@@ -819,7 +819,7 @@
         # Test-BRAVOEffectiveSecurityInvariants (BRAVO_CONFIG_LOADER.ps1,
         # покрито окремо в BRAVO_SELF_TEST.ConfigLoader.ps1, Test 5.4/5.4c і
         # Wave 1B requireAdministrator). Друга копія цієї політики тут була б
-        # забороненою дублікацією (.claude/rules/05-architecture.md); ця
+        # забороненою дублікацією (docs/engineering/architecture.md); ця
         # перевірка лише встановлює, що дельта-інструмент НЕ приховує
         # security-значущу відмінність від оператора під час підготовки
         # candidate-файлу.
@@ -2293,7 +2293,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Failure "авторизація НЕ повинна нормалізувати/мутувати сире значення на місці; отримано '$($taskPathMutationProbeOverrides['schedulerSettings.TaskPath'])' замість 'BRAVO'"
 
     # =====================================================================
-    # Codex review PR #224 (P2, "Import the task-path normalizer into this
+    # Рев'ю PR #224 (P2, "Import the task-path normalizer into this
     # module scope"): Test-BRAVOConfigurationAuthorizationTaskSchedulerPath
     # раніше перевіряла `Get-Module -Name 'BRAVO.System'` і імпортувала
     # залежність ЛИШЕ якщо модуля не знайдено в процесі — тепер БЕЗУМОВНИЙ
@@ -2379,7 +2379,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         # заборонений `if (-not (Get-Module -Name 'BRAVO.System'))) {...}`
         # guard у КОДІ (не в коментарях-поясненнях фіксу — вони навмисно
         # цитують старий патерн для документації). МУСИТЬ провалитись
-        # проти ОРИГІНАЛЬНОЇ guard-реалізації (до Codex review 5290816507)
+        # проти ОРИГІНАЛЬНОЇ guard-реалізації (до рев'ю 5290816507)
         # і МУСИТЬ проходити на поточній.
         $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
         $ssgLines = Get-Content -LiteralPath $ssgSchemaPath -Encoding UTF8
@@ -2482,7 +2482,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     }
 
     # =====================================================================
-    # Codex review PR #224 (P2, "Ignore blank lookup URL entries before
+    # Рев'ю PR #224 (P2, "Ignore blank lookup URL entries before
     # validating"): Test-BRAVOConfigurationAuthorizationUrlArray раніше
     # відхиляла ВЕСЬ масив, якщо хоча б один елемент був порожнім/
     # whitespace-рядком, хоча production-споживач (BRAVO.Notifications.psm1)
@@ -2542,7 +2542,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Failure "недопустима схема поруч із порожнім записом мусить лишитись відхиленою — фільтрація порожніх записів НЕ повинна ширше послаблювати перевірку схеми/формату; отримано IsValid=$($urlArrayBlankBadSchemeResult.IsValid)"
 
     # =====================================================================
-    # Codex review PR #224 (P2, "Preserve whitespace tolerance for legacy
+    # Рев'ю PR #224 (P2, "Preserve whitespace tolerance for legacy
     # LogLevel"): LogLevel раніше використовував точний 'Enum:' валідатор,
     # хоча defaultLogLevel уже отримав whitespace-tolerant 'EnumTrimmed:' —
     # значення на кшталт ' ERROR ' раніше приймались (єдиний production-

@@ -63,7 +63,7 @@ function Get-BRAVOServiceRecoveryPolicy {
 
 function Get-BRAVOServiceRecoveryBootGate {
     # Чи відкладає профіль -RecoverServices відновлення після старту ОС
-    # (рев'ю PR #432: A-P3-4 / B-P3-3, Codex P1). Службами після старту
+    # (рев'ю PR #432: A-P3-4 / B-P3-3, рев'ю P1). Службами після старту
     # розпоряджається boot-тригер; event- чи daily-тригер профілю не
     # випереджає його.
     #   BootRestoreMode HoldServices (сервер робочого часу): boot-тригер
@@ -71,7 +71,7 @@ function Get-BRAVOServiceRecoveryBootGate {
     #     (Restore.StartupDelayMinutes) і виконує пропущену реставрацію до
     #     запуску служб. Поки пропущена реставрація чекає (-RestorePending,
     #     персистентний стан реставрації; невідомий стан викликач передає як
-    #     $true) — відкласти без обмеження часу (рев'ю PR #432, Codex раунд 2):
+    #     $true) — відкласти без обмеження часу (рев'ю PR #432, раунд 2):
     #     профіль не запускає служби, поки модель не реставровано. Інакше вікно =
     #     затримка + BootHoldMarginMinutes, не менше за BootGraceMinutes. Час
     #     старту ОС не прочитано, затримка невідома чи час старту в
@@ -141,7 +141,7 @@ function Get-BRAVOServiceRecoveryBackupDeferralPath {
 
 function Register-BRAVOServiceRecoveryBackupDeferralWarning {
     # Тротлінг WARNING «служба не працює; відновлення відкладено до
-    # завершення бекапу» (рев'ю PR #432, Codex раунд 2): не частіше ніж раз
+    # завершення бекапу» (рев'ю PR #432, раунд 2): не частіше ніж раз
     # на BackupDeferralWarningMinutes на службу. Формат файлу -Path:
     #   { "schemaVersion": 1, "hostname": "HOST-01",
     #     "services": { "exchangAPI": "2026-10-08T10:15:00.0000000+03:00" } }

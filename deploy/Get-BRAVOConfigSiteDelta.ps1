@@ -105,7 +105,7 @@ try {
     # (-Validate), не з самої дельти. Предикат — Test-BRAVOSecurityInvariant
     # ValueWeakened (modules\BRAVO.Configuration, вже імпортований вище) —
     # той самий canonical owner, яким Test-BRAVOEffectiveSecurityInvariants
-    # перевіряє ці самі ключі, без окремої копії (`.claude/rules/05-architecture.md`).
+    # перевіряє ці самі ключі, без окремої копії (`docs/engineering/architecture.md`).
 
     # Шляхи, які вже перевизначені в BRAVO.local.config, позначаються
     # окремо: переносити їх ще раз не потрібно, а мовчки видати їх у

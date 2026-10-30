@@ -85,7 +85,7 @@ FAIL; невідомий head-репозиторій — fail-closed). Репо�
 гілках для `developer` не підтверджується: `developer` **не protected**
 (ні класичного правила, ні ruleset). `master` protected із шістьма
 required checks (канон `RELEASE_POLICY.md` §13.3); `strict`,
-`enforce_admins` і заборону force push для `master` з автоматичної сесії
+`enforce_admins` і заборону force push для `master` токеном без admin-прав
 не перевірено (HTTP 403). Бажана політика, live-стан і дія власника —
 `RELEASE_POLICY.md` §13.3–§13.4. Тому останній пункт критеріїв нижче
 знято з `[x]`.
@@ -95,7 +95,7 @@ required checks (канон `RELEASE_POLICY.md` §13.3); `strict`,
 - [x] PR #46 доведено до merge після виправлення всіх review findings.
 - [x] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
 - [x] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(PR #92)*
-- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт `ci/Test-BRAVOMasterMergePolicy.ps1` + branch protection `master` з required checks, live 2026-09-30; `enforce_admins` з автоматичної сесії не перевірено)*
+- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт `ci/Test-BRAVOMasterMergePolicy.ps1` + branch protection `master` з required checks, live 2026-09-30; `enforce_admins` токеном без admin-прав не перевірено)*
 - [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(`master` — protected, live 2026-09-30; `developer` — **не protected**: OWNER ACTION REQUIRED, `RELEASE_POLICY.md` §13.4)*
 
 ### P0.3 — Захист remote backup history
@@ -368,7 +368,7 @@ BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Детал
 **двошарову, постійну** (`DEFAULT < BRAVO.config < BRAVO.local.config`,
 `BRAVO.config` лишається назавжди опціональним DATA-only шаром
 перевизначення сайту/розгортання). Це рішення **застаріло**: чинний
-мандат — Issue #216, підтверджений власником прямо в сесії 2026-09-26
+мандат — Issue #216, підтверджений власником 2026-09-26
 («У версії 5.3 взагалі не повинно бути BRAVO.config»). Для 5.3
 `BRAVO.config` не читається, не шукається й не виконується у
 нормальному production-виконанні взагалі — legacy `BRAVO.config`

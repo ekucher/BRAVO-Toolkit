@@ -197,7 +197,7 @@ function Merge-BRAVOConfiguratorCandidateOverrides {
         $setting = @($Model | Where-Object { $_.Path -eq $path })
         if ($setting.Count -ne 1) { continue }
 
-        # Codex review PR #224 (P2, "Flatten every nested representation
+        # Рев'ю PR #224 (P2, "Flatten every nested representation
         # when clearing a leaf"): той самий canonical leaf МІГ бути
         # supplied ОДНОЧАСНО кількома незалежними representations —
         # точним флетом, і вкладеним Node-контейнером на будь-якій

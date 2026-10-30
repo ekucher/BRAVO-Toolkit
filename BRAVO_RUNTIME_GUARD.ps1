@@ -485,7 +485,7 @@ function ConvertTo-BRAVOComparableVersion {
         $trimmed = $trimmed.Substring(0, $plusIndex)
         if ([string]::IsNullOrEmpty($buildMetadata)) { return $null }
         foreach ($buildIdentifier in $buildMetadata.Split('.')) {
-            if ($buildIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
+            if ($buildIdentifier -cnotmatch '^[0-9A-Za-z-]+\z') { return $null }
         }
     }
 
@@ -498,14 +498,16 @@ function ConvertTo-BRAVOComparableVersion {
         if ([string]::IsNullOrWhiteSpace($prerelease)) { return $null }
         # SemVer 2.0 §9: кожен dot-ідентифікатор prerelease непорожній,
         # лише [0-9A-Za-z-]; числовий — без leading zero (крім "0").
+        # Якір \z, а не $: .NET-ний $ збігається і перед кінцевим "`n",
+        # тож '1`n' інакше проходив би як числовий ідентифікатор (5.2.5-rc.8).
         # Review-знахідка PR #135: суфікс на кшталт 'rc"oops' раніше
         # приймався, лапка потрапляла в highestVersionFull і ламала
         # state JSON — наступний запуск втрачав high-water mark, і
         # захист від відкату слабшав. Валідація ДО порівняння і ДО
         # запису стану.
         foreach ($prereleaseIdentifier in $prerelease.Split('.')) {
-            if ($prereleaseIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
-            if ($prereleaseIdentifier -cmatch '^0[0-9]+$') { return $null }
+            if ($prereleaseIdentifier -cnotmatch '^[0-9A-Za-z-]+\z') { return $null }
+            if ($prereleaseIdentifier -cmatch '^0[0-9]+\z') { return $null }
         }
     }
 
@@ -569,8 +571,8 @@ function Compare-BRAVOComparableVersion {
         # ConvertTo-BRAVOComparableVersion), тому порівняння точне для
         # будь-якої довжини: коротший рядок цифр менший, за однакової
         # довжини — ординально.
-        $leftIsNumeric = $leftIdentifiers[$index] -cmatch '^[0-9]+$'
-        $rightIsNumeric = $rightIdentifiers[$index] -cmatch '^[0-9]+$'
+        $leftIsNumeric = $leftIdentifiers[$index] -cmatch '^[0-9]+\z'
+        $rightIsNumeric = $rightIdentifiers[$index] -cmatch '^[0-9]+\z'
         if ($leftIsNumeric -and $rightIsNumeric) {
             if ($leftIdentifiers[$index].Length -lt $rightIdentifiers[$index].Length) { return -1 }
             if ($leftIdentifiers[$index].Length -gt $rightIdentifiers[$index].Length) { return 1 }

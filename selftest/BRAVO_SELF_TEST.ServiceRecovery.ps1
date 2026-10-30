@@ -1683,7 +1683,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) ([string]$Result.LogText).Contains('тримає: operation=Maintenance; pid=4242; служби не змінювались')
         } 'ServiceRecovery/RecoverServicesLockBusyNamesHolder' `
             "Рев'ю PR #432 (B-P2-2): lock тримає нічний Maintenance — код 20, без змін, у рядку INFO названо операцію власника"
-        # Рев'ю PR #432 (Codex, раунд 2, P1): відновлення без lock-а прибрано
+        # Рев'ю PR #432 (раунд 2, P1): відновлення без lock-а прибрано
         # повністю — BRAVO_ARCHIV може звільнити lock посеред циклу, і тоді на
         # профіль накладуться нічний Maintenance чи DataRestore. Lock зайнятий —
         # завжди код 20 без змін служб і без запису state-файлу обліку; для
@@ -1697,21 +1697,21 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             ([string]$Result.LogText).Contains($recoverArchiveLine) -and [string]::IsNullOrEmpty([string]$Result.StateText) -and
                 ([string]$Result.DeferralText).Contains('"exchangAPI"')
         } 'ServiceRecovery/RecoverServicesArchiveLockDefersWithWarning' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): lock тримає живий BRAVO_ARCHIV — код 20, служби не змінюються, state-файл обліку не пишеться; WARNING «відновлення відкладено до завершення бекапу» і мітка тротлінгу"
+            "Рев'ю PR #432 (раунд 2, P1): lock тримає живий BRAVO_ARCHIV — код 20, служби не змінюються, state-файл обліку не пишеться; WARNING «відновлення відкладено до завершення бекапу» і мітка тротлінгу"
         & $recoverCheck 'RSLockBusyArchiveWarnedRecently' 20 @('LOCK-BUSY') $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('попереднє сповіщення — менше 60 хв тому')
         } 'ServiceRecovery/RecoverServicesArchiveLockWarningThrottled' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): WARNING про ту саму службу вже надсилалось 20 хв тому — код 20 без нового сповіщення"
+            "Рев'ю PR #432 (раунд 2, P1): WARNING про ту саму службу вже надсилалось 20 хв тому — код 20 без нового сповіщення"
         & $recoverCheck 'RSLockBusyArchiveWarnedLongAgo' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName $recoverOk `
             'ServiceRecovery/RecoverServicesArchiveLockWarningRepeatsAfterHour' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): попереднє WARNING — 61 хв тому, служба досі не працює — сповіщення повторюється"
+            "Рев'ю PR #432 (раунд 2, P1): попереднє WARNING — 61 хв тому, служба досі не працює — сповіщення повторюється"
         & $recoverCheck 'RSLockBusyArchiveCorruptDeferral' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName $recoverOk `
             'ServiceRecovery/RecoverServicesArchiveLockCorruptThrottleStillWarns' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): файл тротлінгу пошкоджений — сповіщення надсилається (мовчати про впалу службу не можна), файл перезаписується"
+            "Рев'ю PR #432 (раунд 2, P1): файл тротлінгу пошкоджений — сповіщення надсилається (мовчати про впалу службу не можна), файл перезаписується"
         & $recoverCheck 'RSLockBusyArchiveOtherService' 20 @('LOCK-BUSY'; 'DEFERRAL-STATE-WRITE'; $recoverDeferred) $recoverPauseLogName {
             param($Result) ([string]$Result.DeferralText).Contains('"BravoWeb"') -and ([string]$Result.DeferralText).Contains('"exchangAPI"')
         } 'ServiceRecovery/RecoverServicesArchiveLockThrottlePerService' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): тротлінг — на службу: впала інша служба — WARNING про неї надсилається, мітка попередньої зберігається"
+            "Рев'ю PR #432 (раунд 2, P1): тротлінг — на службу: впала інша служба — WARNING про неї надсилається, мітка попередньої зберігається"
         & $recoverCheck 'RSLockBusyArchiveDead' 20 @('LOCK-BUSY') $recoverPauseLogName $recoverOk `
             'ServiceRecovery/RecoverServicesArchiveLockDeadHolderFailClosed' `
             "Рев'ю PR #432 (B-P2-2): lock із записом Archive, але процес власника не живий — fail-closed, код 20 без змін"
@@ -1721,39 +1721,39 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 9 хв')
         } 'ServiceRecovery/RecoverServicesBootGrace' `
             "Рев'ю PR #432 (A-P3-4): ОС працює 5 хв — профіль без lock-а і без змін виходить з кодом 0, рядок INFO у RECOVER_PAUSE.log"
-        # Рев'ю PR #432 (Codex P1): на профілі HoldServices вікно виводиться із
+        # Рев'ю PR #432 (P1): на профілі HoldServices вікно виводиться із
         # затримки boot-тригера Recovery (Restore.StartupDelayMinutes) і стану
         # пропущеної реставрації; час старту ОС не прочитано — fail-closed.
         & $recoverCheck 'RSBootHoldDelay' 0 @() $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: ОС працює менше 40 хв (профіль HoldServices: затримка boot-тригера Recovery 30 хв + запас 10 хв)')
         } 'ServiceRecovery/RecoverServicesBootGraceFollowsHoldServicesDelay' `
-            "Рев'ю PR #432 (Codex P1): HoldServices із затримкою boot-тригера 30 хв, ОС працює 25 хв — профіль не випереджає boot-реставрацію: код 0 без змін, вікно 30 + 10 хв"
-        # Рев'ю PR #432 (Codex, раунд 2, P1): поки пропущена реставрація на
+            "Рев'ю PR #432 (P1): HoldServices із затримкою boot-тригера 30 хв, ОС працює 25 хв — профіль не випереджає boot-реставрацію: код 0 без змін, вікно 30 + 10 хв"
+        # Рев'ю PR #432 (раунд 2, P1): поки пропущена реставрація на
         # HoldServices чекає, гейт закритий без обмеження часу (не затримка +
         # 60 хв); невідомий стан реставрації — так само (fail-closed).
         & $recoverCheck 'RSBootHoldPendingRestore' 0 @() $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: очікується пропущена реставрація (профіль HoldServices') -and
                 -not ([string]$Result.LogText).Contains('ОС працює менше')
         } 'ServiceRecovery/RecoverServicesHoldServicesGateClosedWhileRestorePending' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): HoldServices і пропущена реставрація ще чекає — ОС працює 10 год, але гейт закритий без обмеження часу: код 0 без змін, INFO «очікується пропущена реставрація»"
+            "Рев'ю PR #432 (раунд 2, P1): HoldServices і пропущена реставрація ще чекає — ОС працює 10 год, але гейт закритий без обмеження часу: код 0 без змін, INFO «очікується пропущена реставрація»"
         & $recoverCheck 'RSBootHoldRestoreStateUnknown' 0 @() $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: очікується пропущена реставрація (профіль HoldServices')
         } 'ServiceRecovery/RecoverServicesHoldServicesUnknownRestoreStateGateClosed' `
-            "Рев'ю PR #432 (Codex, раунд 2, P1): HoldServices, стан реставрації невідомий — трактується як «чекає»: гейт закритий, код 0 без змін"
+            "Рев'ю PR #432 (раунд 2, P1): HoldServices, стан реставрації невідомий — трактується як «чекає»: гейт закритий, код 0 без змін"
         & $recoverCheck 'RSBootHoldBootTimeUnknown' 0 @() $recoverPauseLogName {
             param($Result) ([string]$Result.LogText).Contains('[INFO] Відновлення служб відкладено: час старту ОС не визначено (профіль HoldServices')
         } 'ServiceRecovery/RecoverServicesHoldServicesUnknownBootTimeFailClosed' `
-            "Рев'ю PR #432 (Codex P1): HoldServices, час старту ОС не прочитано — fail-closed: тик пропущено (код 0, INFO), служби не змінювались"
+            "Рев'ю PR #432 (P1): HoldServices, час старту ОС не прочитано — fail-closed: тик пропущено (код 0, INFO), служби не змінювались"
         & $recoverCheck 'RSBootHoldElapsed' 0 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
             'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
         ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesHoldServicesAfterGraceRecovers' `
-            "Рев'ю PR #432 (Codex P1): HoldServices, вікно після старту ОС минуло — служба відновлюється як звичайно"
+            "Рев'ю PR #432 (P1): HoldServices, вікно після старту ОС минуло — служба відновлюється як звичайно"
         & $recoverCheck 'RSBootTimeUnknownNoHold' 0 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
             'EXCHANGE-ROTATION'; 'START exchangAPI'; 'RECOVERY-STATE-WRITE'; 'MARKER-CLEAR'; $recoverRecovered; 'LOCK-EXIT'
         ) $recoverLogName $recoverOk 'ServiceRecovery/RecoverServicesUnknownBootTimeWithoutHoldRecovers' `
-            "Рев'ю PR #432 (Codex P1): профіль без HoldServices, час старту ОС не прочитано — як і раніше, відновлення не відкладається"
+            "Рев'ю PR #432 (P1): профіль без HoldServices, час старту ОС не прочитано — як і раніше, відновлення не відкладається"
         # Рев'ю PR #432 (B-P3-1): осиротілий маркер власного профілю переймається.
         & $recoverCheck 'RSOrphanOwnMarker' 0 @(
             $recoverLock; 'SCM-READ'; (& $recoverMarker @('exchangAPI'))
@@ -1837,7 +1837,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             param($Result) @($Result.Events | Where-Object { ([string]$_) -like 'NOTIFY CRITICAL|СЛУЖБУ BRAVO НЕ ВДАЛОСЯ ПІДНЯТИ*' }).Count -eq 0
         } 'ServiceRecovery/RecoverServicesStopTimeoutNoFalseCritical' `
             "Рев'ю PR #432 (B-P3-6): таймаут зупинки залежної служби, яка лишилась Running — CRITICAL про збій зупинки (код 60), без хибного «зупинено, але не запущено»"
-        # Рев'ю PR #432 (Codex, P2): зупинену профілем exchangAPI запустив хтось
+        # Рев'ю PR #432 (P2): зупинену профілем exchangAPI запустив хтось
         # інший під час збору журналів — фінальний стан Running, тож це успіх:
         # без CRITICAL «зупинено, але не запущено», маркер прибрано, код 0.
         & $recoverCheck 'RSDependentStartedExternally' 0 @(
@@ -1851,7 +1851,7 @@ foreach ($probeScenarioName in @($probeScenarios.Keys)) {
             ([string]$Result.LogText).Contains('[INFO] Служба exchangAPI вже працює (її запустили поза профілем після зупинки)') -and
             @($Result.Events | Where-Object { ([string]$_) -like 'NOTIFY CRITICAL*' }).Count -eq 0
         } 'ServiceRecovery/RecoverServicesDependentStartedExternallyIsSuccess' `
-            "Рев'ю PR #432 (Codex P2): зупинену профілем службу запустили поза ним під час збору журналів — фінальний стан Running, без хибного CRITICAL, маркер знято, код 0"
+            "Рев'ю PR #432 (P2): зупинену профілем службу запустили поза ним під час збору журналів — фінальний стан Running, без хибного CRITICAL, маркер знято, код 0"
         # Рев'ю PR #432 (B-P3-4): непередбачений виняток — код 60 (не 1),
         # FR-6 Failed для впалої служби, lock звільнено.
         & $recoverCheck 'RSUnexpectedException' 60 @(
@@ -2482,7 +2482,7 @@ function Start-BRAVOScheduledTask {
         -Name 'ServiceRecovery/HealthUnknownStartModeNotRecovered' `
         -Failure "Рев'ю PR #432 (B-P3-2): зупинена служба з невідомим типом запуску — issue з причиною, без запуску задачі відновлення. Отримано: $(& $describeHealthRecovery $healthUnknownMode)"
 
-    # Рев'ю PR #432 (Codex, P2): призупинена служба (Paused — Failed за FR-1)
+    # Рев'ю PR #432 (P2): призупинена служба (Paused — Failed за FR-1)
     # профілем -RecoverServices не запускається, тож Health для неї лише
     # додає issue: без запуску задачі й без дії «запущено задачу відновлення».
     $healthPausedOnly = & $runHealthRecovery @('BRAVO') $wmiAuto $taskReady $null $true @('exchangAPI')
@@ -2503,7 +2503,7 @@ function Start-BRAVOScheduledTask {
             @($healthPausedAndStopped.Events | Where-Object { $_ -like 'LOG-INFO Служби не працюють (BRAVO) *' }).Count -eq 1
         ) `
         -Name 'ServiceRecovery/HealthPausedServiceNoRecoveryTask' `
-        -Failure "Рев'ю PR #432 (Codex P2): Paused-служба — issue без запуску задачі відновлення і без дії «запущено задачу відновлення»; поряд зі зупиненою — задачу запущено лише заради зупиненої. Отримано: Paused=[$(& $describeHealthRecovery $healthPausedOnly)]; Paused+Stopped=[$(& $describeHealthRecovery $healthPausedAndStopped)]"
+        -Failure "Рев'ю PR #432 (P2): Paused-служба — issue без запуску задачі відновлення і без дії «запущено задачу відновлення»; поряд зі зупиненою — задачу запущено лише заради зупиненої. Отримано: Paused=[$(& $describeHealthRecovery $healthPausedOnly)]; Paused+Stopped=[$(& $describeHealthRecovery $healthPausedAndStopped)]"
 
     # Start-BRAVOScheduledTask (BRAVO.Compatibility): запуск через ScheduledTasks
     # (Start-ScheduledTask) або COM RegisteredTask.Run($null) — Windows 7 без

@@ -13,7 +13,10 @@
 #   результат операції (fail-soft; перевіряється self-test-контрактом).
 # - Exit codes лишаються канонічним класифікатором збою: поле status
 #   (OK|WARNINGS|ERROR) — лише зручна проєкція exitCode для споживача,
-#   деривується ТУТ в одному місці (0→OK, 10→WARNINGS, решта→ERROR).
+#   деривується в одному місці — Get-BRAVOExitCodeStatus (BRAVO.ExitCodes:
+#   0→OK, 10/20→WARNINGS, решта→ERROR; 20 = SkippedLockBusy, рішення D-A).
+#   BRAVO.Status імпортує BRAVO.ExitCodes сам (див. нижче): запис статусу
+#   не покладається на те, що викликач імпортував ExitCodes у свою сесію.
 # - Жодних secret-bearing значень у details: call-site передає лише
 #   агрегати (лічильники, ідентифікатори generation, булеві прапорці).
 #
@@ -21,6 +24,15 @@
 # свідомо НЕ входить — контракт лишається локальним файлом.
 
 Set-StrictMode -Version 2.0
+
+# Залежність від канонічного відображення код -> status (#479, QA-001).
+# Імпорт у область цього модуля (без -Global): функція видима лише всередині
+# BRAVO.Status і не залежить від сесії викликача. Fail-closed на завантаженні:
+# модулі комплекту розгортаються разом (RUNTIME_MANIFEST), тож відсутній
+# BRAVO.ExitCodes — пошкоджений комплект, а не привід мовчки писати status
+# за власною копією мапінгу.
+$script:ExitCodesModulePath = Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.ExitCodes\BRAVO.ExitCodes.psd1'
+Import-Module -Name $script:ExitCodesModulePath -ErrorAction Stop
 
 $script:OperationStatusSchemaVersion = 1
 
@@ -83,13 +95,20 @@ function Write-BRAVOOperationStatus {
         # Call-site НЕ передає сюди секрети, повні шляхи з credentials чи
         # сирі повідомлення винятків — self-test перевіряє серіалізацію.
         [hashtable]$Details = @{},
-        # Ім'я exit-коду з канонічного BRAVO.ExitCodes; параметр, а не
-        # виклик звідси — модуль статусу не тягне залежність на ExitCodes
-        # (call-site уже має Get-BRAVOExitCodeName у scope).
+        # Ім'я exit-коду з канонічного BRAVO.ExitCodes; параметр лишається
+        # (call-site уже має Get-BRAVOExitCodeName у scope), сигнатура
+        # сумісна: нових обов'язкових параметрів немає.
         [AllowNull()][AllowEmptyString()][string]$ExitCodeName
     )
 
-    $status = if ($ExitCode -eq 0) { 'OK' } elseif ($ExitCode -eq 10) { 'WARNINGS' } else { 'ERROR' }
+    # Якщо хтось зробив Remove-Module/Import-Module -Force для BRAVO.ExitCodes
+    # після завантаження Status, вкладений імпорт зникає разом із ним —
+    # повторний імпорт у область цього модуля (власним шляхом, а не станом
+    # сесії викликача), а не падіння запису статусу.
+    if ($null -eq (Get-Command -Name Get-BRAVOExitCodeStatus -CommandType Function -ErrorAction SilentlyContinue)) {
+        Import-Module -Name $script:ExitCodesModulePath -ErrorAction Stop
+    }
+    $status = Get-BRAVOExitCodeStatus -Code $ExitCode
 
     $packageVersion = ''
     $packageVersionVariable = Get-Variable -Name 'ScriptVersion' -Scope Global -ErrorAction SilentlyContinue
