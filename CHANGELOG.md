@@ -2,6 +2,69 @@
 
 ## Не випущено (developer)
 
+- **Fix: status-файли — код 20 дає `WARNINGS`, ранні виходи не лишають старий `OK` (#479, #478; мінімальний
+  порт PR #493 у схемі v1).** Нова `Get-BRAVOExitCodeStatus` (`BRAVO.ExitCodes`) — єдине відображення код ->
+  `status`, деривоване з severity: 0 -> `OK`, 10 і 20 -> `WARNINGS`, решта -> `ERROR`. Раніше Health, відкладений
+  через зайнятий ресурс (20), писав `ERROR`, хоча severity — WARNING (рішення власника D-A). `BRAVO.Status` сам
+  імпортує `BRAVO.ExitCodes`, тож запис статусу не залежить від сесії викликача. Ранні виходи Maintenance
+  (конфігурація 30, креденшли 31, цілісність інструментів 32, середовище 90) і Archive (конфігурація 30, права 36)
+  тепер пишуть статус із `details.earlyTermination`, коли каталог стану вже відомий; помилка запису не змінює код
+  завершення. `schemaVersion` лишається 1, набір значень `status` не змінено. Не входять (відкладено до 5.3):
+  запис статусу прогонами `-RecoverServices` без роботи/заблокованими, міжпроцесне блокування статус-файла і
+  збереження сильнішої помилки. Self-test `Status/*` (мапінг, exit 20, чистий runspace без ExitCodes, статичні
+  allowlist-и сирих exit, fail-soft helper-и). Ранній запис статусу виконується лише коли спільний operation lock
+  вільний (короткочасне захоплення того самого lock-файла на час запису): інакше статус екземпляра, що працює, не
+  перезаписується (лише журнал).
+
+- **Fix: спостережуваність retention — видимий прогрес аудиту generation і перевірки SHA512 (#498).**
+  `Remove-BRAVOExpiredBackupGenerations` тепер пише INFO про старт аудиту ще до переліку й читання
+  manifest-ів, а потім підсумок інвентаризації: кількість generation, з них COMPLETE, прострочені за віком
+  до захисту N (COMPLETE і failed/incomplete), окремо стан прапорців видалення (`enableArchiveDeletion`,
+  `enableFailedArchiveDeletion`) і причину, чому повна перевірка SHA512 потрібна або не потрібна. Прострочені,
+  дозволені до видалення та фактично видалені — різні величини: фактично видалені показує лише підсумок
+  «Аудит retention». Перед
+  кожною повною перевіркою SHA512 лог містить generation ID, номер спроби, скільки verified знайдено з N і
+  логічний обсяг архівів; після неї — результат і тривалість (Stopwatch). Фінальний рядок «Аудит retention»
+  зберігає всі наявні поля та їхній порядок; у кінець дописано: перевірено SHA512 (generation), логічний
+  обсяг перевірених архівів (сума розмірів файлів, а не виміряний дисковий I/O), тривалість SHA512 і
+  тривалість retention. Рішення про видалення чи захист не змінено: lazy-hash уже був у developer — SHA512
+  рахується лише при `enableArchiveDeletion = $true` і наявності простроченої COMPLETE, від найновіших до N
+  verified; issue описує стару 5.2.4 (f8fa5aa). Гарантії безпеки #335 без змін, нових ключів конфігурації
+  немає. Self-test: розширено fixture-тести реальної функції в `selftest/BRAVO_SELF_TEST.ManifestStorage.ps1`
+  (облік конкретних хешованих шляхів, свіжі generation без жодного SHA512, сценарії пошкоджених та
+  недостатньо verified generation, пошкоджена COMPLETE між порогами під час активного SHA512, збій читання
+  всередині `Get-BRAVOFileHash`, перевірка логів).
+
+- **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
+  шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
+  (1) якщо записаний у manifest шлях збігався з канонічним, файла за ним не було, а каталог компонента був
+  недоступний (відключений том, мережевий шлях), файл рахувався «уже видаленим» — manifest простроченої generation
+  видалявся з SUCCESS «файлів, яких уже не було: N», і архів на недоступному томі ставав сиротою. Тепер такий
+  компонент дає WARNING «каталог компонента недоступний», generation не видаляється; коли каталог доступний, а
+  файла немає, поведінка без змін. (2) Існуючий файл за записаним шляхом приймався без identity-gate за
+  NameTemplate, тож пошкоджений або підмінений manifest простроченої generation міг видалити архів поточної. Тепер
+  діє той самий gate, що для перебудованого шляху і для відновлення (`Get-BRAVOVerifiedGenerationArchive`);
+  без NameTemplate поведінка не змінилась. Self-test
+  `BackupConsistency/SameRecordedPathUnavailableDestinationKeepsManifest`,
+  `BackupConsistency/SameRecordedPathAvailableDestinationMissingFileStillDeletes`,
+  `ManifestStorage/ExistingRecordedPathStillChecksNameTemplate`.
+
+- **Fix: багатотомний VSS (diskshadow) при ручному запуску з профілю з не-ASCII `%TEMP%`.** Відомий дефект
+  5.2.5/5.2.6: сценарій diskshadow (UTF-8 без BOM) і `SET METADATA` у `%TEMP%` diskshadow читає як ANSI/OEM,
+  кирилиця в шляху ламала сценарій (diskshadow 3 -> Archive 40). Тепер сценарій і metadata-.cab кладуться в
+  `%TEMP%`, лише якщо шлях ASCII, інакше в `%SystemRoot%\Temp` (з пробою запису); якщо придатного каталогу немає —
+  керована помилка VSS без live-архівації. Сценарій перевіряється на ASCII-чистоту і пишеться ASCII. Завдання
+  Планувальника під SYSTEM не зачеплені. Обхід для 5.2.6 (ASCII `TEMP`/`TMP` або запуск завданням) більше не
+  потрібен. Self-test `Archive/VSSDiskshadowWorkDir*`, `Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory`.
+
+- **Fix: Maintenance у local-only конфігурації більше не завершується кодом 10 через відкладену передачу Trace.**
+  При `componentSettings.SFTP.Enabled = false` добові архіви Trace і exchangAPI оновлюються локально, а передача
+  відкладається; раніше це логувалося WARNING «SFTP-сесія недоступна» для кожної дати backlog, і Maintenance щоночі
+  давав `SuccessWithWarnings` (10). Тепер для свідомо вимкненого SFTP це INFO «SFTP вимкнено конфігурацією»; при
+  увімкненому, але недоступному SFTP WARNING лишається. Джерела `.out` і надалі не видаляються без підтвердженої
+  передачі (політику не змінено). Self-test `TraceArchive/RemoteDisabledDeferralLogsInfoNotWarning`,
+  `TraceArchive/SessionUnavailableStillWarns`, `TraceArchive/RuntimeCallsPassRemoteDisabledFromStorageEffective`.
+
 - **Release: збирання з lightweight-тега відхиляється (D8).**
   `ci/New-BRAVOReleaseArtifact.ps1` з `-ExpectedTag` перевіряє, що тег annotated, і інакше падає з маркером
   `RELEASE_TAG_NOT_ANNOTATED` до збирання — Release з такого тега не створюється. GitHub ruleset тип тега не

@@ -2174,8 +2174,20 @@ try {
                 -Failure ("-ValidateOnly має попереджати про reparse point на шляху runtime (і мовчати на звичайному): normal='" + [string]$acl482WarnNormal + "' linked='" + [string]$acl482WarnLinked + "'") `
                 -EnvironmentLimitation $(if ($acl482AncestorCreated) { '' } else { $acl482NoLinkReason })
         } finally {
+            # Видалення лишається в тому самому процесі: junction знімається без рекурсії,
+            # а всі цілі перевіряються відносно іменованого scratch-каталогу до cleanup.
+            $acl482ScratchFull = [IO.Path]::GetFullPath($acl482Scratch).TrimEnd('\')
+            $acl482ScratchParent = [IO.Path]::GetFullPath([Environment]::GetFolderPath('CommonApplicationData')).TrimEnd('\')
+            if (-not [string]::Equals([IO.Path]::GetDirectoryName($acl482ScratchFull), $acl482ScratchParent, [StringComparison]::OrdinalIgnoreCase) -or
+                [IO.Path]::GetFileName($acl482ScratchFull) -notmatch '^bravo-acl482-[0-9a-f]{32}$') {
+                throw 'Небезпечний шлях cleanup ACL-фікстури.'
+            }
             foreach ($acl482Junction in @($acl482Junctions)) {
-                if ([IO.Directory]::Exists($acl482Junction)) { & cmd.exe /c rmdir "$acl482Junction" 2>&1 | Out-Null }
+                $acl482JunctionFull = [IO.Path]::GetFullPath($acl482Junction)
+                if (-not $acl482JunctionFull.StartsWith($acl482ScratchFull + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Junction cleanup виходить за межі ACL-фікстури.'
+                }
+                if ([IO.Directory]::Exists($acl482JunctionFull)) { [IO.Directory]::Delete($acl482JunctionFull, $false) }
             }
             if ([IO.Directory]::Exists($acl482Scratch)) {
                 # Елемент 'x.' (тест 10) дає Remove-Item термінальний Win32Exception навіть з SilentlyContinue.

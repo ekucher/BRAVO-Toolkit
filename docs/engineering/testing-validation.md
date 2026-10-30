@@ -41,6 +41,61 @@
   фікстури: прогін одного suite не еквівалентний повному прогону для
   runtime-релевантної зміни.
 
+## Швидкий цикл розробника
+
+Це прискорення зворотного зв'язку під час роботи, а не заміна Full.
+**Release gate і єдиний доказ для мержу та релізу — Full:**
+`.\BRAVO_SELF_TEST.ps1 -NoPause` (дослівний маркер `SELF-TEST PASSED`,
+код завершення 0).
+
+Команди (усі параметри існують у `BRAVO_SELF_TEST.ps1` та
+`ci\Invoke-BRAVOAffectedSelfTest.ps1`), виконуються з кореня репозиторію у
+Windows PowerShell 5.1:
+
+```powershell
+# 1. Один чи кілька suite з каталогу selftest\BRAVOSelfTestSuiteMap.ps1
+.\BRAVO_SELF_TEST.ps1 -NoPause -Suite Paths
+.\BRAVO_SELF_TEST.ps1 -NoPause -Suite DiskSpace,ArchiveDiskSpace
+
+# 2. Мінімальний набір за змінами відносно бази (git, не shallow-клон)
+.\ci\Invoke-BRAVOAffectedSelfTest.ps1 -BaseRef origin/developer
+
+# 3. Повний прогін перед PR і перед acceptance
+.\BRAVO_SELF_TEST.ps1 -NoPause
+```
+
+Як читати результат:
+
+- Вибірковий прогін завершується `SELF-TEST PARTIAL: <suite>`, а не
+  `SELF-TEST PASSED`, і підсумок прямо каже, що потрібен повний прогін.
+  `PARTIAL` ніколи не є доказом.
+- Inline-тіло кореня виконується завжди (фрагменти споживають його
+  фікстури), тому `-Suite` швидший за Full лише на частку suite.
+- Affected друкує `AFFECTED RESULT: <КОД>`; `0` лише для `PARTIAL-OK`.
+  Порожня база (`BASE-MISSING`), база рівна `HEAD` без змін
+  (`BASE-EQUALS-HEAD`), порожній diff (`EMPTY-DIFF`) і збій git — це
+  помилка з кодом `1`, а не успіх.
+
+Правило ескалації. Негайно запускай Full, а не вибірковий прогін, коли:
+
+- Affected друкує `AFFECTED CLASS: V3` / `ESCALATED-V3` (він у цьому
+  випадку нічого не запускає);
+- змінено будь-який шлях поза мапою: невідомий файл, `modules\**`
+  (мапа leaf-модулів порожня), `BRAVO_*.ps1`, `deploy\**`, `ci\**`,
+  `Tools\**`, `VERSION.json`, `Tools\TOOLS_MANIFEST.json`,
+  `selftest\fixtures\**`, `BRAVO_SELF_TEST.ps1` та `selftest\BRAVOSelfTestSuiteMap.ps1`;
+- змінено фрагменти поза каталогом `-Suite`:
+  `BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1` (окремий CI job) і
+  `BRAVO_SELF_TEST.ManualLaunchers.ps1` (вкладений у `LogRotation`);
+- набір змін змішаний (відомі й невідомі шляхи разом), шлях видалено чи
+  `RUNTIME_MANIFEST.json` не є похідним супутником змін;
+- зміна runtime-релевантна (див. розділ «Контракт self-test BRAVO»).
+
+Перед PR завжди запускай Full: вибірковий результат не замінює його, а
+Affected сам себе не вважає acceptance (`IsAcceptanceEvidence = $false`).
+Докладніше про Affected та клас V1/V2/V3 — у `README.md`, розділ
+«Affected: мінімальний вибірковий прогін за зміною».
+
 ## Безпека production-стану
 
 Тести й фікстури ніколи не читають і не пишуть реальний production-стан

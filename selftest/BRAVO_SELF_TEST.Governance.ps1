@@ -1565,12 +1565,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             if (-not $m.Success) { break }
             $first = $m.Value[0]
             if ($first -eq [char]'\') {
-                $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = 2; Kind = 'Escape' }))
+                $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = 2; Kind = 'Escape' }))
                 $pos = $m.Index + 2
                 continue
             }
             if ($first -eq [char]'<') {
-                $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = $m.Length; Kind = 'Comment' }))
+                $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = $m.Length; Kind = 'Comment' }))
                 $pos = $m.Index + $m.Length
                 continue
             }
@@ -1586,8 +1586,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             if ($content.Length -ge 2 -and $content.StartsWith(' ') -and $content.EndsWith(' ') -and $content.Trim().Length -gt 0) {
                 $content = $content.Substring(1, $content.Length - 2)
             }
-            $spans.Add((New-Object PSObject -Property @{ Index = $contentStart; Content = $content; Start = $m.Index; End = $close.Index + $runLength }))
-            $ranges.Add((New-Object PSObject -Property @{ Start = $m.Index; Length = $close.Index + $runLength - $m.Index; Kind = 'Code' }))
+            $spans.Add(([pscustomobject]@{ Index = $contentStart; Content = $content; Start = $m.Index; End = $close.Index + $runLength }))
+            $ranges.Add(([pscustomobject]@{ Start = $m.Index; Length = $close.Index + $runLength - $m.Index; Kind = 'Code' }))
             $pos = $close.Index + $runLength
         }
         $masked = New-Object Text.StringBuilder
@@ -1606,7 +1606,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         }
         [void]$masked.Append($Text.Substring($cursor))
         [void]$visible.Append($Text.Substring($cursor))
-        return New-Object PSObject -Property @{ Masked = $masked.ToString(); Visible = $visible.ToString(); CodeSpans = $spans }
+        return [pscustomobject]@{ Masked = $masked.ToString(); Visible = $visible.ToString(); CodeSpans = $spans }
     }
 
     function Get-BRAVODocModel {
@@ -1643,7 +1643,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
                         $close.Groups[1].Value[0] -eq $fence.FenceChar -and $close.Groups[1].Value.Length -ge $fence.FenceLength) {
                         $fence = $null
                     }
-                    $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                    $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                     continue
                 }
                 # Контейнер (пункт списку чи цитата) скінчився — з ним і блок;
@@ -1658,12 +1658,12 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             $blank = ($body.Trim().Length -eq 0)
             if ($inComment) {
                 if ($line.Contains('-->')) { $inComment = $false }
-                $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                 continue
             }
             if ($blank) {
                 $previousQuote = $quoteDepth
-                $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $false; Kind = 'Blank'; Block = ''; Container = 0; Quote = $quoteDepth }))
+                $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $false; Kind = 'Blank'; Block = ''; Container = 0; Quote = $quoteDepth }))
                 continue
             }
             while ($containers.Count -gt 0 -and $indent -lt $containers[$containers.Count - 1]) { $containers.RemoveAt($containers.Count - 1) }
@@ -1703,21 +1703,21 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
                 if ($column - $base -le 3) {
                     $open = [regex]::Match($rest, '^(`{3,}(?=[^`]*$)|~{3,})')
                     if ($open.Success) {
-                        $fence = New-Object PSObject -Property @{
+                        $fence = [pscustomobject]@{
                             FenceChar = $open.Groups[1].Value[0]; FenceLength = $open.Groups[1].Value.Length
                             Indent = $base; Quote = $quoteDepth
                         }
-                        $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                        $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                         continue
                     }
                     if ($rest.StartsWith('<!--')) {
                         $inComment = -not $rest.Substring(4).Contains('-->')
-                        $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
+                        $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $true; Kind = 'Code'; Block = $null; Container = 0; Quote = 0 }))
                         continue
                     }
                 }
             }
-            $lines.Add((New-Object PSObject -Property @{ Number = $i + 1; Text = $line; IsCode = $false; Kind = $kind; Block = $block; Container = $base; Quote = $quoteDepth }))
+            $lines.Add(([pscustomobject]@{ Number = $i + 1; Text = $line; IsCode = $false; Kind = $kind; Block = $block; Container = $base; Quote = $quoteDepth }))
         }
 
         # Абзаци (послідовні непорожні рендерні рядки) як один текст із мапою
@@ -1731,7 +1731,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         $paragraphs = New-Object Collections.Generic.List[object]
         $current = New-Object Collections.Generic.List[object]
         $entries = New-Object Collections.Generic.List[object]
-        $separator = New-Object PSObject -Property @{ Number = 0; Text = ''; IsCode = $true }
+        $separator = [pscustomobject]@{ Number = 0; Text = ''; IsCode = $true }
         foreach ($line in $lines) {
             if ($line.Kind -eq 'Heading') {
                 $entries.Add($separator)
@@ -1744,19 +1744,19 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             $entries.Add($line)
         }
         # Сторож наприкінці закриває останній абзац.
-        $entries.Add((New-Object PSObject -Property @{ Number = 0; Text = ''; IsCode = $true }))
+        $entries.Add(([pscustomobject]@{ Number = 0; Text = ''; IsCode = $true }))
         foreach ($entry in $entries) {
             if ($entry.IsCode -or [string]::IsNullOrEmpty($entry.Text.Trim())) {
                 if ($current.Count -gt 0) {
                     $sb = New-Object Text.StringBuilder
                     $offsets = New-Object Collections.Generic.List[object]
                     foreach ($line in $current) {
-                        $offsets.Add((New-Object PSObject -Property @{ Offset = $sb.Length; Number = $line.Number }))
+                        $offsets.Add(([pscustomobject]@{ Offset = $sb.Length; Number = $line.Number }))
                         [void]$sb.Append($line.Text).Append("`n")
                     }
                     $paragraphText = $sb.ToString()
                     $projection = Get-BRAVODocInlineProjection -Text $paragraphText
-                    $paragraphs.Add((New-Object PSObject -Property @{
+                    $paragraphs.Add(([pscustomobject]@{
                                 Lines = $current; Text = $paragraphText; Offsets = $offsets
                                 Masked = $projection.Masked; Visible = $projection.Visible; CodeSpans = $projection.CodeSpans
                             }))
@@ -1766,7 +1766,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
             }
             $current.Add($entry)
         }
-        $model = New-Object PSObject -Property @{ Source = $source; Lines = $lines; Paragraphs = $paragraphs }
+        $model = [pscustomobject]@{ Source = $source; Lines = $lines; Paragraphs = $paragraphs }
         $docModelCache[$FullPath] = $model
         return $model
     }
@@ -1979,12 +1979,18 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         param([string]$Text)
         $starts = New-Object Collections.Generic.List[int]
         $stack = New-Object Collections.Generic.Stack[int]
-        foreach ($bracket in [regex]::Matches($Text, '[\[\]]')) {
-            if ($bracket.Value -eq '[') { $stack.Push($bracket.Index); continue }
-            if ($stack.Count -eq 0) { continue }
-            $open = $stack.Pop()
-            $next = $bracket.Index + 1
-            if ($next -lt $Text.Length -and ($Text[$next] -eq [char]'(' -or $Text[$next] -eq [char]'[')) { $starts.Add($open) }
+        # IndexOfAny замість [regex]::Matches: той самий лінійний прохід по
+        # дужках без об'єкта Match на кожну дужку.
+        $bracketChars = [char[]]@([char]'[', [char]']')
+        $at = $Text.IndexOfAny($bracketChars)
+        while ($at -ge 0) {
+            if ($Text[$at] -eq [char]'[') { $stack.Push($at) }
+            elseif ($stack.Count -gt 0) {
+                $open = $stack.Pop()
+                $next = $at + 1
+                if ($next -lt $Text.Length -and ($Text[$next] -eq [char]'(' -or $Text[$next] -eq [char]'[')) { $starts.Add($open) }
+            }
+            $at = $Text.IndexOfAny($bracketChars, $at + 1)
         }
         $starts.Sort()
         return ,$starts
@@ -6798,9 +6804,16 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
         $closureProbe = & {
             param([int]$GlobalLimit)
             $MaximumVariableCount = $GlobalLimit * 4
+            # Змінні створюються звичайними присвоєннями (dot-source згенерованого
+            # блоку в ЦІЙ області), а не Set-Variable -Name у циклі: Set-Variable
+            # трактує -Name як шаблон і щоразу скануює всі змінні області —
+            # квадратична вартість (~19 с на 8448 змінних проти ~0.3 с). Кількість,
+            # імена й значення змінних, область і ефект на closure ті самі.
+            $closurePadBuilder = New-Object System.Text.StringBuilder
             for ($padIndex = 0; $padIndex -lt ($GlobalLimit + 256); $padIndex++) {
-                Set-Variable -Name ("closurePad$padIndex") -Value $padIndex
+                [void]$closurePadBuilder.Append('$closurePad').Append($padIndex).Append('=').Append($padIndex).Append(';')
             }
+            . ([scriptblock]::Create($closurePadBuilder.ToString()))
             $closureDependency = New-Object System.Collections.Generic.List[string]
             $directCallback = { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure()
             $narrowCallback = & { param($closureDependency) { param($Message) if ($null -ne $closureDependency) { [void]$closureDependency.Add($Message) } }.GetNewClosure() } $closureDependency

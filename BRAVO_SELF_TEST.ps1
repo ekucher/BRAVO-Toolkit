@@ -1438,6 +1438,63 @@ function Write-BRAVOSelfTestTimingSummary {
     }
     Write-Host "------------------------------------------------------------------------"
     Write-BRAVOResultBlankLine
+
+    # OPT-02: opt-in профіль (BRAVO_SELFTEST_PROFILE=1), лише ПІСЛЯ незмінного
+    # блоку вище; без змінної середовища друкується тільки він. Нічого не
+    # обгортає й не збирає під час прогону: працює над вже накопиченими
+    # секціями ($script:BRAVOSelfTestSections) і процесними лічильниками
+    # ОС/CLR, тому не впливає ні на тривалість, ні на результат перевірок.
+    # Лічильники ParseFile/читань/дочірніх процесів/Start-Sleep навмисно НЕ
+    # збираються: це потребувало б обгортання сотень викликів або підміни
+    # вбудованих команд, які ізоляційні перевірки (#337) вважають забрудненням.
+    if ($env:BRAVO_SELFTEST_PROFILE -eq '1') {
+        $profileSections = $script:BRAVOSelfTestSections.ToArray()
+        $profileChildMs = @{}
+        $profileTopLevelMs = 0.0
+        foreach ($profileSection in $profileSections) {
+            if ([string]::IsNullOrEmpty($profileSection.Parent)) {
+                $profileTopLevelMs += $profileSection.DurationMs
+            } else {
+                if (-not $profileChildMs.ContainsKey($profileSection.Parent)) { $profileChildMs[$profileSection.Parent] = 0.0 }
+                $profileChildMs[$profileSection.Parent] += $profileSection.DurationMs
+            }
+        }
+        $profileRows = @(foreach ($profileSection in $profileSections) {
+                $profileChild = 0.0
+                if ($profileChildMs.ContainsKey($profileSection.Name)) { $profileChild = $profileChildMs[$profileSection.Name] }
+                [pscustomobject]@{
+                    Name   = $profileSection.Name
+                    Suite  = $profileSection.Suite
+                    Status = $profileSection.Status
+                    Checks = $profileSection.ChecksExecuted
+                    WallMs = $profileSection.DurationMs
+                    SelfMs = $profileSection.DurationMs - $profileChild
+                }
+            })
+        $profileTotalMs = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds
+        Write-Host "Profile (BRAVO_SELFTEST_PROFILE=1): top 20 sections by self time"
+        Write-Host "Self = wall секції мінус wall вкладених секцій; час поза секціями не входить."
+        Write-Host "------------------------------------------------------------------------"
+        Write-Host ("{0,-58} {1,-11} {2,7} {3,9} {4,9}" -f 'Section', 'Suite', 'Checks', 'Wall(s)', 'Self(s)')
+        Write-Host "------------------------------------------------------------------------"
+        foreach ($profileRow in @($profileRows | Sort-Object -Property SelfMs -Descending | Select-Object -First 20)) {
+            Write-Host ("{0,-58} {1,-11} {2,7} {3,9:N1} {4,9:N1}" -f `
+                $profileRow.Name, $profileRow.Suite, $profileRow.Checks, ($profileRow.WallMs / 1000.0), ($profileRow.SelfMs / 1000.0))
+        }
+        Write-Host "------------------------------------------------------------------------"
+        Write-Host ("Sections: {0}; top-level sections wall: {1:N1}s of {2:N1}s total; outside sections: {3:N1}s" -f `
+            $profileRows.Count, ($profileTopLevelMs / 1000.0), ($profileTotalMs / 1000.0), (($profileTotalMs - $profileTopLevelMs) / 1000.0))
+        try {
+            $profileProcess = [Diagnostics.Process]::GetCurrentProcess()
+            Write-Host ("Process: peak working set {0:N0} MB; cpu {1:N1}s; managed heap {2:N0} MB; GC gen0/1/2 {3}/{4}/{5}" -f `
+                ($profileProcess.PeakWorkingSet64 / 1MB), $profileProcess.TotalProcessorTime.TotalSeconds,
+                ([GC]::GetTotalMemory($false) / 1MB), [GC]::CollectionCount(0), [GC]::CollectionCount(1), [GC]::CollectionCount(2))
+        } catch {
+            Write-Host ("Process: лічильники недоступні: {0}" -f $_.Exception.Message)
+        }
+        Write-Host "Parse/read/child-process/Start-Sleep лічильники не збираються (див. docs/engineering/selftest-performance/baseline.md)."
+        Write-BRAVOResultBlankLine
+    }
 }
 
 # P0 fail-fast/telemetry: канонічний ЄДИНИЙ фінальний reporting/exit
@@ -2330,6 +2387,108 @@ function Get-BRAVOSelfTestAstTypePredicate {
         }.GetNewClosure()
     }
     $script:BRAVOSelfTestAstTypePredicateCache[$cacheKey] = $predicate
+    return $predicate
+}
+
+# Предикат "ім'я вузла належить набору" для FindAll (OPT-03/OPT-07): теж
+# компілюється в .NET-делегат, а не викликає scriptblock на кожному вузлі.
+# Пропускає ЗАВЖДИ FunctionDefinitionAst, а VariableExpressionAst і CommandAst -
+# лише коли VariablePath.UserPath / GetCommandName() є в наборі (порівняння
+# за правилами самого набору). Це фільтр-надмножина: подальша класифікація
+# вузлів лишається в аналізаторі без змін. Кешу тут немає: набір залежить від
+# конкретного аналізу, предикат будується щоразу.
+function Get-BRAVOSelfTestAstNameFilterPredicate {
+    param([Parameter(Mandatory = $true)][System.Collections.Generic.HashSet[string]]$Name)
+
+    $predicate = $null
+    try {
+        $nodeParameter = [Linq.Expressions.Expression]::Parameter([Management.Automation.Language.Ast], 'node')
+        $setConstant = [Linq.Expressions.Expression]::Constant($Name, [System.Collections.Generic.HashSet[string]])
+        $containsMethod = [System.Collections.Generic.HashSet[string]].GetMethod('Contains', [Type[]]@([string]))
+        $variableType = [Management.Automation.Language.VariableExpressionAst]
+        $commandType = [Management.Automation.Language.CommandAst]
+        $userPath = [Linq.Expressions.Expression]::Property(
+            [Linq.Expressions.Expression]::Property([Linq.Expressions.Expression]::Convert($nodeParameter, $variableType), 'VariablePath'),
+            'UserPath')
+        $commandName = [Linq.Expressions.Expression]::Call(
+            [Linq.Expressions.Expression]::Convert($nodeParameter, $commandType),
+            $commandType.GetMethod('GetCommandName', [Type[]]@()))
+        $variableTest = [Linq.Expressions.Expression]::AndAlso(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, $variableType),
+            [Linq.Expressions.Expression]::Call($setConstant, $containsMethod, [Linq.Expressions.Expression[]]@($userPath)))
+        $commandTest = [Linq.Expressions.Expression]::AndAlso(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, $commandType),
+            [Linq.Expressions.Expression]::Call($setConstant, $containsMethod, [Linq.Expressions.Expression[]]@($commandName)))
+        $body = [Linq.Expressions.Expression]::OrElse(
+            [Linq.Expressions.Expression]::OrElse(
+                [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.FunctionDefinitionAst]),
+                $variableTest),
+            $commandTest)
+        $predicate = [Linq.Expressions.Expression]::Lambda(
+            [Func[Management.Automation.Language.Ast, bool]],
+            $body,
+            [Linq.Expressions.ParameterExpression[]]@($nodeParameter)
+        ).Compile()
+    } catch {
+        # Linq.Expressions недоступні: повільніший предикат з тією самою семантикою.
+        $fallbackNames = $Name
+        $predicate = {
+            param($node)
+            if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+            if ($node -is [Management.Automation.Language.VariableExpressionAst]) { return $fallbackNames.Contains($node.VariablePath.UserPath) }
+            if ($node -is [Management.Automation.Language.CommandAst]) {
+                $fallbackCommandName = $node.GetCommandName()
+                return ($null -ne $fallbackCommandName -and $fallbackNames.Contains($fallbackCommandName))
+            }
+            return $false
+        }.GetNewClosure()
+    }
+    return $predicate
+}
+
+# Предикат "форма визначення" для FindAll (OPT-03/OPT-07): FunctionDefinitionAst
+# і змінні, чий безпосередній батько може зробити їх ціллю присвоєння,
+# змінною foreach чи параметром (Assignment, Convert, ArrayLiteral, ForEach,
+# Parameter). Надмножина справжніх визначень: точну перевірку (Left,
+# Variable, вкладення Convert/ArrayLiteral) робить сам аналізатор.
+function Get-BRAVOSelfTestAstDefinitionShapePredicate {
+    $parentTypes = @(
+        [Management.Automation.Language.AssignmentStatementAst],
+        [Management.Automation.Language.ConvertExpressionAst],
+        [Management.Automation.Language.ArrayLiteralAst],
+        [Management.Automation.Language.ForEachStatementAst],
+        [Management.Automation.Language.ParameterAst])
+    $predicate = $null
+    try {
+        $nodeParameter = [Linq.Expressions.Expression]::Parameter([Management.Automation.Language.Ast], 'node')
+        $parentExpression = [Linq.Expressions.Expression]::Property($nodeParameter, 'Parent')
+        $parentTest = $null
+        foreach ($parentType in $parentTypes) {
+            $typeTest = [Linq.Expressions.Expression]::TypeIs($parentExpression, $parentType)
+            if ($null -eq $parentTest) { $parentTest = $typeTest } else { $parentTest = [Linq.Expressions.Expression]::OrElse($parentTest, $typeTest) }
+        }
+        $body = [Linq.Expressions.Expression]::OrElse(
+            [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.FunctionDefinitionAst]),
+            [Linq.Expressions.Expression]::AndAlso(
+                [Linq.Expressions.Expression]::TypeIs($nodeParameter, [Management.Automation.Language.VariableExpressionAst]),
+                $parentTest))
+        $predicate = [Linq.Expressions.Expression]::Lambda(
+            [Func[Management.Automation.Language.Ast, bool]],
+            $body,
+            [Linq.Expressions.ParameterExpression[]]@($nodeParameter)
+        ).Compile()
+    } catch {
+        $fallbackParentTypes = $parentTypes
+        $predicate = {
+            param($node)
+            if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) { return $true }
+            if (-not ($node -is [Management.Automation.Language.VariableExpressionAst])) { return $false }
+            foreach ($fallbackParentType in $fallbackParentTypes) {
+                if ($node.Parent -is $fallbackParentType) { return $true }
+            }
+            return $false
+        }.GetNewClosure()
+    }
     return $predicate
 }
 
@@ -16342,6 +16501,8 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # Пошук по AST, а не підрядком: інакше тест ловив би власні пояснювальні
     # коментарі — на цих граблях ця гілка вже стояла двічі.
     $collapsedJsonUsages = @()
+    $jsonArrayExpressionPredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.ArrayExpressionAst])
+    $jsonPipelinePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([System.Management.Automation.Language.PipelineAst])
     # -Include мовчки ігнорується разом із -LiteralPath, тому фільтруємо
     # розширення самі; LOGS виключено окремо — там лежить відкритий
     # transcript цього ж прогону.
@@ -16351,31 +16512,34 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $_.FullName -notlike '*\local-backups\*' -and
             $_.FullName -notlike '*\LOGS\*'
         })) {
-        $jsonScriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $jsonScriptPath.FullName, [ref]$null, [ref]$null
-        )
-        $collapsedNode = $jsonScriptAst.Find(
-            {
-                param($node)
-                if ($node -isnot [System.Management.Automation.Language.ArrayExpressionAst]) {
-                    return $false
+        # Файли, які Root/Parser уже розібрав, беруться з кешу прогону; решта
+        # (ci, deploy, Tools...) розбирається напряму й не потрапляє в кеш, щоб
+        # не роздувати купу.
+        if ($script:BRAVOSelfTestParsedFileCache.ContainsKey($jsonScriptPath.FullName)) {
+            $jsonScriptAst = (Get-BRAVOSelfTestParsedFile -Path $jsonScriptPath.FullName).Ast
+        } else {
+            $jsonScriptAst = [System.Management.Automation.Language.Parser]::ParseFile(
+                $jsonScriptPath.FullName, [ref]$null, [ref]$null
+            )
+        }
+        # Предикат на кожному вузлі файлу - виклик scriptblock-а на мільйонах
+        # вузлів; тип вузла відбирає компільований делегат, а сама умова
+        # перевіряється лише на знайдених @(...) / конвеєрах. Результат той
+        # самий: перший за обходом @(...), у якому є потрібний конвеєр.
+        $collapsedNode = $null
+        foreach ($arrayNode in @($jsonScriptAst.FindAll($jsonArrayExpressionPredicate, $true))) {
+            # Всередині @() шукаємо конвеєр, останній елемент якого —
+            # виклик ConvertFrom-Json. Саме він і згортає масив.
+            foreach ($pipelineNode in @($arrayNode.SubExpression.FindAll($jsonPipelinePredicate, $true))) {
+                if ($pipelineNode.PipelineElements.Count -gt 1 -and
+                    ($pipelineNode.PipelineElements[-1] -is [System.Management.Automation.Language.CommandAst]) -and
+                    ([string]$pipelineNode.PipelineElements[-1].GetCommandName()) -eq 'ConvertFrom-Json') {
+                    $collapsedNode = $arrayNode
+                    break
                 }
-                # Всередині @() шукаємо конвеєр, останній елемент якого —
-                # виклик ConvertFrom-Json. Саме він і згортає масив.
-                $inner = $node.SubExpression.Find(
-                    {
-                        param($pipelineNode)
-                        $pipelineNode -is [System.Management.Automation.Language.PipelineAst] -and
-                        $pipelineNode.PipelineElements.Count -gt 1 -and
-                        ($pipelineNode.PipelineElements[-1] -is [System.Management.Automation.Language.CommandAst]) -and
-                        ([string]$pipelineNode.PipelineElements[-1].GetCommandName()) -eq 'ConvertFrom-Json'
-                    },
-                    $true
-                )
-                return ($null -ne $inner)
-            },
-            $true
-        )
+            }
+            if ($null -ne $collapsedNode) { break }
+        }
         if ($null -ne $collapsedNode) {
             $collapsedJsonUsages += $jsonScriptPath.Name
         }
@@ -17821,6 +17985,14 @@ $global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
+    # Похідні рядки з незмінних файлів репозиторію (runtime 845 КБ + ServiceCycle/
+    # ServiceRecovery + stubs) будуються ОДИН раз на дочірній процес і далі лише
+    # читаються сценаріями (рядки, не AST). Раніше кожен із ~55 сценаріїв заново
+    # парсив усе це (OPT-08). Збій побудови не кешується: кожен сценарій знову
+    # кине ту саму помилку й отримає ProbeError (fail-closed). Файл runtime.ps1,
+    # seed, scenario-seed, Import-Module -Force і виклик точки входу лишаються
+    # посценарними.
+    if ($null -eq $script:probeShared) {
     $probeRuntimeText = [IO.File]::ReadAllText(
         (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
     $probeParseErrors = $null
@@ -17890,6 +18062,15 @@ try {
         [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
         [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
     }
+    $script:probeShared = @{
+        ParamBlockText = [string]$probeAst.ParamBlock.Extent.Text
+        FunctionTexts = [string]($probeFunctionTexts -join "`n`n")
+        Stubs = [string]$probeStubs
+        RegionText = [string]$probeRegion.ToString()
+        FinallyText = [string]('} finally ' + $probeOuterTry.Finally.Extent.Text)
+    }
+    }
+    $probeShared = $script:probeShared
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
     # ThrowInSizeCheck: exchangAPI зупинена до прогону. #349 *InitiallyStopped:
@@ -18080,18 +18261,18 @@ try {
         $probeScenarioSeedFile = [IO.File]::ReadAllText($probeScenarioSeedPath, [Text.Encoding]::UTF8)
     }
     $probeGenerated = @(
-        $probeAst.ParamBlock.Extent.Text,
+        $probeShared.ParamBlockText,
         'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
         'Set-StrictMode -Version 2.0',
-        ($probeFunctionTexts -join "`n`n"),
-        $probeStubs,
+        $probeShared.FunctionTexts,
+        $probeShared.Stubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
         $probeRestoreSeed,
         $probeScenarioSeedFile,
         'try {',
-        $probeRegion.ToString(),
-        ('} finally ' + $probeOuterTry.Finally.Extent.Text),
+        $probeShared.RegionText,
+        $probeShared.FinallyText,
         '}',
         'Invoke-BRAVOMaintenanceOrchestrationProbe'
     ) -join "`n"
@@ -19744,11 +19925,33 @@ $credentialSettings = $null
 $operationsReportingSettings = $null
 '@
             $healthOrchestrationProbeScript = @'
+param([string]$Scenarios, [string]$RepositoryRoot, [string]$ProbeParent)
+# Усі сценарії в ОДНОМУ дочірньому процесі (раніше: процес на сценарій; OPT-08).
+# Ізоляція сценарію: власний дочірній scope (& { }), власні ProbeRoot, runtime.ps1
+# і result.json, свіжий Import-Module -Force, глобальні змінні сценарію
+# прибираються перед наступним (так само, як у пробі Maintenance). Канарки
+# ізоляції: сценарій, що побачив слід попереднього, пише ProbeError (fail-closed).
+$probeBaselineGlobals = @{}
+foreach ($probeGlobal in @(Get-Variable -Scope Global)) { $probeBaselineGlobals[$probeGlobal.Name] = $true }
+foreach ($probeScenarioName in @($Scenarios -split ',')) {
+    do {
+        try {
+            & {
 param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
 $ErrorActionPreference = 'Stop'
+$probeLeaks = @()
+if ($null -ne (Get-Variable -Name 'probeIsolationCanary' -ErrorAction SilentlyContinue)) { $probeLeaks += 'probeIsolationCanary' }
+if ($null -ne (Get-Variable -Name 'BRAVOOrchestrationProbeCanary' -Scope Global -ErrorAction SilentlyContinue)) { $probeLeaks += 'global:BRAVOOrchestrationProbeCanary' }
+$probeIsolationCanary = $Scenario
+$global:BRAVOOrchestrationProbeCanary = $Scenario
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
 $probeUtf8 = New-Object Text.UTF8Encoding($false)
 try {
+    # Похідні рядки з незмінних файлів репозиторію будуються один раз на дочірній
+    # процес (рядки, не AST); збій побудови не кешується (кожен сценарій знову
+    # отримає ту саму помилку). runtime.ps1, seed, Import-Module -Force і точка
+    # входу лишаються посценарними.
+    if ($null -eq $script:probeShared) {
     $probeRuntimeText = [IO.File]::ReadAllText(
         (Join-Path $RepositoryRoot 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
     $probeParseErrors = $null
@@ -19811,6 +20014,17 @@ try {
         [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
         [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
     }
+    $script:probeShared = @{
+        ParamBlockText = [string]$probeAst.ParamBlock.Extent.Text
+        WrapperParamText = [string]$probeWrapper.Body.ParamBlock.Extent.Text
+        LeadingText = [string]($probeLeadingTexts -join "`n")
+        FunctionTexts = [string]($probeFunctionTexts -join "`n`n")
+        Stubs = [string]$probeStubs
+        RegionText = [string]$probeRegion.ToString()
+        GuardText = [string]$probeGuard.Extent.Text
+    }
+    }
+    $probeShared = $script:probeShared
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
     $probeTemporaryRoot = Join-Path $ProbeRoot 'TEMP'
@@ -19840,18 +20054,18 @@ try {
         ('$probeHostKey = ''{0}''' -f $(if ($Scenario -eq 'InvalidHostKey') { 'ssh-ed25519 255 self-test' } else { 'ssh-ed25519 255 SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE' }))
     ) -join "`n"
     $probeGenerated = @(
-        $probeAst.ParamBlock.Extent.Text,
+        $probeShared.ParamBlockText,
         'function Invoke-BRAVOHealth {',
-        $probeWrapper.Body.ParamBlock.Extent.Text,
+        $probeShared.WrapperParamText,
         'Set-StrictMode -Version 2.0',
-        ($probeLeadingTexts -join "`n"),
-        ($probeFunctionTexts -join "`n`n"),
-        $probeStubs,
+        $probeShared.LeadingText,
+        $probeShared.FunctionTexts,
+        $probeShared.Stubs,
         $probeScenarioSeed,
         [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
-        $probeRegion.ToString(),
+        $probeShared.RegionText,
         '}',
-        $probeGuard.Extent.Text
+        $probeShared.GuardText
     ) -join "`n"
     $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
     [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
@@ -19895,7 +20109,22 @@ try {
 } catch {
     $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
 }
+if (@($probeLeaks).Count -gt 0) {
+    $probeResult = [pscustomobject]@{ ProbeError = ('ізоляцію сценарію порушено: ' + (@($probeLeaks) -join ', ')) }
+}
 [IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+            } -Scenario $probeScenarioName -RepositoryRoot $RepositoryRoot -ProbeRoot (Join-Path $ProbeParent $probeScenarioName)
+        } catch {
+            # result.json не записано: батьківська частина дасть ProbeError.
+            $null = $_
+        }
+    } while ($false)
+    foreach ($probeGlobal in @(Get-Variable -Scope Global)) {
+        if (-not $probeBaselineGlobals.ContainsKey($probeGlobal.Name)) {
+            Remove-Variable -Name $probeGlobal.Name -Scope Global -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
 '@
             $healthOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
             [IO.File]::WriteAllText((Join-Path $healthOrchestrationRoot 'stubs.ps1'), $healthOrchestrationStubs, $healthOrchestrationUtf8)
@@ -19904,17 +20133,21 @@ try {
             [IO.File]::WriteAllText($healthOrchestrationProbePath, $healthOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
             $healthOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
             $healthOrchestrationResults = @{}
-            foreach ($healthOrchestrationScenario in @(
-                    'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
-                    'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
-                    'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook',
-                    'InvalidHostKey'
-                )) {
+            $healthOrchestrationScenarios = @(
+                'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
+                'ToolIntegritySftpDisabled', 'ToolIntegrityWinScpBusy',
+                'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook',
+                'InvalidHostKey'
+            )
+            foreach ($healthOrchestrationScenario in $healthOrchestrationScenarios) {
+                [void][IO.Directory]::CreateDirectory((Join-Path $healthOrchestrationRoot $healthOrchestrationScenario))
+            }
+            # Один дочірній процес на всі сценарії (ізоляція сценаріїв — у probe.ps1).
+            $null = & $healthOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $healthOrchestrationProbePath `
+                -Scenarios ($healthOrchestrationScenarios -join ',') -RepositoryRoot $root -ProbeParent $healthOrchestrationRoot
+            foreach ($healthOrchestrationScenario in $healthOrchestrationScenarios) {
                 $healthOrchestrationScenarioRoot = Join-Path $healthOrchestrationRoot $healthOrchestrationScenario
-                [void][IO.Directory]::CreateDirectory($healthOrchestrationScenarioRoot)
-                $null = & $healthOrchestrationHost -NoLogo -NoProfile -NonInteractive `
-                    -ExecutionPolicy Bypass -File $healthOrchestrationProbePath `
-                    -Scenario $healthOrchestrationScenario -RepositoryRoot $root -ProbeRoot $healthOrchestrationScenarioRoot
                 $healthOrchestrationResultPath = Join-Path $healthOrchestrationScenarioRoot 'result.json'
                 $healthOrchestrationResults[$healthOrchestrationScenario] = if (Test-Path -LiteralPath $healthOrchestrationResultPath -PathType Leaf) {
                     [IO.File]::ReadAllText($healthOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -35151,6 +35384,134 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework' -DependsOn 'Tail/Isolation
             "after-delay=$elapsedAfterDelay after-second-stop=$elapsedAfterSecondStop")
 }
 
+# Framework/TimingSummaryProfile* (OPT-02): opt-in профіль секцій у Timing
+# summary. Реальна Write-BRAVOSelfTestTimingSummary береться AST-екстракцією
+# з цього файлу й виконується в ізольованому динамічному модулі на
+# СИНТЕТИЧНИХ секціях (Write-Host/Write-BRAVOResultBlankLine там — локальні
+# стаби, що збирають рядки): жива телеметрія головного процесу не чіпається.
+# Доводить: (1) без BRAVO_SELFTEST_PROFILE=1 (і з '0') профільних рядків немає;
+# (2) з =1 вивід лише ДОДАЄТЬСЯ до незмінного блоку (префікс збігається);
+# (3) секції впорядковано за self-часом, self = wall мінус вкладені секції;
+# (4) підсумок секцій і процесні лічильники друкуються; (5) fixture нічого не
+# лишив (функція відновлена, змінну середовища повернуто).
+# Fixture shadow-ить Write-BRAVOSelfTestTimingSummary у Function:-drive (див.
+# коментар вище про New-Module), тому відновлення ScriptBlock — у finally.
+& {
+    $profileProbeRealSummaryScriptBlock = (Get-Item -Path function:Write-BRAVOSelfTestTimingSummary).ScriptBlock
+    $profileProbeEnvBefore = [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', 'Process')
+    $profileProbeModule = $null
+    $profileProbeResult = $null
+    $profileProbeFixtureError = $null
+    try {
+        $profileProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText (Get-BRAVOSelfTestOwnSourceText) `
+            -FunctionNames @('Write-BRAVOSelfTestTimingSummary')
+        $profileProbeResult = & $profileProbeModule {
+            $script:profileProbeLines = New-Object System.Collections.Generic.List[string]
+            function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$Parts) [void]$script:profileProbeLines.Add([string]($Parts -join ' ')) }
+            function Write-BRAVOResultBlankLine { }
+            $script:suiteDurationTotals = [ordered]@{ 'ProbeSuite' = 5000.0 }
+            $script:testTimings = New-Object System.Collections.Generic.List[object]
+            [void]$script:testTimings.Add([pscustomobject]@{
+                    Name = 'Probe/A'; Suite = 'ProbeSuite'; Result = 'PASS'
+                    LeadDurationMs = 1.0; AssertionDurationMs = 1.0; IntervalMs = 2.0
+                })
+            $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
+            $script:selfTestTotalStopwatch.Stop()
+            $script:BRAVOSelfTestSections = New-Object System.Collections.Generic.List[object]
+            foreach ($probeSectionSpec in @(
+                    @('P/Parent', '', 4000.0), @('P/ChildA', 'P/Parent', 1000.0),
+                    @('P/ChildB', 'P/Parent', 2500.0), @('P/Solo', '', 600.0))) {
+                [void]$script:BRAVOSelfTestSections.Add([pscustomobject]@{
+                        Name = $probeSectionSpec[0]; Parent = $probeSectionSpec[1]; Suite = 'ProbeSuite'
+                        Status = 'Completed'; DurationMs = $probeSectionSpec[2]; ChecksExecuted = 1
+                    })
+            }
+            $probeRuns = [ordered]@{}
+            foreach ($probeMode in @('unset', '0', '1')) {
+                $script:profileProbeLines.Clear()
+                if ($probeMode -eq 'unset') {
+                    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $null, 'Process')
+                } else {
+                    [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $probeMode, 'Process')
+                }
+                Write-BRAVOSelfTestTimingSummary
+                $probeRuns[$probeMode] = $script:profileProbeLines.ToArray()
+            }
+            [pscustomobject]@{ Unset = $probeRuns['unset']; Zero = $probeRuns['0']; On = $probeRuns['1'] }
+        }
+    } catch {
+        $profileProbeFixtureError = $_.Exception.Message
+    } finally {
+        [Environment]::SetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', $profileProbeEnvBefore, 'Process')
+        Set-Item -Path function:Write-BRAVOSelfTestTimingSummary -Value $profileProbeRealSummaryScriptBlock -Force
+        Clear-BRAVOSelfTestOwnedRuntimeModules
+    }
+
+    if ($null -ne $profileProbeFixtureError) {
+        Test-BRAVOCondition -Condition $false -Name "Framework/TimingSummaryProfileFixtureExecution" `
+            -Failure "не вдалося виконати isolated profile-probe fixture: $profileProbeFixtureError"
+    } else {
+        $profileOffLines = @($profileProbeResult.Unset)
+        $profileZeroLines = @($profileProbeResult.Zero)
+        $profileOnLines = @($profileProbeResult.On)
+        $profileOffIsBaseline = (
+            $profileOffLines.Count -gt 0 -and
+            @($profileOffLines | Where-Object { $_ -match '^Total wall-clock: ' }).Count -eq 1 -and
+            @($profileOffLines | Where-Object { $_ -eq 'Top 20 longest assertion intervals' }).Count -eq 1 -and
+            @($profileOffLines | Where-Object { $_ -match '^(Profile|Sections:|Process:)' }).Count -eq 0
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $profileOffIsBaseline -and
+                [string]::Join("`n", $profileZeroLines) -ceq [string]::Join("`n", $profileOffLines)
+            ) `
+            -Name "Framework/TimingSummaryProfileOffByDefault" `
+            -Failure "без BRAVO_SELFTEST_PROFILE=1 (і з '0') Timing summary має лишатись без профільних рядків: off=$($profileOffLines.Count) рядків, zero=$($profileZeroLines.Count)"
+
+        $profilePrefixMatches = (
+            $profileOnLines.Count -gt $profileOffLines.Count -and
+            [string]::Join("`n", @($profileOnLines | Select-Object -First $profileOffLines.Count)) -ceq [string]::Join("`n", $profileOffLines)
+        )
+        Test-BRAVOCondition `
+            -Condition $profilePrefixMatches `
+            -Name "Framework/TimingSummaryProfileOnlyAddsLines" `
+            -Failure "профіль мав лише дописати рядки ПІСЛЯ незмінного Timing summary: off=$($profileOffLines.Count) on=$($profileOnLines.Count)"
+
+        $profileOnlyLines = if ($profilePrefixMatches) { @($profileOnLines | Select-Object -Skip $profileOffLines.Count) } else { @() }
+        $profileRowNames = @(foreach ($profileLine in $profileOnlyLines) {
+                if ($profileLine -match '^(P/\S+)\s+ProbeSuite\s') { $Matches[1] }
+            })
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::Join(',', $profileRowNames) -ceq 'P/ChildB,P/ChildA,P/Solo,P/Parent' -and
+                @($profileOnlyLines | Where-Object { $_ -match '^P/Parent\s+ProbeSuite\s+1\s+4[.,]0\s+0[.,]5$' }).Count -eq 1 -and
+                @($profileOnlyLines | Where-Object { $_ -match '^P/ChildB\s+ProbeSuite\s+1\s+2[.,]5\s+2[.,]5$' }).Count -eq 1
+            ) `
+            -Name "Framework/TimingSummaryProfileRanksSectionsBySelfTime" `
+            -Failure ("секції мають бути впорядковані за self-часом (wall мінус вкладені): отримано '" +
+                [string]::Join(',', $profileRowNames) + "'")
+
+        Test-BRAVOCondition `
+            -Condition (
+                @($profileOnlyLines | Where-Object { $_ -match '^Sections: 4; top-level sections wall: 4[.,]6s of ' }).Count -eq 1 -and
+                @($profileOnlyLines | Where-Object { $_ -match '^Process: peak working set \d.*GC gen0/1/2 \d+/\d+/\d+$' }).Count -eq 1
+            ) `
+            -Name "Framework/TimingSummaryProfileReportsCoverageAndProcess" `
+            -Failure "профіль має друкувати підсумок секцій (4; top-level 4.6s) і процесні лічильники"
+    }
+
+    $profileProbeCurrentCommand = Get-Command -Name 'Write-BRAVOSelfTestTimingSummary' -ErrorAction SilentlyContinue
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $profileProbeCurrentCommand -and
+            [string]::IsNullOrEmpty($profileProbeCurrentCommand.ModuleName) -and
+            $profileProbeCurrentCommand.ScriptBlock.ToString() -ceq $profileProbeRealSummaryScriptBlock.ToString() -and
+            [Environment]::GetEnvironmentVariable('BRAVO_SELFTEST_PROFILE', 'Process') -ceq $profileProbeEnvBefore
+        ) `
+        -Name "Framework/TimingSummaryProfileProbeCleanedUp" `
+        -Failure "profile-probe не відновив Write-BRAVOSelfTestTimingSummary і/або змінну BRAVO_SELFTEST_PROFILE"
+}
+
 # Framework/BootstrapIntegrityCheckedBeforeManifestCoveredImports (P1-A
 # regression): текстова перевірка ФІЗИЧНОГО порядку у ВЛАСНОМУ вихідному
 # коді — той самий підхід, що вже використовується нижче для
@@ -36904,10 +37265,34 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
         # Дорогий підйом до меж scope — лише для визначень і для тих читань,
         # чиє ім'я взагалі визначає якийсь фрагмент.
         $unitFacts = @()
-        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
-            [Management.Automation.Language.VariableExpressionAst],
-            [Management.Automation.Language.FunctionDefinitionAst],
-            [Management.Automation.Language.CommandAst])
+        # Корінь і фрагменти розбираються лише на вузлах, чиє ім'я МОЖЕ
+        # визначати фрагмент: імена з визначень фрагментів (надмножина, без
+        # перевірки scope), включно з варіантами з кваліфікатором scope. Решта
+        # вузлів на результат не впливає: визначення кореня враховуються лише
+        # для імен, які визначає фрагмент ($fragmentDefinedKeys), а читання -
+        # лише для імен із $fragmentOwners, і обидва є підмножиною цього набору.
+        $definitionShapePredicate = Get-BRAVOSelfTestAstDefinitionShapePredicate
+        $candidateNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $qualifierPrefixes = @('script:', 'global:', 'local:', 'private:', 'variable:', 'using:')
+        foreach ($fragmentUnit in $units) {
+            if ($null -eq $fragmentUnit.Suite) { continue }
+            foreach ($shapeNode in @($fragmentUnit.Ast.FindAll($definitionShapePredicate, $true))) {
+                if ($shapeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    [void]$candidateNames.Add([string]$shapeNode.Name)
+                    continue
+                }
+                $shapeName = [string]$shapeNode.VariablePath.UserPath
+                $shapeQualifierEnd = $shapeName.IndexOf(':')
+                if ($shapeQualifierEnd -ge 0) { $shapeName = $shapeName.Substring($shapeQualifierEnd + 1) }
+                [void]$candidateNames.Add($shapeName)
+            }
+        }
+        $filterNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($candidateName in $candidateNames) {
+            [void]$filterNames.Add($candidateName)
+            foreach ($qualifierPrefix in $qualifierPrefixes) { [void]$filterNames.Add($qualifierPrefix + $candidateName) }
+        }
+        $unitNodePredicate = Get-BRAVOSelfTestAstNameFilterPredicate -Name $filterNames
         foreach ($unit in $units) {
             $definitionNodes = New-Object System.Collections.ArrayList
             $useKeys = New-Object System.Collections.ArrayList
@@ -36971,6 +37356,43 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
                 })
         }
 
+        # Ключ може дати знахідку лише якщо його читає одиниця з іншого suite,
+        # ніж принаймні одна одиниця-визначник (власник із suite == споживач
+        # пропускається). Для решти ключів визначення нічого не вирішують, тож
+        # їх контекст не обчислюється. Мітка suite: '' - корінь, '*' - кілька
+        # різних suite. Порівняння імен - без урахування регістру, як у
+        # $fragmentOwners (hashtable) нижче.
+        $useSuiteByKey = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        $defSuiteByKey = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($facts in $unitFacts) {
+            $suiteLabel = if ($null -eq $facts.Unit.Suite) { '' } else { [string]$facts.Unit.Suite }
+            foreach ($useKeyItem in $facts.UseKeys) {
+                $knownLabel = $null
+                if (-not $useSuiteByKey.TryGetValue([string]$useKeyItem, [ref]$knownLabel)) {
+                    $useSuiteByKey[[string]$useKeyItem] = $suiteLabel
+                } elseif ($knownLabel -ne '*' -and $knownLabel -ne $suiteLabel) {
+                    $useSuiteByKey[[string]$useKeyItem] = '*'
+                }
+            }
+            if ($null -eq $facts.Unit.Suite) { continue }
+            foreach ($definitionItem in $facts.DefinitionNodes) {
+                $knownLabel = $null
+                if (-not $defSuiteByKey.TryGetValue([string]$definitionItem.Key, [ref]$knownLabel)) {
+                    $defSuiteByKey[[string]$definitionItem.Key] = $suiteLabel
+                } elseif ($knownLabel -ne '*' -and $knownLabel -ne $suiteLabel) {
+                    $defSuiteByKey[[string]$definitionItem.Key] = '*'
+                }
+            }
+        }
+        $relevantKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($definedKey in $defSuiteByKey.Keys) {
+            $usedLabel = $null
+            if (-not $useSuiteByKey.TryGetValue($definedKey, [ref]$usedLabel)) { continue }
+            $definedLabel = $defSuiteByKey[$definedKey]
+            if ($definedLabel -ne '*' -and $usedLabel -eq $definedLabel) { continue }
+            [void]$relevantKeys.Add($definedKey)
+        }
+
         # Визначення: у scope файлу (разом із $script:/$global:) чи локальне
         # в дочірньому scriptblock/функції. Спершу фрагменти; для кореня
         # потрібні лише імена, які визначає хоч один фрагмент.
@@ -36980,8 +37402,24 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
                 $isRootUnit = $null -eq $facts.Unit.Suite
                 if (($pass -eq 'Root') -ne $isRootUnit) { continue }
                 foreach ($definitionNode in $facts.DefinitionNodes) {
+                    if (-not $relevantKeys.Contains($definitionNode.Key)) { continue }
                     if ($isRootUnit -and -not $fragmentDefinedKeys.Contains($definitionNode.Key)) { continue }
-                    $context = & $getContext $definitionNode.Node $facts.Unit.Ast
+                    # Контекст без виклику scriptblock-а на кожен вузол: підйом до
+                    # найближчого scope-блока тут, а $getContext - лише коли контекст
+                    # цього блока ще не пораховано (його результат кешується).
+                    $scopeBlock = $definitionNode.Node.Parent
+                    while ($null -ne $scopeBlock -and -not [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast) -and
+                        -not ($scopeBlock -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                            $scopeBlock -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                        $scopeBlock = $scopeBlock.Parent
+                    }
+                    if ($null -eq $scopeBlock -or [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast)) {
+                        $context = $fileScopeContext
+                    } elseif ($blockContextCache.ContainsKey($scopeBlock)) {
+                        $context = $blockContextCache[$scopeBlock]
+                    } else {
+                        $context = & $getContext $definitionNode.Node $facts.Unit.Ast
+                    }
                     if ($null -eq $context) { continue }
                     if ($context.Scopes.Count -eq 0 -or $definitionNode.Qualified) {
                         [void]$facts.Definitions.Add([pscustomobject]@{
@@ -37040,30 +37478,43 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SelectiveSuitesHaveNoCrossS
             $consumerSuite = $facts.Unit.Suite
             for ($useIndex = 0; $useIndex -lt $facts.UseKeys.Count; $useIndex++) {
                 if (-not $fragmentOwners.ContainsKey($facts.UseKeys[$useIndex])) { continue }
-                $use = [pscustomobject]@{ Key = [string]$facts.UseKeys[$useIndex]; Node = $facts.UseNodes[$useIndex] }
-                if ($rootInFunction.ContainsKey($use.Key)) { continue }
-                if ($null -ne $consumerSuite -and $suiteDefinitions.ContainsKey($consumerSuite + '|' + $use.Key)) { continue }
-                $readOffset = if ($null -eq $consumerSuite) { $use.Node.Extent.StartOffset } else { $facts.Unit.GateOffset }
-                if ($rootEarliest.ContainsKey($use.Key) -and $rootEarliest[$use.Key] -lt $readOffset) { continue }
-                $context = & $getContext $use.Node $facts.Unit.Ast
+                $useKey = [string]$facts.UseKeys[$useIndex]
+                $useNode = $facts.UseNodes[$useIndex]
+                if ($rootInFunction.ContainsKey($useKey)) { continue }
+                if ($null -ne $consumerSuite -and $suiteDefinitions.ContainsKey($consumerSuite + '|' + $useKey)) { continue }
+                $readOffset = if ($null -eq $consumerSuite) { $useNode.Extent.StartOffset } else { $facts.Unit.GateOffset }
+                if ($rootEarliest.ContainsKey($useKey) -and $rootEarliest[$useKey] -lt $readOffset) { continue }
+                $scopeBlock = $useNode.Parent
+                while ($null -ne $scopeBlock -and -not [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast) -and
+                    -not ($scopeBlock -is [Management.Automation.Language.FunctionDefinitionAst] -or
+                        $scopeBlock -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                    $scopeBlock = $scopeBlock.Parent
+                }
+                if ($null -eq $scopeBlock -or [object]::ReferenceEquals($scopeBlock, $facts.Unit.Ast)) {
+                    $context = $fileScopeContext
+                } elseif ($blockContextCache.ContainsKey($scopeBlock)) {
+                    $context = $blockContextCache[$scopeBlock]
+                } else {
+                    $context = & $getContext $useNode $facts.Unit.Ast
+                }
                 if ($null -eq $context) { continue }
-                if ($context.InFunction -and $rootEarliest.ContainsKey($use.Key)) { continue }
+                if ($context.InFunction -and $rootEarliest.ContainsKey($useKey)) { continue }
                 $owners = New-Object System.Collections.ArrayList
-                foreach ($ownerEntry in $fragmentOwners[$use.Key].GetEnumerator()) {
+                foreach ($ownerEntry in $fragmentOwners[$useKey].GetEnumerator()) {
                     if ($ownerEntry.Key -eq $consumerSuite) { continue }
                     if ($context.InFunction -or $ownerEntry.Value -lt $readOffset) { [void]$owners.Add([string]$ownerEntry.Key) }
                 }
                 if ($owners.Count -eq 0) { continue }
                 $isLocal = $false
                 foreach ($scope in $context.Scopes) {
-                    if ($facts.LocalNames.ContainsKey($scope) -and $facts.LocalNames[$scope].Contains($use.Key)) { $isLocal = $true; break }
+                    if ($facts.LocalNames.ContainsKey($scope) -and $facts.LocalNames[$scope].Contains($useKey)) { $isLocal = $true; break }
                 }
                 if ($isLocal) { continue }
                 $consumerLabel = if ($null -eq $consumerSuite) { 'корінь' } else { "suite $consumerSuite" }
-                if (-not $seenFindings.Add($use.Key + '|' + $consumerLabel)) { continue }
+                if (-not $seenFindings.Add($useKey + '|' + $consumerLabel)) { continue }
                 $findings.Add(("{0} визначає лише suite {1}, а читає {2} ({3}:{4})" -f
-                        $use.Key, ([string]::Join('/', @($owners | Sort-Object))), $consumerLabel,
-                        $facts.Unit.Fragment, $use.Node.Extent.StartLineNumber))
+                        $useKey, ([string]::Join('/', @($owners | Sort-Object))), $consumerLabel,
+                        $facts.Unit.Fragment, $useNode.Extent.StartLineNumber))
             }
         }
 
@@ -41072,10 +41523,24 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
             }
             return $parameterValues
         }
+        # Предикати зібрано в .NET-делегати один раз (Get-BRAVOSelfTestAstTypePredicate):
+        # виклик PowerShell-scriptblock-а на кожному вузлі файлу дорожчий за сам розбір.
+        $commandNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @([Management.Automation.Language.CommandAst])
+        $unitNodePredicate = Get-BRAVOSelfTestAstTypePredicate -Type @(
+            [Management.Automation.Language.IfStatementAst],
+            [Management.Automation.Language.CommandAst],
+            [Management.Automation.Language.BreakStatementAst],
+            [Management.Automation.Language.ContinueStatementAst],
+            [Management.Automation.Language.ExitStatementAst],
+            [Management.Automation.Language.ReturnStatementAst])
+        $boundaryCallNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($boundaryCallName in @('Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault', 'Complete-BRAVOSelfTestSection')) {
+            [void]$boundaryCallNames.Add($boundaryCallName)
+        }
         $isSectionIf = {
             param($Node)
             if (-not ($Node -is [Management.Automation.Language.IfStatementAst]) -or $Node.Clauses.Count -lt 1) { return $false }
-            $conditionCommand = $Node.Clauses[0].Item1.Find({ param($inner) $inner -is [Management.Automation.Language.CommandAst] }, $true)
+            $conditionCommand = $Node.Clauses[0].Item1.Find($commandNodePredicate, $true)
             return ($null -ne $conditionCommand -and $conditionCommand.GetCommandName() -eq 'Enter-BRAVOSelfTestSection')
         }
         $analyzeUnit = {
@@ -41084,18 +41549,29 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
             # ОДИН обхід дерева на одиницю: FindAll викликає предикат на КОЖЕН
             # вузол, тож предикат — лише дешеві перевірки типу, а класифікація
             # — уже по відібраних вузлах (див. Perf/SingleAstPassOverRepositoryFiles).
-            $unitNodes = @($UnitAst.FindAll({ param($node)
-                        $node -is [Management.Automation.Language.IfStatementAst] -or
-                        $node -is [Management.Automation.Language.CommandAst] -or
-                        $node -is [Management.Automation.Language.BreakStatementAst] -or
-                        $node -is [Management.Automation.Language.ContinueStatementAst] -or
-                        $node -is [Management.Automation.Language.ExitStatementAst] -or
-                        $node -is [Management.Automation.Language.ReturnStatementAst] }, $true))
-            $unitSectionIfs = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $_) })
-            $unitBoundaryCalls = @($unitNodes | Where-Object { $_ -is [Management.Automation.Language.CommandAst] -and
-                    @('Enter-BRAVOSelfTestSection', 'Register-BRAVOSelfTestSectionFault', 'Complete-BRAVOSelfTestSection') -contains $_.GetCommandName() })
-            $unitJumps = @($unitNodes | Where-Object { -not ($_ -is [Management.Automation.Language.IfStatementAst]) -and
-                    -not ($_ -is [Management.Automation.Language.CommandAst]) })
+            $unitNodes = @($UnitAst.FindAll($unitNodePredicate, $true))
+            # Один прохід замість трьох Where-Object. $sectionIfSet — межі-секції
+            # цієї одиниці: кожен предок-if належить $unitNodes, тож "предок є
+            # межею" рівнозначне членству в наборі й не потребує повторного
+            # виклику $isSectionIf на кожному предку кожного вузла (виклик
+            # scriptblock-а на кожному кроці підйому давав тисячі зайвих
+            # scope-ів і GC-пауз на великому купі повного прогону).
+            $unitSectionIfs = New-Object System.Collections.Generic.List[object]
+            $unitBoundaryCalls = New-Object System.Collections.Generic.List[object]
+            $unitJumps = New-Object System.Collections.Generic.List[object]
+            $sectionIfSet = New-Object 'System.Collections.Generic.HashSet[object]'
+            foreach ($unitNode in $unitNodes) {
+                if ($unitNode -is [Management.Automation.Language.IfStatementAst]) {
+                    if (& $isSectionIf $unitNode) {
+                        $unitSectionIfs.Add($unitNode)
+                        [void]$sectionIfSet.Add($unitNode)
+                    }
+                } elseif ($unitNode -is [Management.Automation.Language.CommandAst]) {
+                    if ($boundaryCallNames.Contains($unitNode.GetCommandName())) { $unitBoundaryCalls.Add($unitNode) }
+                } else {
+                    $unitJumps.Add($unitNode)
+                }
+            }
             foreach ($sectionIf in $unitSectionIfs) {
                 $sectionProblem = ''
                 $sectionName = ''
@@ -41142,7 +41618,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                             $Label, $sectionIf.Extent.StartLineNumber, $sectionName, $sectionPolicy, [string]::Join(', ', $GlobalFatalAllowList)))
                 }
                 $parentSection = $sectionIf.Parent
-                while ($null -ne $parentSection -and -not (& $isSectionIf $parentSection)) { $parentSection = $parentSection.Parent }
+                while ($null -ne $parentSection -and -not $sectionIfSet.Contains($parentSection)) { $parentSection = $parentSection.Parent }
                 [void]$unitSections.Add([pscustomobject]@{
                         Name      = $sectionName
                         DependsOn = $sectionDependsOn
@@ -41160,7 +41636,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                 while ($null -ne $owningFunction -and -not ($owningFunction -is [Management.Automation.Language.FunctionDefinitionAst])) { $owningFunction = $owningFunction.Parent }
                 if ($null -ne $owningFunction) { continue }
                 $owningSection = $boundaryCall.Parent
-                while ($null -ne $owningSection -and -not (& $isSectionIf $owningSection)) { $owningSection = $owningSection.Parent }
+                while ($null -ne $owningSection -and -not $sectionIfSet.Contains($owningSection)) { $owningSection = $owningSection.Parent }
                 $isCanonicalCall = $false
                 if ($null -ne $owningSection) {
                     $owningTry = $owningSection.Clauses[0].Item2.Statements | Select-Object -First 1
@@ -41183,7 +41659,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Tail/Framework.SectionBoundaries') { try {
                     $jumpContained = $false
                     $jumpInSection = ($Domain -ne 'root')
                     while ($null -ne $jumpAncestor) {
-                        if (-not $jumpInSection -and $jumpAncestor -is [Management.Automation.Language.IfStatementAst] -and (& $isSectionIf $jumpAncestor)) {
+                        if (-not $jumpInSection -and $jumpAncestor -is [Management.Automation.Language.IfStatementAst] -and $sectionIfSet.Contains($jumpAncestor)) {
                             $jumpInSection = $true
                         }
                         if ($jumpAncestor -is [Management.Automation.Language.FunctionDefinitionAst] -or

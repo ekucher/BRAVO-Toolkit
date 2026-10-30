@@ -80,7 +80,62 @@ if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
 }
 Import-Module -Name $archiveHelpersPath -ErrorAction Stop
 
+# #478: запис status-файла для ранніх виходів конфігурації Archive (30/36) —
+# best-effort, ДО exit. Раніше ці виходи завершували процес без запису, і
+# BRAVO_STATUS_Archive.json лишався з попереднім "OK". Це scriptblock, а не
+# function: Write-BRAVOArchiveOperationStatus (нижче, для Main) ще не
+# визначена на цей момент, а нове визначення функції ДО preamble зсунуло б
+# початок регіону orchestration-проби self-test (вона стартує з першої
+# функції тіла). Виклик — `& $writeArchiveEarlyExitStatus <код> '<причина>'`,
+# сам `Exit <код>` лишається буквальним у місці виклику. Fail-soft: помилка
+# запису (в т.ч. $stateRoot ще не визначено) лише логується і не змінює код
+# завершення. Не використовується для: пересилання -HealthCheckOnly у
+# BRAVO_HEALTH (Health пише власний статус), коду дочірнього елевованого
+# процесу (статус пише він), lock-busy / catch-up skip і фінального exit.
+$writeArchiveEarlyExitStatus = {
+    param([int]$ExitCode, [string]$EarlyExitReason)
 
+    try {
+        # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: -SyncBAZA його не
+        # перезаписує (як і Write-BRAVOArchiveOperationStatus).
+        if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
+        $earlyStartedAtVariable = Get-Variable -Name scriptStartTime -ErrorAction SilentlyContinue
+        # ARCH-001: ранній вихід іде ДО Enter-BRAVOArchiveProcessLock — статус
+        # пишемо лише коли спільний operation lock вільний (короткочасно
+        # захоплюємо той самий файл тими ж Open-параметрами). Зайнятий або
+        # невизначений стан — fail-closed: не пишемо, лише лог.
+        $earlyLockStream = $null
+        try {
+            # Як в Enter-BRAVOArchiveProcessLock: на свіжій установці каталогу lock ще немає.
+            $earlyLockDirectory = Split-Path -Path ([string]$operationLockSettings.Path) -Parent
+            if (-not (Test-Path -LiteralPath $earlyLockDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $earlyLockDirectory -Force -ErrorAction Stop)
+            }
+            $earlyLockStream = [System.IO.File]::Open([string]$operationLockSettings.Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        } catch {
+            throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        try {
+            Write-BRAVOOperationStatus `
+                -StateRoot $stateRoot `
+                -Operation Archive `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -StartedAt $(if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) { $earlyStartedAtVariable.Value } else { Get-Date }) `
+                -Details @{ earlyTermination = $true; earlyExitReason = $EarlyExitReason }
+        } finally {
+            $earlyLockStream.Dispose()
+        }
+    } catch {
+        try {
+            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Телеметрія не змінює exit code.
+        }
+    }
+    # Фінальна Operations-подія у finally читає $script:processExitCode.
+    $script:processExitCode = $ExitCode
+}
 
 # Compatibility forwarding for callers that still use BRAVO_ARCHIV -HealthCheckOnly.
 # New callers and Task Scheduler use BRAVO_HEALTH.ps1 directly.
@@ -163,7 +218,9 @@ try {
 } catch {
     Write-Host "ПОМИЛКА: Не вдалося завантажити конфiгурацiю: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration, як у Maintenance
-    # і DataRestore для тієї самої відмови (раніше — голий 1).
+    # і DataRestore для тієї самої відмови (раніше — голий 1). #478: статус
+    # пише helper (якщо $stateRoot уже відомий; інакше fail-soft без запису).
+    & $writeArchiveEarlyExitStatus 30 'ConfigurationLoad'
     Exit 30
 }
 
@@ -223,6 +280,7 @@ try {
     }
 } catch {
     Write-Host "ПОМИЛКА: Некоректна конфігурація перевірки вільного місця: $($_.Exception.Message)" -ForegroundColor Red
+    & $writeArchiveEarlyExitStatus 30 'FreeSpaceConfiguration'
     Exit 30
 }
 
@@ -257,6 +315,7 @@ if ($requireAdministrator) {
             Write-Host "UAC запит вiдхилено або сталася помилка: $($_.Exception.Message)" -ForegroundColor $logColors.ERROR
             Write-Host "Запустiть PowerShell з правами адмiнiстратора вручну" -ForegroundColor $logColors.WARNING
             # Контракт BRAVO.ExitCodes: 36 = PrivilegeRequired (раніше — голий 1).
+            & $writeArchiveEarlyExitStatus 36 'PrivilegeRequired'
             Exit 36
         }
     }
@@ -455,12 +514,14 @@ if ($credentialHelperLoaded) {
         Write-Host "ПОМИЛКА: Некоректні локальні параметри установи у Credential Manager: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" `
             -ForegroundColor $logColors.ERROR
         # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+        & $writeArchiveEarlyExitStatus 30 'InstitutionSettings'
         exit 30
     }
 } elseif ($institutionSettingsRequired) {
     Write-Host "ПОМИЛКА: Не вдалося завантажити локальні параметри установи: $($script:institutionSettingsInitializationError)" `
         -ForegroundColor $logColors.ERROR
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+    & $writeArchiveEarlyExitStatus 30 'InstitutionSettings'
     exit 30
 }
 
@@ -1466,7 +1527,27 @@ function Resolve-BRAVORetentionGenerationManifest {
             if ($null -eq $recordedProperty) { continue }
             $recordedPath = [string]$recordedProperty.Value
             if ([string]::IsNullOrWhiteSpace($recordedPath)) { continue }
+            # Суфікс імені, який NameTemplate дає для ЦІЄЇ generation (той
+            # самий identity gate, що в Get-BRAVOVerifiedGenerationArchive).
+            $expectedSuffix = ''
+            if (-not [string]::IsNullOrWhiteSpace($nameTemplate)) {
+                try { $expectedSuffix = $nameTemplate -f '', $generationId } catch { $expectedSuffix = '' }
+            }
+            if ($fieldName -eq 'HashPath' -and -not [string]::IsNullOrEmpty($expectedSuffix)) {
+                $expectedSuffix += $hashExtension
+            }
             if (Test-Path -LiteralPath $recordedPath -PathType Leaf) {
+                # Існуючий записаний файл теж перевіряється за NameTemplate:
+                # підмінений manifest із ім'ям архіву іншої (поточної)
+                # generation інакше видалив би чужий архів. Без NameTemplate
+                # (порожній суфікс) перевірити нічого - поведінка без змін.
+                $existingLeaf = [IO.Path]::GetFileName($recordedPath)
+                if (-not [string]::IsNullOrEmpty($expectedSuffix) -and
+                    ($existingLeaf.Length -le $expectedSuffix.Length -or
+                    -not $existingLeaf.EndsWith($expectedSuffix, [StringComparison]::Ordinal))) {
+                    $unresolvedReasons += "${componentName}: ім'я '$existingLeaf' не належить generation $generationId за NameTemplate"
+                    continue
+                }
                 if (Test-BRAVOBackupArtifactPathSafe -Path $recordedPath -BackupRoot $BackupRoot) {
                     $resolvedComponent.$fieldName = $recordedPath
                 } else {
@@ -1483,16 +1564,15 @@ function Resolve-BRAVORetentionGenerationManifest {
             $recordedFull = try { [IO.Path]::GetFullPath($recordedPath) } catch { $recordedPath }
             $canonicalFull = try { [IO.Path]::GetFullPath($canonicalPath) } catch { $canonicalPath }
             if ([string]::Equals($recordedFull, $canonicalFull, [StringComparison]::OrdinalIgnoreCase)) {
-                # Перебудови немає: файла просто вже немає (як до #335).
+                # Перебудови немає: файла за записаним шляхом немає. "Уже
+                # видалено" це доводить лише доступний каталог компонента
+                # (як до #335); недоступний том осиротив би архів.
+                if (-not (Test-Path -LiteralPath $destination -PathType Container)) {
+                    $unresolvedReasons += "${componentName}: каталог компонента недоступний ($destination)"
+                    continue
+                }
                 $resolvedComponent.$fieldName = $recordedPath
                 continue
-            }
-            $expectedSuffix = ''
-            if (-not [string]::IsNullOrWhiteSpace($nameTemplate)) {
-                try { $expectedSuffix = $nameTemplate -f '', $generationId } catch { $expectedSuffix = '' }
-            }
-            if ($fieldName -eq 'HashPath' -and -not [string]::IsNullOrEmpty($expectedSuffix)) {
-                $expectedSuffix += $hashExtension
             }
             if ([string]::IsNullOrEmpty($expectedSuffix) -or
                 $leaf.Length -le $expectedSuffix.Length -or
@@ -1697,6 +1777,14 @@ function Remove-BRAVOExpiredBackupGenerations {
         $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
         $validCutoff = (Get-Date).AddDays(-$validRetentionDays)
         $invalidCutoff = (Get-Date).AddDays(-$invalidRetentionDays)
+        # Спостережуваність (#498): старт етапу до читання manifest-ів, щоб
+        # оператор не бачив "тиші" між COMPLETE і підсумком. Телеметрія лише
+        # пише в лог і не бере участі в жодному рішенні нижче.
+        $retentionStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        Write-BRAVOLog -Component 'CLEANUP' -Message (
+            "Retention: старт аудиту generation у $BackupRoot " +
+            "(archiveRetentionDays=$validRetentionDays; failedArchiveRetentionDays=$invalidRetentionDays)"
+        ) -Level 'INFO'
         $records = @()
         $referencedArchiveNames = @{}
         # dev.14: MANIFESTS-first reader (з fallback на legacy корінь
@@ -1842,19 +1930,89 @@ function Remove-BRAVOExpiredBackupGenerations {
             [int]$minimumRetainedVerifiedBackups
         } else { 1 }
         $protectedGenerationIds = @()
-        $hashVerificationNeeded = [bool]$enableArchiveDeletion -and (@($records | Where-Object {
+        $expiredCompleteCount = @($records | Where-Object {
             $_.IsComplete -and $_.TimeKnown -and $_.UnresolvedTypes.Count -eq 0 -and
             $_.GenerationId -ne $CurrentGenerationId -and $_.StartedAt -lt $validCutoff
-        }).Count -gt 0)
+        }).Count
+        $hashVerificationNeeded = [bool]$enableArchiveDeletion -and ($expiredCompleteCount -gt 0)
+        $hashCandidateRecords = @($records | Where-Object {
+            $_.IsComplete -and $_.TimeKnown -and $_.UnresolvedTypes.Count -eq 0 -and $_.ArtifactProblems.Count -eq 0
+        } | Sort-Object StartedAt -Descending)
+
+        # Підсумок інвентаризації (#498): лише лічильники для оператора.
+        # "Прострочено за віком" - до врахування захисту N і прапорців
+        # видалення; стан прапорців показано окремо, а фактично видалені
+        # generation - лише в підсумку "Аудит retention". Прапорець
+        # failed-видалення читається без винятку під StrictMode: телеметрія
+        # не повинна зупиняти retention там, де рішення його не читає.
+        $failedDeletionEnabled = [bool](Get-Variable -Name 'enableFailedArchiveDeletion' -ValueOnly -ErrorAction SilentlyContinue)
+        $expiredFailedCount = @($records | Where-Object {
+            ($_.Status -eq 'FAILED' -or $_.Status -eq 'INCOMPLETE') -and $_.TimeKnown -and
+            $_.UnresolvedTypes.Count -eq 0 -and $_.GenerationId -ne $CurrentGenerationId -and
+            $_.StartedAt -lt $invalidCutoff
+        }).Count
+        $hashDecisionReason = if (-not [bool]$enableArchiveDeletion) {
+            'SHA512 не потрібен: enableArchiveDeletion=false, COMPLETE за віком не видаляються'
+        } elseif (-not $hashVerificationNeeded) {
+            "SHA512 не потрібен: немає COMPLETE, придатної до видалення за віком (archiveRetentionDays=$validRetentionDays)"
+        } else {
+            "SHA512 потрібен: є прострочені COMPLETE; перевірка від найновіших, доки не знайдено " +
+            "$minimumRetainedCount verified (придатних до перевірки: $($hashCandidateRecords.Count))"
+        }
+        Write-BRAVOLog -Component 'CLEANUP' -Message (
+            "Retention: інвентаризація — generation=$($records.Count) " +
+            "(COMPLETE=$(@($records | Where-Object { $_.IsComplete }).Count)); " +
+            "прострочено за віком (до захисту N): COMPLETE=$expiredCompleteCount, failed/incomplete=$expiredFailedCount; " +
+            "видалення за віком: COMPLETE — $(if ([bool]$enableArchiveDeletion) { 'увімкнено' } else { 'вимкнено' }) (enableArchiveDeletion), " +
+            "failed/incomplete — $(if ($failedDeletionEnabled) { 'увімкнено' } else { 'вимкнено' }) (enableFailedArchiveDeletion); " +
+            "$hashDecisionReason; фактично видалені — у підсумку «Аудит retention»; минуло " +
+            $retentionStopwatch.Elapsed.TotalSeconds.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + ' с'
+        ) -Level 'INFO'
+
+        $hashAttemptCount = 0
+        [long]$hashedArchiveBytes = 0
+        $hashStageElapsed = [TimeSpan]::Zero
         if ($hashVerificationNeeded) {
-            foreach ($record in @($records | Where-Object {
-                $_.IsComplete -and $_.TimeKnown -and $_.UnresolvedTypes.Count -eq 0 -and $_.ArtifactProblems.Count -eq 0
-            } | Sort-Object StartedAt -Descending)) {
+            $hashStageStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+            foreach ($record in $hashCandidateRecords) {
                 if ($protectedGenerationIds.Count -ge $minimumRetainedCount) { break }
-                if (Test-BRAVOGenerationManifestVerified -Manifest $record.Manifest) {
+                # Логічний обсяг = сума розмірів файлів архівів generation,
+                # а не виміряний дисковий I/O: перевірка може зупинитися на
+                # першому невідповідному компоненті. Збій підрахунку не
+                # впливає на перевірку.
+                $hashAttemptCount++
+                [long]$attemptArchiveBytes = 0
+                foreach ($component in @(Get-BRAVOGenerationManifestComponents -Manifest $record.Manifest)) {
+                    try {
+                        $attemptArchiveBytes += (New-Object System.IO.FileInfo -ArgumentList ([string]$component.ArchivePath)).Length
+                    } catch {
+                        # Лише телеметрія: недоступні метадані файлу не логуються
+                        # окремо, бо саму перевірку нижче це не змінює, а її
+                        # результат (і WARNING про пошкодження) лог уже містить.
+                    }
+                }
+                $hashedArchiveBytes += $attemptArchiveBytes
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Retention: повна перевірка SHA512 generation $($record.GenerationId) " +
+                    "(спроба $hashAttemptCount; verified знайдено $($protectedGenerationIds.Count)/$minimumRetainedCount; " +
+                    "логічний обсяг архівів " +
+                    ($attemptArchiveBytes / 1MB).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + ' МБ)'
+                ) -Level 'INFO'
+                $attemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $attemptVerified = Test-BRAVOGenerationManifestVerified -Manifest $record.Manifest
+                $attemptStopwatch.Stop()
+                $attemptSeconds = $attemptStopwatch.Elapsed.TotalSeconds.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
+                if ($attemptVerified) {
                     $protectedGenerationIds += $record.GenerationId
+                    Write-BRAVOLog -Component 'CLEANUP' -Message (
+                        "Retention: generation $($record.GenerationId) — SHA512 збігається, захищено " +
+                        "$($protectedGenerationIds.Count)/$minimumRetainedCount; тривалість $attemptSeconds с"
+                    ) -Level 'INFO'
                     continue
                 }
+                Write-BRAVOLog -Component 'CLEANUP' -Message (
+                    "Retention: generation $($record.GenerationId) — перевірку SHA512 не пройдено; тривалість $attemptSeconds с"
+                ) -Level 'INFO'
                 $corruptGenerationIds += $record.GenerationId
                 Write-BRAVOLog -Component 'CLEANUP' -Message (
                     "Пошкоджена резервна копія $($record.GenerationId): статус COMPLETE, але SHA512 архіву не " +
@@ -1862,6 +2020,8 @@ function Remove-BRAVOExpiredBackupGenerations {
                     "і не видаляється як невдала"
                 ) -Level 'WARNING'
             }
+            $hashStageStopwatch.Stop()
+            $hashStageElapsed = $hashStageStopwatch.Elapsed
         }
 
         foreach ($record in @($records | Sort-Object StartedAt)) {
@@ -1981,18 +2141,28 @@ function Remove-BRAVOExpiredBackupGenerations {
         # сильніше за +, тому без них форматувався ЛИШЕ другий рядок — в
         # операторському лозі HOST-11 перша половина вийшла з літеральними
         # "{0}/{1}/{2}" (діагностика без чисел, помічено на acceptance).
+        # Поля {9}-{12} (#498) лише дописані в кінець: наявні поля і їхній
+        # порядок не змінюються. Обсяг — сума розмірів файлів архівів
+        # перевірених generation, а не виміряний дисковий I/O.
+        $retentionStopwatch.Stop()
         Write-BRAVOLog -Component 'CLEANUP' -Message (
             ("Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
              "пошкоджено (COMPLETE, не пройшли перевірку)={3}; " +
              "збережено (невідомий тип компонента)={4}; " +
              "видалено (COMPLETE, прострочено)={5}; " +
              "видалено (failed/incomplete, прострочено)={6}; " +
-             "помилок видалення={7}; архівів без manifest-а={8}") -f
+             "помилок видалення={7}; архівів без manifest-а={8}; " +
+             "перевірено SHA512 (generation)={9}; логічний обсяг перевірених архівів={10}; " +
+             "тривалість SHA512={11} с; тривалість retention={12} с") -f
             $records.Count, $protectedGenerationIds.Count,
             $(if ($hashVerificationNeeded) { $protectedGenerationIds -join ', ' } else { 'SHA512 не потрібен' }),
             $corruptGenerationIds.Count, $unresolvedGenerationIds.Count,
             $deletedVerifiedExpiredCount, $deletedFailedIncompleteCount,
-            $failedDeletionIds.Count, $unreferencedArchives.Count
+            $failedDeletionIds.Count, $unreferencedArchives.Count,
+            $hashAttemptCount,
+            (($hashedArchiveBytes / 1GB).ToString('0.00', [Globalization.CultureInfo]::InvariantCulture) + " ГБ ($hashedArchiveBytes байт)"),
+            $hashStageElapsed.TotalSeconds.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture),
+            $retentionStopwatch.Elapsed.TotalSeconds.ToString('0.0', [Globalization.CultureInfo]::InvariantCulture)
         ) -Level 'INFO'
         return ($failedDeletionIds.Count -eq 0)
     } catch {
@@ -2780,6 +2950,47 @@ function Remove-BRAVOVSSDiskshadowOrphanedShadow {
     }
 }
 
+function Get-BRAVOVSSDiskshadowWorkDirectory {
+    # diskshadow.exe читає сценарій (/s) як ANSI/OEM, а не UTF-8: шлях зі
+    # SET METADATA з кирилицею (ручний запуск з профілю з не-ASCII %TEMP%)
+    # ламається і дає diskshadow exit 3 -> Archive 40. Тому сценарій і
+    # metadata-.cab кладуться лише в каталог із ПОВНІСТЮ ASCII-шляхом:
+    # %TEMP%, якщо він ASCII, інакше %SystemRoot%\Temp (diskshadow і так
+    # потребує адмін-прав; завдання Планувальника під SYSTEM мають
+    # TEMP=C:\Windows\Temp). Той самий принцип ASCII-перевірки, що й у
+    # New-BRAVOManualLaunchers. Немає придатного каталогу -> $null, і
+    # викликач зупиняється керованою помилкою (live-fallback не існує).
+    param(
+        [string]$TempPath = [IO.Path]::GetTempPath(),
+        [string]$SystemRootPath = $env:SystemRoot
+    )
+
+    $asciiPattern = '^[\x20-\x7E]+$'
+    if (-not [string]::IsNullOrWhiteSpace($TempPath) -and $TempPath -cmatch $asciiPattern) {
+        return $TempPath
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SystemRootPath)) {
+        return $null
+    }
+    $systemTemp = Join-Path $SystemRootPath 'Temp'
+    if ($systemTemp -cmatch $asciiPattern -and (Test-Path -LiteralPath $systemTemp -PathType Container)) {
+        $probePath = Join-Path $systemTemp ("BRAVO_diskshadow_probe_{0}.tmp" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [IO.File]::WriteAllText($probePath, 'probe')
+            return $systemTemp
+        } catch {
+            # Каталог недоступний для запису: кандидата відхилено.
+            return $null
+        } finally {
+            if (Test-Path -LiteralPath $probePath -PathType Leaf) {
+                Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    return $null
+}
+
 function New-BRAVOVSSDiskshadowSnapshotSet {
     param([Parameter(Mandatory = $true)][string[]]$VolumeRoots)
 
@@ -2792,7 +3003,16 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
         )
     }
 
-    $scriptPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
+    $workDirectory = Get-BRAVOVSSDiskshadowWorkDirectory
+    if ([string]::IsNullOrWhiteSpace($workDirectory)) {
+        throw (
+            "Багатотомний VSS Snapshot Set потребує diskshadow.exe, який читає сценарій лише в ANSI/OEM, " +
+            "а ні TEMP ($env:TEMP), ні %SystemRoot%\Temp не є доступним каталогом з ASCII-шляхом " +
+            "(типово: ручний запуск з профілю з кирилицею у шляху). Live-архівацію без знімка не виконано. " +
+            "Запустіть архівацію завданням Планувальника (SYSTEM) або задайте ASCII-шлях у TEMP/TMP поточного користувача."
+        )
+    }
+    $scriptPath = Join-Path $workDirectory ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
     # SET METADATA обов'язковий (5.2.1): без нього diskshadow.exe у
     # backup-контексті пише VSS writer metadata .cab з автоіменем
     # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у ПОТОЧНИЙ РОБОЧИЙ КАТАЛОГ
@@ -2802,7 +3022,7 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     # 2026-08-26). BRAVO ці метадані не використовує (контекст
     # NOWRITERS), тому файл спрямовується в TEMP і прибирається у finally
     # разом зі сценарієм.
-    $metadataPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_meta_{0}.cab" -f [guid]::NewGuid().ToString("N"))
+    $metadataPath = Join-Path $workDirectory ("BRAVO_diskshadow_meta_{0}.cab" -f [guid]::NewGuid().ToString("N"))
 
     # Одноразове best-effort прибирання ВЖЕ накопичених metadata-.cab від
     # попередніх версій (до SET METADATA вище): у каталозі комплекту вони
@@ -2841,11 +3061,21 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     # навіть тоді, коли Snapshot Set створено успішно.
     $lines.Add("EXIT")
 
+    # У сценарії лише літери томів (Get-BRAVOVSSVolumeRoot приймає тільки
+    # X:\), alias і шляхи з $workDirectory — усе ASCII, тож ASCII-кодування
+    # дає ті самі байти, що й UTF-8 без BOM. Перевірка fail-closed: будь-який
+    # інший символ зупинив би запуск до diskshadow, а не зіпсував би шлях.
+    foreach ($scriptLine in $lines) {
+        if ($scriptLine -cnotmatch '^[\x20-\x7E]*$') {
+            throw "Сценарій diskshadow містить не-ASCII символи, які diskshadow.exe прочитає некоректно: $scriptLine"
+        }
+    }
+
     $volumeShadows = $null
     $snapshotSetId = $null
     $knownShadowIds = Get-BRAVOVSSExistingShadowIdMap
     try {
-        [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), [Text.Encoding]::ASCII)
 
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
         $processInfo.FileName = $diskshadowPath
