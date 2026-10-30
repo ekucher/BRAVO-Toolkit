@@ -80,7 +80,62 @@ if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
 }
 Import-Module -Name $archiveHelpersPath -ErrorAction Stop
 
+# #478: запис status-файла для ранніх виходів конфігурації Archive (30/36) —
+# best-effort, ДО exit. Раніше ці виходи завершували процес без запису, і
+# BRAVO_STATUS_Archive.json лишався з попереднім "OK". Це scriptblock, а не
+# function: Write-BRAVOArchiveOperationStatus (нижче, для Main) ще не
+# визначена на цей момент, а нове визначення функції ДО preamble зсунуло б
+# початок регіону orchestration-проби self-test (вона стартує з першої
+# функції тіла). Виклик — `& $writeArchiveEarlyExitStatus <код> '<причина>'`,
+# сам `Exit <код>` лишається буквальним у місці виклику. Fail-soft: помилка
+# запису (в т.ч. $stateRoot ще не визначено) лише логується і не змінює код
+# завершення. Не використовується для: пересилання -HealthCheckOnly у
+# BRAVO_HEALTH (Health пише власний статус), коду дочірнього елевованого
+# процесу (статус пише він), lock-busy / catch-up skip і фінального exit.
+$writeArchiveEarlyExitStatus = {
+    param([int]$ExitCode, [string]$EarlyExitReason)
 
+    try {
+        # BRAVO_STATUS_Archive.json — статус НІЧНОЇ копії: -SyncBAZA його не
+        # перезаписує (як і Write-BRAVOArchiveOperationStatus).
+        if ((Test-Path variable:SyncBAZA) -and $SyncBAZA) { return }
+        $earlyStartedAtVariable = Get-Variable -Name scriptStartTime -ErrorAction SilentlyContinue
+        # ARCH-001: ранній вихід іде ДО Enter-BRAVOArchiveProcessLock — статус
+        # пишемо лише коли спільний operation lock вільний (короткочасно
+        # захоплюємо той самий файл тими ж Open-параметрами). Зайнятий або
+        # невизначений стан — fail-closed: не пишемо, лише лог.
+        $earlyLockStream = $null
+        try {
+            # Як в Enter-BRAVOArchiveProcessLock: на свіжій установці каталогу lock ще немає.
+            $earlyLockDirectory = Split-Path -Path ([string]$operationLockSettings.Path) -Parent
+            if (-not (Test-Path -LiteralPath $earlyLockDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $earlyLockDirectory -Force -ErrorAction Stop)
+            }
+            $earlyLockStream = [System.IO.File]::Open([string]$operationLockSettings.Path, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::Read)
+        } catch {
+            throw 'operation lock зайнятий іншим екземпляром або недоступний — статус не записано (захист від перезапису статусу іншого екземпляра)'
+        }
+        try {
+            Write-BRAVOOperationStatus `
+                -StateRoot $stateRoot `
+                -Operation Archive `
+                -ExitCode $ExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $ExitCode) `
+                -StartedAt $(if ($null -ne $earlyStartedAtVariable -and $earlyStartedAtVariable.Value -is [datetime]) { $earlyStartedAtVariable.Value } else { Get-Date }) `
+                -Details @{ earlyTermination = $true; earlyExitReason = $EarlyExitReason }
+        } finally {
+            $earlyLockStream.Dispose()
+        }
+    } catch {
+        try {
+            Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Телеметрія не змінює exit code.
+        }
+    }
+    # Фінальна Operations-подія у finally читає $script:processExitCode.
+    $script:processExitCode = $ExitCode
+}
 
 # Compatibility forwarding for callers that still use BRAVO_ARCHIV -HealthCheckOnly.
 # New callers and Task Scheduler use BRAVO_HEALTH.ps1 directly.
@@ -163,7 +218,9 @@ try {
 } catch {
     Write-Host "ПОМИЛКА: Не вдалося завантажити конфiгурацiю: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration, як у Maintenance
-    # і DataRestore для тієї самої відмови (раніше — голий 1).
+    # і DataRestore для тієї самої відмови (раніше — голий 1). #478: статус
+    # пише helper (якщо $stateRoot уже відомий; інакше fail-soft без запису).
+    & $writeArchiveEarlyExitStatus 30 'ConfigurationLoad'
     Exit 30
 }
 
@@ -223,6 +280,7 @@ try {
     }
 } catch {
     Write-Host "ПОМИЛКА: Некоректна конфігурація перевірки вільного місця: $($_.Exception.Message)" -ForegroundColor Red
+    & $writeArchiveEarlyExitStatus 30 'FreeSpaceConfiguration'
     Exit 30
 }
 
@@ -257,6 +315,7 @@ if ($requireAdministrator) {
             Write-Host "UAC запит вiдхилено або сталася помилка: $($_.Exception.Message)" -ForegroundColor $logColors.ERROR
             Write-Host "Запустiть PowerShell з правами адмiнiстратора вручну" -ForegroundColor $logColors.WARNING
             # Контракт BRAVO.ExitCodes: 36 = PrivilegeRequired (раніше — голий 1).
+            & $writeArchiveEarlyExitStatus 36 'PrivilegeRequired'
             Exit 36
         }
     }
@@ -455,12 +514,14 @@ if ($credentialHelperLoaded) {
         Write-Host "ПОМИЛКА: Некоректні локальні параметри установи у Credential Manager: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" `
             -ForegroundColor $logColors.ERROR
         # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+        & $writeArchiveEarlyExitStatus 30 'InstitutionSettings'
         exit 30
     }
 } elseif ($institutionSettingsRequired) {
     Write-Host "ПОМИЛКА: Не вдалося завантажити локальні параметри установи: $($script:institutionSettingsInitializationError)" `
         -ForegroundColor $logColors.ERROR
     # Контракт BRAVO.ExitCodes: 30 = InvalidConfiguration (раніше — голий 1).
+    & $writeArchiveEarlyExitStatus 30 'InstitutionSettings'
     exit 30
 }
 
