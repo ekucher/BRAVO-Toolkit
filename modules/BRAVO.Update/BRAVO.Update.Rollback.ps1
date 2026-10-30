@@ -1168,6 +1168,15 @@ function Invoke-BRAVORollback {
                 [void](& $step 'Rollback.Scheduler' {
                     # Mandatory-параметри передаємо ЗАВЖДИ явно: $null у Mandatory = запит у консолі.
                     if ($null -eq $rb.SchedulerSnapshot) { throw 'Знімок scheduler відсутній: повторне налаштування неможливе.' }
+                    # Repair пошкодженого runtime: setup-validate ДО операції вже падав, тож setup-прохід
+                    # реєстрації задач зі старого (пошкодженого) runtime знову впав би. Повторну реєстрацію
+                    # пропускаємо: лише відновлюємо enabled-стани зі знімка (Rollback.RestoreTasks) + Warning.
+                    $setupBaselineValue = Get-BRAVOUpdatePropertyValue -InputObject (Get-BRAVOUpdatePropertyValue -InputObject $rb.Journal -Name 'baseline') -Name 'setupValidateExitCode'
+                    if (($rb.Action -ceq 'Repair') -and ($null -ne $setupBaselineValue) -and ((Get-BRAVODeploySetupExitVerdict -ExitCode ([int]$setupBaselineValue)) -ceq 'FAIL')) {
+                        [void]$rb.Findings.Add((New-BRAVOUpdateFinding -Id 'Rollback.SchedulerReRegistrationSkipped' -Severity Warning -Title 'Повторну реєстрацію задач пропущено' `
+                            -Meaning 'Перевірка setup падала вже до repair (пошкоджений runtime): відновлено лише стани задач зі знімка.' -Details ('setupValidateExitCode baseline=' + [string]$setupBaselineValue)))
+                        return
+                    }
                     $reconcile = Invoke-BRAVOSchedulerReconcile -Context $rb.Context -Snapshot $rb.SchedulerSnapshot
                     if (([string]$reconcile.Verdict) -ceq 'FAIL') { throw ('Повторне налаштування scheduler зі старого runtime не вдалося: ' + (@($reconcile.Problems) -join '; ')) }
                 })
@@ -1191,6 +1200,8 @@ function Invoke-BRAVORollback {
                 $arguments = @{ Context = $rb.Context; Mode = 'Rollback'; ExpectedVersion = $expectedVersion; ExpectedManifestPath = $manifestPath; SiteBaseline = $site }
                 $guardBaseline = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'guardExitCode'
                 if (($rb.Action -ceq 'Repair') -and ($null -ne $guardBaseline)) { $arguments.GuardBaselineExitCode = [int]$guardBaseline }
+                $setupBaseline = Get-BRAVOUpdatePropertyValue -InputObject $baseline -Name 'setupValidateExitCode'
+                if (($rb.Action -ceq 'Repair') -and ($null -ne $setupBaseline)) { $arguments.SetupValidateBaselineExitCode = [int]$setupBaseline }
                 $verdict = Test-BRAVODeploymentValidation @arguments
                 foreach ($item in @(Get-BRAVOUpdatePropertyValue -InputObject $verdict -Name 'Items' -Default @())) {
                     [void]$rb.Validation.Add([pscustomobject][ordered]@{

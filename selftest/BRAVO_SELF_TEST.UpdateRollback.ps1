@@ -72,7 +72,8 @@ function Get-UpdRbTreeHash {
         [pscustomobject]@{ Verdict = [string]$script:UpdRbMode.ReconcileVerdict; ExitCode = 0; CreatedTasks = @(); RequiescedTasks = @(); Problems = @() }
     }
     function script:Test-BRAVODeploymentValidation {
-        [CmdletBinding()] param($Context, $Mode, $ExpectedVersion, $ExpectedManifestPath, $SiteBaseline, $GuardBaselineExitCode)
+        [CmdletBinding()] param($Context, $Mode, $ExpectedVersion, $ExpectedManifestPath, $SiteBaseline, $GuardBaselineExitCode, $SetupValidateBaselineExitCode)
+        $script:UpdRbLastValidate = @{ Guard = $GuardBaselineExitCode; Setup = $SetupValidateBaselineExitCode }
         $script:UpdRbLog.Add('Validate:' + $Mode)
         [pscustomobject]@{ Status = [string]$script:UpdRbMode.ValidationStatus; Items = @([pscustomobject]@{ Name = 'RuntimeManifest'; Status = 'Pass'; Message = 'ok' }) }
     }
@@ -864,6 +865,27 @@ if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath(
         Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and -not (Test-Path -LiteralPath $s.Runtime) -and (@($calls) -contains 'SetTaskEnabled:BRAVO_A:False') -and (@($calls) -notcontains 'GetEffectiveConfiguration') -and (@($calls) -notcontains 'GetManagedTasks')) -Name 'UpdateRollback/Install/CreatedTasksDisabledWithoutConfigLoad' -Failure "createdTasks вимикаються без читання конфігурації; status=$($r.status) calls=$($calls -join ',') $($r.rollback.message)"
     }
 
+    # --- Repair пошкодженого runtime: setup-validate падав і ДО операції (baseline-aware відкат) ---
+    & {
+        Reset-UpdRbStubs
+        $s = New-UpdRbUpdateScenario -Name 'repair-setup-baseline' -ConfigureScheduler
+        $s.Journal.action = 'Repair'
+        [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalField' -Arguments @{ Journal = $s.Journal; Name = 'baseline'; Value = ([pscustomobject]@{ siteConfig = $null; guardExitCode = 0; setupValidateExitCode = 1 }); StateRoot = $s.State })
+        $r = Invoke-UpdRbRollback -Scenario $s
+        $log = @(Get-UpdRbLog)
+        $seen = & $updRbModule { $script:UpdRbLastValidate }
+        Test-BRAVOCondition -Condition ($r.status -eq 'RolledBack' -and $log -notcontains 'Reconcile' -and $log -contains 'RestoreTasks' -and [int]$seen.Setup -eq 1) -Name 'UpdateRollback/RepairSetupBaseline/SchedulerSkippedTasksRestored' -Failure "baseline setup=1: повторну реєстрацію пропущено, стани задач відновлено, baseline передано у валідацію; status=$($r.status) log=$($log -join ',') $($r.rollback.message)"
+        Test-BRAVOCondition -Condition (@($r.findings | Where-Object { $_.id -eq 'Rollback.SchedulerReRegistrationSkipped' }).Count -eq 1 -and @($r.findings | Where-Object { $_.id -eq 'Repair.RuntimeStillDamaged' }).Count -eq 1) -Name 'UpdateRollback/RepairSetupBaseline/Findings' -Failure 'очікуються findings Rollback.SchedulerReRegistrationSkipped і Repair.RuntimeStillDamaged'
+
+        # Baseline setup = 0 (здоровий): повторна реєстрація виконується як зазвичай.
+        Reset-UpdRbStubs
+        $s2 = New-UpdRbUpdateScenario -Name 'repair-setup-ok' -ConfigureScheduler
+        $s2.Journal.action = 'Repair'
+        [void](Invoke-UpdRbCall -Name 'Set-BRAVOUpdateJournalField' -Arguments @{ Journal = $s2.Journal; Name = 'baseline'; Value = ([pscustomobject]@{ siteConfig = $null; guardExitCode = 0; setupValidateExitCode = 0 }); StateRoot = $s2.State })
+        $r2 = Invoke-UpdRbRollback -Scenario $s2
+        Test-BRAVOCondition -Condition ($r2.status -eq 'RolledBack' -and @(Get-UpdRbLog) -contains 'Reconcile') -Name 'UpdateRollback/RepairSetupBaseline/HealthyBaselineStillReconciles' -Failure "baseline setup=0 -> Rollback.Scheduler виконується; status=$($r2.status)"
+    }
+
     # --- Прямий виклик Invoke-BRAVOInstallRollback з недовіреним журналом ---
     & {
         Reset-UpdRbStubs
@@ -872,6 +894,38 @@ if ($tmp.StartsWith([System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath(
         $direct = Invoke-UpdRbCall -Name 'Invoke-BRAVOInstallRollback' -Arguments @{ Journal = $s.Journal; Adapter = @{}; StateRoot = $s.State }
         Test-BRAVOCondition -Condition ((-not $direct.Success) -and @(Get-UpdRbLog).Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $s.Runtime 'BRAVO_A.ps1'))) -Name 'UpdateRollback/Forged/InstallRollbackDirectUntrusted' -Failure 'Invoke-BRAVOInstallRollback сам перевіряє довіру до будь-якої дії'
     }
+    # --- Реальна Test-BRAVODeploymentValidation: SetupValidate baseline-aware у Mode Rollback ---
+    & {
+        # Перезавантаження модуля скидає stub-и: далі працює справжня валідація.
+        Import-Module (Join-Path $root 'modules\BRAVO.Update\BRAVO.Update.psm1') -Force -DisableNameChecking
+        $realModule = Get-Module BRAVO.Update
+        $vr = Join-Path $updRbTemp 'real validation rt'
+        Write-UpdRbFile -Path (Join-Path $vr 'VERSION.json') -Text '{"packageVersion":"5.2.5"}'
+        Write-UpdRbFile -Path (Join-Path $vr 'RUNTIME_MANIFEST.json') -Text '{"schemaVersion":1,"files":{}}'
+        $mkContext = {
+            param($Code)
+            $codeValue = $Code
+            [pscustomobject]@{
+                Adapter = @{
+                    InvokeGuard = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = 0; Output = ''; TimedOut = $false } }
+                    InvokeSetupValidate = { param($RuntimeRoot, $LogPath) [pscustomobject]@{ ExitCode = $codeValue; Output = ''; TimedOut = $false } }.GetNewClosure()
+                }
+                Paths = [pscustomobject]@{ RuntimeRoot = $vr }; OperationDirectory = ''; Plan = $null
+            }
+        }
+        $setupItem = {
+            param($Code, $Baseline)
+            $arguments = @{ Context = (& $mkContext $Code); Mode = 'Rollback'; ExpectedVersion = '5.2.5'; ExpectedManifestPath = (Join-Path $vr 'RUNTIME_MANIFEST.json'); SiteBaseline = $null }
+            if ($null -ne $Baseline) { $arguments.SetupValidateBaselineExitCode = $Baseline }
+            $result = & $realModule { param($a) Test-BRAVODeploymentValidation @a } $arguments
+            return @($result.Items | Where-Object { $_.Name -eq 'SetupValidate' })[0].Status
+        }
+        Test-BRAVOCondition -Condition ((& $setupItem 1 1) -eq 'Warn') -Name 'UpdateRollback/Validation/SetupEqualBaselineIsWarn' -Failure 'збій setup, що збігається з baseline, у Rollback -> Warn'
+        Test-BRAVOCondition -Condition ((& $setupItem 1 $null) -eq 'Fail') -Name 'UpdateRollback/Validation/SetupFailWithoutBaselineIsFail' -Failure 'без baseline збій setup лишається Fail'
+        Test-BRAVOCondition -Condition ((& $setupItem 2 1) -eq 'Fail') -Name 'UpdateRollback/Validation/SetupDifferentFromBaselineIsFail' -Failure 'код, відмінний від baseline, лишається Fail'
+        Test-BRAVOCondition -Condition ((& $setupItem 0 1) -eq 'Pass') -Name 'UpdateRollback/Validation/SetupPassStillPass' -Failure 'код 0 лишається Pass'
+    }
+
 } finally {
     [Environment]::SetEnvironmentVariable('BRAVO_ALLOW_DOWNGRADE', $updRbSavedDowngrade, 'Process')
     # Перезавантаження модуля скидає stub-и, визначені в його області.
