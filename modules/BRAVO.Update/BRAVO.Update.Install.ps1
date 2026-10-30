@@ -490,6 +490,11 @@ function Install-BRAVOToolkit {
                         $reconcile = Invoke-BRAVOSchedulerReconcile -Context $Context -Snapshot $snapshot
                         $Context.Data['SchedulerReconcile'] = $reconcile
                         $Context.Data['Tasks'] = @(Get-BRAVOUpdateArrayProperty -InputObject $reconcile -Name 'CreatedTasks')
+                        # Той самий контракт, що в Deploy: дерево процесів BRAVO_SETUP не підтверджено завершеним -> Critical
+                        # без подальших змін (уцілілий процес міг продовжувати реєструвати задачі).
+                        if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $reconcile -Name 'TreeNotContained' -Default $false)) {
+                            throw (New-BRAVOUpdateTypedException -Message 'Дерево процесів налаштування планувальника не підтверджено завершеним.' -Kind ProcessTreeNotContained -FindingId 'Process.TreeNotContained' -Action 'Потрібне ручне втручання: переконайтесь, що процеси BRAVO_SETUP/guard/self-test завершено (за потреби перезавантажте сервер), потім виконайте відновлення.')
+                        }
                         $verdict = [string](Get-BRAVOUpdatePropertyValue -InputObject $reconcile -Name 'Verdict' -Default 'FAIL')
                         if ($verdict -ceq 'FAIL') {
                             throw (New-BRAVOUpdateTypedException -Message ('Реєстрація задач завершилась помилкою: ' + ((@(Get-BRAVOUpdateArrayProperty -InputObject $reconcile -Name 'Problems') | Select-Object -First 5) -join '; ')) -Kind Error -FindingId 'Scheduler.ReconcileFailed')
@@ -513,6 +518,9 @@ function Install-BRAVOToolkit {
                     $validation = Test-BRAVODeploymentValidation -Context $Context -Mode Install -ExpectedVersion ([string](Get-BRAVOUpdatePropertyValue -InputObject $Context.Plan -Name 'targetVersion' -Default '')) `
                         -ExpectedManifestPath (Join-Path $Context.Paths.RuntimeRoot 'RUNTIME_MANIFEST.json') -SiteBaseline $baseline
                     foreach ($item in @(Get-BRAVOUpdateArrayProperty -InputObject $validation -Name 'Items')) { $Context.Validation.Add($item) }
+                    if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $validation -Name 'TreeNotContained' -Default $false)) {
+                        throw (New-BRAVOUpdateTypedException -Message 'Дерево процесів валідації не підтверджено завершеним.' -Kind ProcessTreeNotContained -FindingId 'Process.TreeNotContained' -Action 'Потрібне ручне втручання: переконайтесь, що процеси BRAVO_SETUP/guard/self-test завершено (за потреби перезавантажте сервер), потім виконайте відновлення.')
+                    }
                     $validationStatus = [string](Get-BRAVOUpdatePropertyValue -InputObject $validation -Name 'Status' -Default 'Fail')
                     $Context.Data['InstallValidation'] = $validationStatus
                     if ($validationStatus -ceq 'Warn') {
