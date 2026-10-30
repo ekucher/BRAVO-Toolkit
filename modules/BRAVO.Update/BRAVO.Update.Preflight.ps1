@@ -902,6 +902,13 @@ function Test-BRAVODeploymentPreflight {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RuntimeIntegrity' -Severity 'NotApplicable' `
             -Title 'Порушена цілісність — очікувано для відновлення' -Meaning 'Саме це відновлення й виправляє.' `
             -Details "integrity=$integrityStatus"
+    } elseif ($integrityStatus -eq 'Invalid') {
+        # Update з доведено порушеного runtime не відкотити чисто (відновлений бекап знову не пройде еталонний маніфест -> Critical),
+        # тому Update блокується: спершу Repair. Статус Unknown (цілісність не підтверджена) лишається Warning.
+        Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RuntimeIntegrity' -Severity 'Blocker' `
+            -Title 'Цілісність поточного runtime порушена — спершу виконайте Відновлення (Repair)' `
+            -Meaning 'Оновлення поверх пошкодженого runtime неможливо безпечно відкотити: відновлена копія знову не відповідатиме еталону.' `
+            -Action 'Виконайте «Відновити» (Repair), а потім повторіть оновлення.' -Details "integrity=$integrityStatus" -ExitCodeHint 33
     } else {
         Add-BRAVOPreflightFinding -List $list -Operation $Operation -Id 'Preflight.RuntimeIntegrity' -Severity 'Warning' `
             -Title 'Цілісність поточної інсталяції порушена або не підтверджена' `

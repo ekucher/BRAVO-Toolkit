@@ -377,7 +377,12 @@
             $state = [pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Invalid'; mismatchedCount = 2 } }
             $r = & $call @{ InstallationState = $state }
             $f = & $find $r 'Preflight.RuntimeIntegrity'
-            Test-BRAVOCondition -Condition ($f.severity -eq 'Warning' -and $r.canProceed) -Name 'UpdatePreflight/UpdateInvalidIntegrityWarns' -Failure 'Update: порушена цілісність — Warning'
+            Test-BRAVOCondition -Condition (($f.severity -eq 'Blocker') -and ($f.exitCodeHint -eq 33) -and (-not $r.canProceed) -and ($f.title -like '*Repair*')) -Name 'UpdatePreflight/UpdateInvalidIntegrityBlocksSuggestsRepair' -Failure 'Update: доведено порушена цілісність — Blocker 33 з порадою Repair'
+            $unknownState = [pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Unknown' } }
+            $rUnknown = & $call @{ InstallationState = $unknownState }
+            Test-BRAVOCondition -Condition (((& $find $rUnknown 'Preflight.RuntimeIntegrity').severity -eq 'Warning') -and $rUnknown.canProceed) -Name 'UpdatePreflight/UpdateUnknownIntegrityStillWarns' -Failure 'Update: непідтверджена цілісність лишається Warning'
+            $rDiagnose = & $call @{ Operation = 'Diagnose'; InstallationState = $state }
+            Test-BRAVOCondition -Condition ((& $find $rDiagnose 'Preflight.RuntimeIntegrity').severity -ne 'Blocker') -Name 'UpdatePreflight/DiagnoseInvalidIntegrityNeverBlocks' -Failure 'Diagnose не блокується'
             $r = & $call @{ Operation = 'Repair'; InstallationState = $state }
             Test-BRAVOCondition -Condition ((& $find $r 'Preflight.RuntimeIntegrity').severity -eq 'NotApplicable' -and $r.canProceed) -Name 'UpdatePreflight/RepairInvalidIntegrityExpected' -Failure 'Repair: порушена цілісність очікувана'
             $ok = [pscustomobject]@{ integrity = [pscustomobject]@{ status = 'Valid' } }
