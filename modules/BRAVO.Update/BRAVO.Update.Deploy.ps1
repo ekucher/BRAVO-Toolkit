@@ -1261,7 +1261,21 @@ function Invoke-BRAVOUpdateCaptureBaseline {
                         recordedVersion = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'recordedVersion')
                         snapshotPath    = (Get-BRAVOUpdatePropertyValue -InputObject $versionSnapshot -Name 'snapshotPath')
                     }))
-            $baseline = [pscustomobject][ordered]@{ siteConfig = $siteBaseline; guardExitCode = $guardExitCode }
+            # Repair: код setup-validate ДО операції. Пошкоджений runtime (hash-mismatch) дає
+            # збій BRAVO_SETUP -ValidateOnly, який після відкату (побайтове відновлення
+            # пошкодженого стану) має повторитись, тож відкат порівнює з baseline, а не з 0.
+            $setupExitCode = $null
+            if (([string]$Context.Journal.action -ceq 'Repair') -and $Context.Adapter.ContainsKey('InvokeSetupValidate') -and $null -ne $Context.Adapter['InvokeSetupValidate']) {
+                try {
+                    $setupRun = & $Context.Adapter['InvokeSetupValidate'] $Context.Paths.RuntimeRoot
+                    $setupExitCode = Get-BRAVOUpdatePropertyValue -InputObject $setupRun -Name 'ExitCode'
+                    if ([bool](Get-BRAVOUpdatePropertyValue -InputObject $setupRun -Name 'TimedOut' -Default $false)) { $setupExitCode = $null }
+                } catch {
+                    if ((Get-BRAVOUpdateExceptionKind -ErrorRecord $_).Kind -ceq 'Crash') { throw }
+                    $setupExitCode = $null
+                }
+            }
+            $baseline = [pscustomobject][ordered]@{ siteConfig = $siteBaseline; guardExitCode = $guardExitCode; setupValidateExitCode = $setupExitCode }
             [void](Set-BRAVOUpdateJournalField -Journal $Context.Journal -StateRoot $Context.Paths.StateRoot -Name 'baseline' -Value $baseline)
         })
 }

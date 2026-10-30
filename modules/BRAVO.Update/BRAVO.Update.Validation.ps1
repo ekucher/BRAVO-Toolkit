@@ -75,7 +75,11 @@ function Test-BRAVODeploymentValidation {
         [Parameter(Mandatory = $true)][string]$ExpectedVersion,
         [Parameter(Mandatory = $true)][string]$ExpectedManifestPath,
         [Parameter(Mandatory = $true)][AllowNull()]$SiteBaseline,
-        [AllowNull()][object]$GuardBaselineExitCode = $null
+        [AllowNull()][object]$GuardBaselineExitCode = $null,
+        # Код BRAVO_SETUP -ValidateOnly ДО операції (Repair-rollback): runtime відновлено
+        # побайтово до пошкодженого стану, тож збій setup, що збігається з baseline, не є
+        # збоєм відкату (як і guard).
+        [AllowNull()][object]$SetupValidateBaselineExitCode = $null
     )
 
     $items = New-Object System.Collections.Generic.List[object]
@@ -190,6 +194,8 @@ function Test-BRAVODeploymentValidation {
             [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SetupValidate' -Status 'Pass' -Message 'BRAVO_SETUP -ValidateOnly: код 0.'))
         } elseif ($verdict -eq 'PASS_WITH_WARNING') {
             [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SetupValidate' -Status 'Warn' -Message 'BRAVO_SETUP -ValidateOnly: код 10 (попередження).'))
+        } elseif (($Mode -eq 'Rollback') -and ($null -ne $SetupValidateBaselineExitCode) -and ($code -eq [int]$SetupValidateBaselineExitCode)) {
+            [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SetupValidate' -Status 'Warn' -Message ("BRAVO_SETUP -ValidateOnly: код $code збігається з baseline до операції (runtime відновлено до попереднього, пошкодженого стану).")))
         } else {
             $note = if ($Mode -eq 'Install') { ' (credentials ще не введено — очікувано на чистому встановленні)' } else { '' }
             [void]$items.Add((New-BRAVOUpdateValidationItem -Name 'SetupValidate' -Status $failStatus -Message ("BRAVO_SETUP -ValidateOnly: код $code$note.")))
