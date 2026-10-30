@@ -663,16 +663,131 @@ function ConvertTo-BRAVOUpdateQuotedArgument {
     return '"' + ([regex]::Replace($Value, '(\\*)$', '$1$1')) + '"'
 }
 
+function Initialize-BRAVOUpdateJobObjectType {
+    # Мінімальний P/Invoke для Win32 Job Object: контейнер ДЕРЕВА процесів,
+    # запущеного рушієм. BRAVO_SETUP породжує вкладені powershell.exe (зокрема
+    # мутуючий BRAVO_TASKS_INSTALL); завершення лише зовнішнього процесу
+    # лишало б їх живими під час reconcile/rollback. Тип компілюється один раз
+    # за сесію. Повертає $true, якщо тип доступний.
+    [CmdletBinding()]
+    param()
+
+    if ($null -ne ('BRAVOUpdateNative.JobObject' -as [type])) { return $true }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace BRAVOUpdateNative
+{
+    public static class JobObject
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BasicLimit
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters
+        {
+            public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+            public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ExtendedLimit
+        {
+            public BasicLimit Basic;
+            public IoCounters Io;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Accounting
+        {
+            public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+            public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimit info, int length);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out Accounting info, int length, IntPtr returned);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: закриття handle останнім власником
+        // знищує всіх учасників, навіть якщо рушій упаде.
+        public static IntPtr Create()
+        {
+            IntPtr job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) { return IntPtr.Zero; }
+            ExtendedLimit info = new ExtendedLimit();
+            info.Basic.LimitFlags = 0x2000;
+            if (!SetInformationJobObject(job, 9, ref info, Marshal.SizeOf(typeof(ExtendedLimit))))
+            {
+                CloseHandle(job);
+                return IntPtr.Zero;
+            }
+            return job;
+        }
+
+        public static bool Assign(IntPtr job, IntPtr process) { return AssignProcessToJobObject(job, process); }
+
+        public static int ActiveProcesses(IntPtr job)
+        {
+            Accounting info;
+            if (!QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(Accounting)), IntPtr.Zero)) { return -1; }
+            return (int)info.ActiveProcesses;
+        }
+
+        public static bool Terminate(IntPtr job) { return TerminateJobObject(job, 1); }
+
+        public static void Close(IntPtr job) { if (job != IntPtr.Zero) { CloseHandle(job); } }
+    }
+}
+'@ -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    return ($null -ne ('BRAVOUpdateNative.JobObject' -as [type]))
+}
+
 function Invoke-BRAVOUpdateChildProcess {
     <#
     .SYNOPSIS
         Запускає powershell.exe -NoProfile -NonInteractive -File <Script> ...
-        і повертає { ExitCode, Output, TimedOut, LogPath }.
+        і повертає { ExitCode, Output, TimedOut, TreeNotContained, LogPath }.
     .DESCRIPTION
         Секрети в аргументи НЕ передаються (лише шляхи та імена компонентів).
-        Завершується лише власний дочірній процес (за об'єктом Process, що
-        створив цей виклик, тобто за його handle, а не за ім'ям чи віком) і
-        лише після таймауту.
+        Процес одразу після старту поміщається в Job Object (діти успадковують
+        job). За таймаутом завершується весь job (TerminateJobObject) і
+        чекається ActiveProcesses = 0; зачіпаються лише процеси, які запустив
+        цей виклик (членство в job), ніколи за ім'ям чи віком. Якщо job
+        створити/призначити не вдалося, процес не лишається: fail closed.
+        Якщо завершення дерева не підтверджено за 15 с, результат має
+        TimedOut = TreeNotContained = $true: викликач трактує це як Critical
+        (без подальших mutation). Вікно між Start і Assign (мілісекунди, до
+        того як powershell.exe встигне породити дітей) визнане залишковим
+        ризиком.
         -ExecutionPolicy RemoteSigned (не Bypass): політика машини не
         послаблюється до повного обходу (ENGINE_DESIGN §6).
         Вивід ЗАВЖДИ проходить Protect-BRAVOLogSecret перед поверненням і
@@ -689,7 +804,7 @@ function Invoke-BRAVOUpdateChildProcess {
     )
 
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
-        return [pscustomobject]@{ ExitCode = -1; Output = "Скрипт не знайдено: $ScriptPath"; TimedOut = $false; LogPath = $null }
+        return [pscustomobject]@{ ExitCode = -1; Output = "Скрипт не знайдено: $ScriptPath"; TimedOut = $false; TreeNotContained = $false; LogPath = $null }
     }
     $powershellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     if (-not (Test-Path -LiteralPath $powershellPath -PathType Leaf)) { $powershellPath = 'powershell.exe' }
@@ -746,23 +861,44 @@ function Invoke-BRAVOUpdateChildProcess {
         try {
             Import-Module -Name $compatibilityManifest -DisableNameChecking -ErrorAction Stop
         } catch {
-            return [pscustomobject]@{ ExitCode = -1; Output = 'BRAVO.Compatibility недоступний: запуск дочірнього процесу відхилено (fail closed).'; TimedOut = $false; LogPath = $null }
+            return [pscustomobject]@{ ExitCode = -1; Output = 'BRAVO.Compatibility недоступний: запуск дочірнього процесу відхилено (fail closed).'; TimedOut = $false; TreeNotContained = $false; LogPath = $null }
         }
+    }
+
+    # Job Object має існувати ДО старту: без контейнера дерева процес не запускаємо.
+    if (-not (Initialize-BRAVOUpdateJobObjectType)) {
+        return [pscustomobject]@{ ExitCode = -1; Output = 'Job Object недоступний: запуск дочірнього процесу відхилено (fail closed).'; TimedOut = $false; TreeNotContained = $true; LogPath = $null }
+    }
+    $job = [BRAVOUpdateNative.JobObject]::Create()
+    if ($job -eq [IntPtr]::Zero) {
+        return [pscustomobject]@{ ExitCode = -1; Output = 'Не вдалося створити Job Object: запуск відхилено (fail closed).'; TimedOut = $false; TreeNotContained = $true; LogPath = $null }
     }
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
         Start-BRAVOProcessWithBomFreeInput -Process $process
+        if (-not [BRAVOUpdateNative.JobObject]::Assign($job, $process.Handle)) {
+            # Дерево не можна обмежити: завершуємо лише власний процес (handle) і відмовляємо.
+            try { $process.Kill() } catch { <# власний процес міг уже завершитись #> }
+            return [pscustomobject]@{ ExitCode = -1; Output = 'Не вдалося призначити процес у Job Object: запуск скасовано (fail closed).'; TimedOut = $false; TreeNotContained = $true; LogPath = $null }
+        }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            # Лише власний об'єкт Process (handle, отриманий зі Start): PID міг
-            # би бути перевикористаний, handle — ні.
-            try { $process.Kill() } catch { <# власний дочірній процес міг завершитись між WaitForExit і Kill — гонитва очікувана #> }
+            # Завершується лише job, створений цим викликом (членство, не ім'я/вік),
+            # і чекаємо підтвердження, що в ньому не лишилось активних процесів.
+            [void][BRAVOUpdateNative.JobObject]::Terminate($job)
+            $contained = $false
+            $deadline = [datetime]::UtcNow.AddSeconds(15)
+            while ([datetime]::UtcNow -lt $deadline) {
+                if ([BRAVOUpdateNative.JobObject]::ActiveProcesses($job) -eq 0) { $contained = $true; break }
+                Start-Sleep -Milliseconds 100
+            }
             $timeoutText = & $mask "Таймаут $TimeoutSeconds с: $ScriptPath"
+            if (-not $contained) { $timeoutText = $timeoutText + ' Завершення дерева процесів не підтверджено (TreeNotContained).' }
             $timeoutLog = & $writeLog $timeoutText
-            return [pscustomobject]@{ ExitCode = -1; Output = $timeoutText; TimedOut = $true; LogPath = $timeoutLog }
+            return [pscustomobject]@{ ExitCode = -1; Output = $timeoutText; TimedOut = $true; TreeNotContained = (-not $contained); LogPath = $timeoutLog }
         }
         $process.WaitForExit()
         $text = [string]$stdoutTask.Result
@@ -770,8 +906,10 @@ function Invoke-BRAVOUpdateChildProcess {
         if (-not [string]::IsNullOrWhiteSpace($errText)) { $text = $text + [Environment]::NewLine + $errText }
         $maskedText = & $mask $text
         $writtenLog = & $writeLog $maskedText
-        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = $maskedText; TimedOut = $false; LogPath = $writtenLog }
+        return [pscustomobject]@{ ExitCode = [int]$process.ExitCode; Output = $maskedText; TimedOut = $false; TreeNotContained = $false; LogPath = $writtenLog }
     } finally {
+        # KILL_ON_JOB_CLOSE: залишки (осиротілі діти після нормального виходу) теж знищуються.
+        [BRAVOUpdateNative.JobObject]::Close($job)
         $process.Dispose()
     }
 }
