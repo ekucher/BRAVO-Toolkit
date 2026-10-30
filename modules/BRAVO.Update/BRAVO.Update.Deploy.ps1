@@ -1210,7 +1210,7 @@ function Invoke-BRAVOUpdateEnterOperationLock {
             if (-not $Context.Adapter.ContainsKey('GetManagedTasks') -or $null -eq $Context.Adapter['GetManagedTasks']) {
                 throw (New-BRAVOUpdateTypedException -Message 'Стан керованих задач недоступний (adapter без GetManagedTasks).' -Kind Blocked -FindingId 'Scheduler.TasksUnknown' -Action 'Перевірте доступ до Task Scheduler.')
             }
-            $tasks = @(& $Context.Adapter['GetManagedTasks'])
+            $tasks = @(& $Context.Adapter['GetManagedTasks'] '' ([string]$Context.Paths.RuntimeRoot))
             foreach ($task in $tasks) {
                 if ($null -eq $task) { continue }
                 $state = [string](Get-BRAVOUpdatePropertyValue -InputObject $task -Name 'State' -Default '')
