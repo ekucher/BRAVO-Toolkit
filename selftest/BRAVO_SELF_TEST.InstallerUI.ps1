@@ -558,6 +558,17 @@
     $planNoSt = [pscustomobject]@{ tests = [pscustomobject]@{ planned = @([pscustomobject]@{ id = 'Validate.Integrity'; title = 'Цілісність' }); skipped = @([pscustomobject]@{ title = 'Самотест'; reason = 'пропущено за запитом' }) } }
     Test-BRAVOCondition -Condition ((Get-BRAVOInstallerPlanSelfTest -Plan $planWithSt -Fallback $false) -and -not (Get-BRAVOInstallerPlanSelfTest -Plan $planNoSt -Fallback $true) -and (Get-BRAVOInstallerPlanSelfTest -Plan $plan -Fallback $true) -and -not (Get-BRAVOInstallerPlanSelfTest -Plan $null -Fallback $false)) `
         -Name 'InstallerUI/Request/RunSelfTestFollowsPlanTests' -Failure 'options.runSelfTest має відповідати plan.tests.'
+
+    # --- Підтверджений root після Install ---
+    $planCustom = [pscustomobject]@{ runtimeRoot = 'D:\Каталог Інший\BRAVO' }
+    $okInstall = [pscustomobject]@{ status = 'Success'; action = 'Install' }
+    Test-BRAVOCondition -Condition ((Get-BRAVOInstallerConfirmedInstallRoot -Result $okInstall -Plan $planCustom) -eq 'D:\Каталог Інший\BRAVO' -and
+        (Get-BRAVOInstallerConfirmedInstallRoot -Result ([pscustomobject]@{ status = 'SuccessWithWarnings'; action = 'Install' }) -Plan $planCustom) -eq 'D:\Каталог Інший\BRAVO' -and
+        (Get-BRAVOInstallerConfirmedInstallRoot -Result ([pscustomobject]@{ status = 'Failed'; action = 'Install' }) -Plan $planCustom) -eq '' -and
+        (Get-BRAVOInstallerConfirmedInstallRoot -Result ([pscustomobject]@{ status = 'RolledBack'; action = 'Install' }) -Plan $planCustom) -eq '' -and
+        (Get-BRAVOInstallerConfirmedInstallRoot -Result ([pscustomobject]@{ status = 'Success'; action = 'Update' }) -Plan $planCustom) -eq '' -and
+        (Get-BRAVOInstallerConfirmedInstallRoot -Result $okInstall -Plan $null) -eq '' -and (Get-BRAVOInstallerConfirmedInstallRoot -Result $null -Plan $planCustom) -eq '') `
+        -Name 'InstallerUI/Result/ConfirmedInstallRoot' -Failure 'Лише успішний Install дає підтверджений root.'
     # --- Форма: нові екрани ---
     $wizardForm = $null
     $wizardFormError = ''
@@ -598,6 +609,21 @@
         $out
     } $ctx
     Test-BRAVOCondition -Condition (($wizardDefaults -join ',') -eq 'Install=True/True,Update=True/True,Repair=False/False') -Name 'InstallerUI/Wizard/SelfTestDefaults' -Failure ($wizardDefaults -join ',')
+            $ctxRoot = & $mod {
+                param($c, $planObj)
+                $savedToolkit = $c.ToolkitRoot
+                $c.ToolkitRoot = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO-G2-NoEngine'   # без engine: оновлення State після завершення не запускає реальний процес
+                $c.RuntimeRoot = ''
+                $c.Wizard = New-BRAVOInstallerWizardState; $c.Wizard.Operation = 'Install'; $c.Wizard.Plan = $planObj
+                $c.Exec = @{ }
+                try { Complete-BRAVOInstallerExecution -Context $c -Result ([pscustomobject]@{ status = 'Success'; action = 'Install'; taskActivation = [pscustomobject]@{ state = 'Inactive' } }) } catch { }
+                $afterComplete = $c.RuntimeRoot
+                [void](Invoke-BRAVOInstallerAction -Context $c -Key 'Finish')
+                $c.ToolkitRoot = $savedToolkit
+                $c.Loading = $false
+                @($afterComplete, $c.RuntimeRoot, ($null -eq $c.Wizard.Plan))
+            } $ctx ([pscustomobject]@{ runtimeRoot = 'D:\Інший Каталог\BRAVO'; planId = 'x' })
+            Test-BRAVOCondition -Condition ($ctxRoot[0] -eq 'D:\Інший Каталог\BRAVO' -and $ctxRoot[1] -eq 'D:\Інший Каталог\BRAVO' -and $ctxRoot[2]) -Name 'InstallerUI/Wizard/InstallRootKeptAfterFinish' -Failure ($ctxRoot -join ' | ')
 
             # Прогін екранів майстра без показу форми: жодних винятків, коректні тексти.
             $walk = & $mod {

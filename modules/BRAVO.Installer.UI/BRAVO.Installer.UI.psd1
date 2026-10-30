@@ -33,6 +33,7 @@
         'New-BRAVOInstallerExecutionRequest',
         'Test-BRAVOInstallerMutationStarted',
         'Get-BRAVOInstallerPlanSelfTest',
+        'Get-BRAVOInstallerConfirmedInstallRoot',
         'Get-BRAVOInstallerCancelAction',
         'ConvertTo-BRAVOInstallerExecutionViewModel',
         'ConvertTo-BRAVOInstallerResultViewModel',
