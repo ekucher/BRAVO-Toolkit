@@ -1025,6 +1025,70 @@ try {
         }
 
         # ================================================================
+        # 15. Crash clean install -> CLI Recover (a) без -RuntimeRoot, (b) з ним, (c) з чужим
+        # ================================================================
+        & {
+            function New-T1CrashedInstall {
+                param([string]$Key, [switch]$PreexistingEmpty)
+                $sb = New-T1Sandbox -Name 'ins-crash' -Presence 'Found'
+                if ($PreexistingEmpty) { [void](New-Item -ItemType Directory -Path $sb.Runtime -Force) }
+                $plan = (New-T1Plan -Sandbox $sb -Operation Install -Release $releaseN).Plan
+                $thrown = ''
+                try { [void](Invoke-T1Install -Sandbox $sb -Plan $plan -Release $releaseN -Fault @{ $Key = 'Crash' }) } catch { $thrown = [string]$_.Exception.Message }
+                return [pscustomobject]@{ Sb = $sb; Plan = $plan; Thrown = $thrown }
+            }
+            function Get-T1CliRecover {
+                param($Sandbox, [string]$RuntimeRoot = '')
+                $arguments = @{ Action = 'Recover'; Paths = $Sandbox.Paths; Adapter = $Sandbox.Adapter; IsAdministrator = $true; CandidateRoots = @($Sandbox.Runtime) }
+                if ($RuntimeRoot -ne '') { $arguments['RuntimeRoot'] = $RuntimeRoot }
+                return (Invoke-BRAVOUpdateCliAction @arguments)
+            }
+            foreach ($key in @('CreateRuntimeRoot.AfterSideEffect', 'Deploy.AfterIntent')) {
+                $name = 'UpdateEndToEnd/InstallCrash/' + $key
+                # (c) чужий RuntimeRoot: відмова 80, журнал лишається Open, нічого не видалено.
+                $c = New-T1CrashedInstall -Key $key
+                Test-BRAVOCondition -Condition ($c.Thrown.StartsWith('BRAVOUpdate.SimulatedCrash', [StringComparison]::Ordinal) -and ((Get-T1JournalState -Sandbox $c.Sb -Plan $c.Plan) -ceq 'Open')) -Name ($name + '/CrashLeavesJournalOpen') -Failure ('thrown=' + $c.Thrown)
+                $foreignRoot = Join-Path $e2eRoot 'foreign-runtime'
+                $rootExistedBefore = Test-T1PathExists -Path $c.Sb.Runtime
+                $foreign = Get-T1CliRecover -Sandbox $c.Sb -RuntimeRoot $foreignRoot
+                Test-BRAVOCondition -Condition (([int]$foreign.ExitCode -eq 80) -and ((Get-T1JournalState -Sandbox $c.Sb -Plan $c.Plan) -ceq 'Open') -and ((Test-T1PathExists -Path $c.Sb.Runtime) -eq $rootExistedBefore)) -Name ($name + '/ForeignRuntimeRootRefused80JournalOpen') `
+                    -Failure ('exit=' + $foreign.ExitCode + ' journal=' + (Get-T1JournalState -Sandbox $c.Sb -Plan $c.Plan))
+                # (b) явний -RuntimeRoot == ціль.
+                $b = Get-T1CliRecover -Sandbox $c.Sb -RuntimeRoot $c.Sb.Runtime
+                Test-BRAVOCondition -Condition (([string]$b.Result.status -ceq 'RolledBack') -and ([int]$b.ExitCode -eq 81) -and ((Get-T1JournalState -Sandbox $c.Sb -Plan $c.Plan) -ceq 'RolledBack') -and (-not (Test-T1PathExists -Path $c.Sb.Runtime))) -Name ($name + '/RecoverWithTargetRootRemovesRoot') `
+                    -Failure ((Format-T1Result -Result $b.Result) + ' root існує=' + (Test-T1PathExists -Path $c.Sb.Runtime))
+                # (a) без -RuntimeRoot.
+                $a = New-T1CrashedInstall -Key $key
+                $ra = Get-T1CliRecover -Sandbox $a.Sb
+                Test-BRAVOCondition -Condition (([string]$ra.Result.status -ceq 'RolledBack') -and ([int]$ra.ExitCode -eq 81) -and ((Get-T1JournalState -Sandbox $a.Sb -Plan $a.Plan) -ceq 'RolledBack') -and (-not (Test-T1PathExists -Path $a.Sb.Runtime))) -Name ($name + '/RecoverWithoutRuntimeRootRemovesRoot') `
+                    -Failure ((Format-T1Result -Result $ra.Result) + ' root існує=' + (Test-T1PathExists -Path $a.Sb.Runtime))
+                $again = Get-T1CliRecover -Sandbox $a.Sb
+                Test-BRAVOCondition -Condition (([int]$again.ExitCode -eq 0) -and ([string]$again.Result.status -ceq 'Success')) -Name ($name + '/SecondRecoverNoOp') -Failure (Format-T1Result -Result $again.Result)
+            }
+            # Заздалегідь створений порожній корінь після відкату лишається (marker:preexistingRoot).
+            $p = New-T1CrashedInstall -Key 'Deploy.AfterIntent' -PreexistingEmpty
+            $rp = Get-T1CliRecover -Sandbox $p.Sb
+            $leftover = @(Get-ChildItem -LiteralPath $p.Sb.Runtime -Force -ErrorAction SilentlyContinue)
+            Test-BRAVOCondition -Condition (([string]$rp.Result.status -ceq 'RolledBack') -and [IO.Directory]::Exists($p.Sb.Runtime) -and ($leftover.Count -eq 0) -and ((Get-T1JournalState -Sandbox $p.Sb -Plan $p.Plan) -ceq 'RolledBack')) -Name 'UpdateEndToEnd/InstallCrash/PreexistingEmptyRootKept' `
+                -Failure ((Format-T1Result -Result $rp.Result) + ' root існує=' + [IO.Directory]::Exists($p.Sb.Runtime) + ' файлів=' + $leftover.Count)
+        }
+
+        # ================================================================
+        # 16. Update поверх порушеної цілісності: blocker 33, без mutation
+        # ================================================================
+        & {
+            $sb = New-T1Sandbox -Name 'integrity-invalid' -Installed $releaseN
+            Write-T1File (Join-Path $sb.Runtime 'BRAVO_RUNTIME_GUARD.ps1') '# tampered guard'
+            $pre = Get-T1Snapshot -Sandbox $sb
+            $plan = (New-T1Plan -Sandbox $sb -Operation Update -Release $releaseN1).Plan
+            $integrity = @(@($plan.findings) | Where-Object { ([string]$_.id -ceq 'Preflight.RuntimeIntegrity') -and ([string]$_.severity -ceq 'Blocker') })
+            Test-BRAVOCondition -Condition (($integrity.Count -eq 1) -and ([int]$integrity[0].exitCodeHint -eq 33)) -Name 'UpdateEndToEnd/IntegrityInvalid/PlanBlocker33' -Failure ('blockers=' + ((Get-T1BlockerIds -Plan $plan) -join ','))
+            $worker = Invoke-T1Worker -Sandbox $sb -Plan $plan -SourcePath $releaseN1.Zip
+            Test-BRAVOCondition -Condition (($worker.Out.ExitCode -eq 33) -and (-not $worker.Result.mutationStarted) -and (@(Get-T1SnapshotDiff -Before $pre -After (Get-T1Snapshot -Sandbox $sb)).Count -eq 0) -and ((Get-T1JournalState -Sandbox $sb -Plan $plan) -ceq 'no-journal')) `
+                -Name 'UpdateEndToEnd/IntegrityInvalid/WorkerRefuses33NoMutation' -Failure (Format-T1Result -Result $worker.Result)
+        }
+
+        # ================================================================
         # 13. Legacy BRAVO.config: міграційний gate (30); site-файли недоторкані
         # ================================================================
         & {
