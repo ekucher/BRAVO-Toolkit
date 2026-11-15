@@ -3,7 +3,9 @@ param(
     [string]$RuntimeRoot = 'C:\Program Files\BRAVO-Toolkit',
     [string]$Tag = 'v5.2.4',
     [string]$ZipPath,
-    [string]$StagingRoot = 'C:\Temp\BRAVO_UPDATE',
+    # Застарілий (#545): staging завжди приватний (BRAVO.Deploy.Staging.ps1),
+    # значення ігнорується з попередженням. Параметр лишено для сумісності команд.
+    [string]$StagingRoot,
     [string]$BackupRoot,
     [switch]$PreflightOnly,
     [switch]$AllowPrereleaseChannel,
@@ -180,6 +182,15 @@ if (-not (Test-Path -LiteralPath $script:RollbackHelperPath -PathType Leaf)) {
         '). Без нього автоматичний відкат неможливий — скопіюйте весь каталог deploy\, а не один скрипт.')
 }
 . $script:RollbackHelperPath
+
+# Приватний staging (#545): каталог із захищеним DACL замість C:\Temp\BRAVO_UPDATE.
+# Fail-closed, як і гейт: без нього розпаковувати комплект нема куди.
+$script:StagingHelperPath = Join-Path $PSScriptRoot 'BRAVO.Deploy.Staging.ps1'
+if (-not (Test-Path -LiteralPath $script:StagingHelperPath -PathType Leaf)) {
+    throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1 (' + $script:StagingHelperPath +
+        '). Без нього комплект нема де безпечно розпакувати — скопіюйте весь каталог deploy\, а не один скрипт.')
+}
+. $script:StagingHelperPath
 
 # --- 0. Права й цілісність цілі --------------------------------------------
 
@@ -396,12 +407,21 @@ if ($PreflightOnly) {
 
 Write-Step ('3. Артефакт ' + $Tag)
 
-if (-not (Test-Path -LiteralPath $StagingRoot)) { [void](New-Item -ItemType Directory -Path $StagingRoot -Force) }
-$downloadDir = Join-Path $StagingRoot 'download'
+# Staging (#545): щоразу новий приватний каталог (лише Administrators і SYSTEM,
+# без успадкування) замість C:\Temp\BRAVO_UPDATE, який може створити й
+# контролювати звичайний користувач. Усе, що далі розпаковується й копіюється
+# в runtime, лежить лише тут.
+if (-not [string]::IsNullOrWhiteSpace($StagingRoot)) {
+    Write-Warn2 ('-StagingRoot ' + $StagingRoot + ' ігнорується: staging завжди приватний каталог ' +
+        'у $env:SystemRoot\Temp із захищеними правами (#545).')
+}
+$privateStagingRoot = Join-Path (Get-BRAVODeployPrivateDirectoryBase) ('BRAVO_UPDATE_' + [guid]::NewGuid().ToString('N'))
+New-BRAVODeployPrivateDirectory -Path $privateStagingRoot
+Write-Ok ('приватний staging: ' + $privateStagingRoot)
+$downloadDir = Join-Path $privateStagingRoot 'download'
 
 if ([string]::IsNullOrWhiteSpace($ZipPath)) {
-    if (Test-Path -LiteralPath $downloadDir) { Remove-Item -LiteralPath $downloadDir -Recurse -Force }
-    [void](New-Item -ItemType Directory -Path $downloadDir -Force)
+    [void](New-Item -ItemType Directory -Path $downloadDir)
     # TLS 1.2 не є дефолтом на серверах 2016 (ROADMAP P3.2a крок 1).
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -425,18 +445,29 @@ if ([string]::IsNullOrWhiteSpace($ZipPath)) {
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw ('Архів не знайдено: ' + $ZipPath) }
 }
 
-$shaFile = $ZipPath + '.sha256'
+# Супутні файли релізу (.sha256, release-manifest.json) — поруч із вихідним
+# архівом; читаються один раз, у пам'ять.
+$sourceZipPath = $ZipPath
+$sourceZipDirectory = Split-Path -Parent $sourceZipPath
+$shaFile = $sourceZipPath + '.sha256'
 if (-not (Test-Path -LiteralPath $shaFile -PathType Leaf)) {
     throw ('Немає файлу контрольної суми: ' + $shaFile + ' — покладіть його поруч із архівом.')
 }
 $expected = (((Get-Content -LiteralPath $shaFile -Raw).Trim()) -split '\s+')[0].ToLowerInvariant()
+
+# Архів оператора може лежати в каталозі, доступному іншим на запис. Тому SHA-256
+# рахується на копії в приватному staging, і розпаковується саме ця копія: між
+# перевіркою й розпакуванням підмінити байти нікому (#545).
+$ZipPath = Join-Path $privateStagingRoot (Split-Path -Leaf $sourceZipPath)
+if (-not [string]::Equals($sourceZipPath, $ZipPath, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $sourceZipPath -Destination $ZipPath
+}
 $actual = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($expected -ne $actual) { throw ('SHA-256 не збігається. очікувано=' + $expected + ' фактично=' + $actual) }
 Write-Ok ('sha256 ' + $actual)
 
-$staged = Join-Path $StagingRoot 'staged'
-if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
-Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged -Force
+$staged = Join-Path $privateStagingRoot 'staged'
+Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged
 
 $stagedVersion = (Get-Content -LiteralPath (Join-Path $staged 'VERSION.json') -Raw -Encoding UTF8 | ConvertFrom-Json)
 if ([string]$stagedVersion.packageVersion -ne $targetVersion) {
@@ -452,7 +483,7 @@ Write-Ok ('розпаковано: ' + $stagedVersion.packageVersion + ' / ' + $
 
 # Конвенція одна: release-manifest.json лежить поруч з архівом — і коли його
 # завантажив цей скрипт, і коли оператор приніс zip разом з ассетами релізу.
-$releaseManifestPath = Join-Path (Split-Path -Parent $ZipPath) 'release-manifest.json'
+$releaseManifestPath = Join-Path $sourceZipDirectory 'release-manifest.json'
 $releaseManifest = $null
 if (Test-Path -LiteralPath $releaseManifestPath -PathType Leaf) {
     try {
@@ -545,6 +576,17 @@ $excludeFiles = @('BRAVO.config', 'BRAVO.local.config', 'TOOLS_INTEGRITY.json',
                   'WinSCP.ini', 'BRAVO_OPERATION.lock')
 $excludeDirs  = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
 
+# Остання звірка ДО першої зміни runtime (#545): staged-дерево == RUNTIME_MANIFEST.json
+# комплекту (той самий критерій, що BRAVO_RUNTIME_GUARD після заміни). Файл,
+# змінений після SHA-256 архіву, зупиняє оновлення тут, а не гейтом після robocopy.
+$stagedIntegrity = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $staged `
+    -ManifestPath (Join-Path $staged 'RUNTIME_MANIFEST.json')
+if (-not $stagedIntegrity.IsMatch) {
+    throw ('Комплект у staging не збігається з власним RUNTIME_MANIFEST.json (' +
+        (@($stagedIntegrity.Problems) -join '; ') + '). Runtime не змінено. Візьміть комплект заново й повторіть запуск.')
+}
+Write-Ok 'staged-комплект звірено з RUNTIME_MANIFEST.json перед розгортанням'
+
 # З цього моменту runtime може бути змінено: будь-який збій далі = відкат.
 $script:DeployStarted = $true
 
@@ -624,6 +666,13 @@ Write-Host ('  backup: ' + $BackupRoot)
 Write-Host ''
 Write-Warn2 'Перевірте перший нічний прогін: і архівацію, і обслуговування.'
 Write-Warn2 ('Backup не видаляється автоматично — приберіть ' + $BackupRoot + ' після успішної доби.')
+# Приватний staging після успіху більше не потрібен (відкат користується ним лише
+# під час прогону). Збій прибирання не змінює результату оновлення.
+try {
+    Remove-Item -LiteralPath $privateStagingRoot -Recurse -Force -ErrorAction Stop
+} catch {
+    Write-Warn2 ('не вдалося прибрати приватний staging ' + $privateStagingRoot + ': ' + $_.Exception.Message)
+}
 exit 0
 } catch {
     Write-Host ''

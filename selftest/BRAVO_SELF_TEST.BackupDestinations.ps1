@@ -1788,10 +1788,14 @@ function robocopy.exe {
             (($node -is [Management.Automation.Language.CommandAst] -and $bdE2eAclWriteCommands -contains [string]$node.GetCommandName()) -or
              ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member.Extent.Text -match '^(?i)(Write\w*|Create\w*|Copy|Move|ExtractToDirectory)$')) -and
             $node.Extent.Text -match $bdE2eAclPrivatePattern }, $true) }))
-        if ($bdE2eAclCreates.Count -ne 1) {
-            $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory у головному try: $($bdE2eAclCreates.Count) викликів (очікувався рівно один)"
+        # #545: другий виклик — приватний staging ($installStagingRoot) у кроці 1;
+        # його порядок відносно запису закріплює Deploy/InstallerStagingPrivateBeforeFirstWrite.
+        $bdE2eAclStagingCreates = @($bdE2eAclCreates | Where-Object { $_.Extent.Text -match '(?i)-Path\s+\$installStagingRoot\b' })
+        $bdE2eAclVerifyCreates = @($bdE2eAclCreates | Where-Object { $_.Extent.Text -notmatch '(?i)-Path\s+\$installStagingRoot\b' })
+        if ($bdE2eAclStagingCreates.Count -ne 1 -or $bdE2eAclVerifyCreates.Count -ne 1) {
+            $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory у головному try: $($bdE2eAclCreates.Count) викликів (очікувалось рівно два: `$installStagingRoot і `$verifiedBundleRoot)"
         } else {
-            $bdE2eAclCreate = $bdE2eAclCreates[0]
+            $bdE2eAclCreate = $bdE2eAclVerifyCreates[0]
             if ($bdE2eAclCreate.Extent.Text -notmatch '(?i)-Path\s+\$verifiedBundleRoot\b') {
                 $bdE2eAclFailures += "New-BRAVOInstallPrivateDirectory не над `$verifiedBundleRoot: $($bdE2eAclCreate.Extent.Text)"
             }
