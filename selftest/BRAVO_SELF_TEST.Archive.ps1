@@ -3486,13 +3486,13 @@ Test-BRAVOCondition -Condition (
         # --- Атрибути ---
         $cfAttributeCases = @(
             @{ Value = 0x400000; Expected = $true }, @{ Value = 0x40000; Expected = $true },
-            @{ Value = (0x1000 -bor 0x400); Expected = $true }, @{ Value = 0x1000; Expected = $false },
+            @{ Value = (0x1000 -bor 0x400); Expected = $false }, @{ Value = 0x1000; Expected = $false },
             @{ Value = 0x80000; Expected = $false }, @{ Value = 0x100000; Expected = $false }, @{ Value = 0x20; Expected = $false })
         $cfAttributeWrong = @($cfAttributeCases | Where-Object { (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes ([long]$_.Value)) -ne $_.Expected } |
             ForEach-Object { '0x{0:X}' -f $_.Value })
         Test-BRAVOCondition -Condition ($cfAttributeWrong.Count -eq 0) `
             -Name 'Archive/CloudFilesPlaceholderAttributes' `
-            -Failure ("віртуальний файл = RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN або OFFLINE+reparse; PINNED/UNPINNED/OFFLINE без reparse — ні (#560). Хибно: $($cfAttributeWrong -join ', ')")
+            -Failure ("віртуальний файл = RECALL_ON_DATA_ACCESS або RECALL_ON_OPEN; OFFLINE+reparse (HSM/tiering/dedup), OFFLINE, PINNED, UNPINNED — ні (#560). Хибно: $($cfAttributeWrong -join ', ')")
 
         # --- Обхід джерела через shim атрибутів ---
         $cfUtf8 = New-Object System.Text.UTF8Encoding($false)
@@ -3520,6 +3520,18 @@ Test-BRAVOCondition -Condition (
             -not $cfStateFull.Truncated -and $cfStateFull.InaccessibleCount -eq 0
         ) -Name 'Archive/CloudFilesSourceStateCountsAndLists' `
           -Failure ("обхід джерела через .NET: віртуальні файли й каталоги рахуються, віртуальний каталог не відкривається, перелік обмежено -MaxListed (#560). count=$($cfState.PlaceholderCount) files=$($cfState.FilesScanned) list=[$(@($cfStateFull.Placeholders) -join '; ')] truncated=$($cfState.Truncated)")
+
+        # Корінь джерела сам віртуальний: знахідка '.' без відкриття каталогу
+        # (усередині лежить inside.txt — shim кидає, якщо його прочитати).
+        $cfVirtualRoot = Join-Path $cfSandbox 'cloudDir'
+        [void][IO.Directory]::CreateDirectory($cfVirtualRoot)
+        [IO.File]::WriteAllText((Join-Path $cfVirtualRoot 'inside.txt'), 'x', $cfUtf8)
+        $cfRootState = Get-BRAVOCloudFilesSourceState -Path ($cfVirtualRoot + '\*') -AttributeReader $cfReader
+        Test-BRAVOCondition -Condition (
+            $cfRootState.Exists -and $cfRootState.PlaceholderCount -eq 1 -and @($cfRootState.Placeholders) -contains '.' -and
+            $cfRootState.FilesScanned -eq 0 -and $cfRootState.InaccessibleCount -eq 0
+        ) -Name 'Archive/CloudFilesVirtualSourceRootNotEnumerated' `
+          -Failure ("віртуальний корінь джерела має бути знахідкою без GetFileSystemInfos() — інакше перелік запускає провайдер або падає під SYSTEM без знахідки (#560). count=$($cfRootState.PlaceholderCount) list=[$(@($cfRootState.Placeholders) -join '; ')] inaccessible=$($cfRootState.InaccessibleCount)")
 
         # --- Корені синхронізації з реєстру (HKCU-фікстура) ---
         $cfManager = Join-Path $cfRegistryRoot 'SyncRootManager'
@@ -3643,4 +3655,24 @@ Test-BRAVOCondition -Condition (
         $cfStageResults[0] -eq 'BRAVOEXCH/CLOUDFILES (CloudPlaceholdersInSource)' -and $cfStageResults[1] -eq 'MODEL/CREATE'
     ) -Name 'Health/ManifestFailedStageShowsReasonCode' `
       -Failure ("Health має показувати код причини з manifest поруч з етапом збою, а без коду — як раніше (#560): [$($cfStageResults -join ' | ')]")
+
+    # Фінальна подія Operations несе класифіковані причини компонентів.
+    $cfArchiveAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $cfReasonsAst = @($cfArchiveAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOArchiveComponentReasons' }, $true))
+    $cfReasons = @(& {
+        param([string]$FunctionText)
+        . ([scriptblock]::Create($FunctionText))
+        Get-BRAVOArchiveComponentReasons -Results @{
+            MODEL = @{ ArchiveSuccess = $true; ToolFailure = $null }
+            BRAVOEXCH = @{ ArchiveSuccess = $false; ToolFailure = [pscustomobject]@{ Tool = 'Cloud Files'; ReasonCode = 'CloudPlaceholdersInSource'; ReasonText = 'CloudPlaceholdersInSource: 3' } }
+            BLOG = @{ ArchiveSuccess = $false; ToolFailure = [pscustomobject]@{ Tool = '7-Zip'; ToolExitCodeText = '2'; ReasonText = '7-Zip код 2' } }
+        }
+    } $(if ($cfReasonsAst.Count -eq 1) { $cfReasonsAst[0].Extent.Text } else { 'function Get-BRAVOArchiveComponentReasons { @() }' }))
+    Test-BRAVOCondition -Condition (
+        $cfReasons.Count -eq 1 -and $cfReasons[0].component -eq 'BRAVOEXCH' -and $cfReasons[0].reasonCode -eq 'CloudPlaceholdersInSource' -and
+        $archiveScriptText.Contains('componentReasons = @(Get-BRAVOArchiveComponentReasons -Results $results)') -and
+        $archiveScriptText.Contains('-Details ("CloudPlaceholdersInSource: {0} віртуальних файлів" -f $cloudFinding.PlaceholderCount)') -and
+        $archiveScriptText.Contains('-Details $archiveStepReasonCode')
+    ) -Name 'Archive/OperationsEventCarriesComponentReasons' `
+      -Failure ("фінальна подія Operations має нести класифіковані причини компонентів (componentReasons), а крок архівації — код причини в Details; компоненти без коду не потрапляють у перелік (#560). reasons=$($cfReasons.Count)")
 }

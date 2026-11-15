@@ -3788,6 +3788,28 @@ function Invoke-BRAVOArchiveCloudPlaceholderPreflight {
     return @($findings.ToArray())
 }
 
+function Get-BRAVOArchiveComponentReasons {
+    # #560: {component; reasonCode; reason} для компонентів, чий збій має
+    # класифікований код причини (ToolFailure.ReasonCode). Порядок — за назвою.
+    param([hashtable]$Results)
+    $reasons = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Results) { return @() }
+    foreach ($componentName in @($Results.Keys | Sort-Object)) {
+        $componentEntry = $Results[$componentName]
+        if ($null -eq $componentEntry -or $componentEntry -isnot [System.Collections.IDictionary]) { continue }
+        if (-not $componentEntry.Contains('ToolFailure')) { continue }
+        $toolFailure = $componentEntry['ToolFailure']
+        if ($null -eq $toolFailure -or $null -eq $toolFailure.PSObject.Properties['ReasonCode']) { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$toolFailure.ReasonCode)) { continue }
+        $reasons.Add([ordered]@{
+            component = [string]$componentName
+            reasonCode = [string]$toolFailure.ReasonCode
+            reason = [string]$toolFailure.ReasonText
+        })
+    }
+    return @($reasons.ToArray())
+}
+
 function New-BRAVOArchiveCreationResult {
     # Створення й перевірка цілісності — ДВІ різні події, а не одна.
     # Раніше New-Archive повертав один bool на обидві, тому "архів створено,
@@ -9895,6 +9917,7 @@ function Main {
                 Write-BRAVOArchiveStep `
                     -Name ("Архівація {0}" -f $cloudFinding.Type) `
                     -Status 'ERROR' `
+                    -Details ("CloudPlaceholdersInSource: {0} віртуальних файлів" -f $cloudFinding.PlaceholderCount) `
                     -Duration ([timespan]::Zero)
                 Write-BRAVOOperatorReason `
                     -Reason ("CloudPlaceholdersInSource: у джерелі {0} віртуальних файлів Cloud Files (On-demand sync)" -f $cloudFinding.PlaceholderCount) `
@@ -10131,9 +10154,14 @@ function Main {
             } else {
                 'OK'
             }
+            # #560: код класифікованої причини збою 7-Zip — у Details кроку,
+            # тобто й в історії етапів фінальної події Operations.
+            $archiveStepReasonCode = $(if ($archiveStepStatus -eq 'ERROR' -and $null -ne $script:lastArchiveToolFailure -and
+                $null -ne $script:lastArchiveToolFailure.PSObject.Properties['ReasonCode']) { [string]$script:lastArchiveToolFailure.ReasonCode } else { '' })
             Write-BRAVOArchiveStep `
                 -Name ("Архівація {0}" -f $archive.Type) `
                 -Status $archiveStepStatus `
+                -Details $archiveStepReasonCode `
                 -Duration $archiveStepDuration
 
             # Component-деталі (docs/OPERATOR_CONSOLE_UX.md §2): показуються
@@ -11029,6 +11057,9 @@ function Main {
                 # $emptyDirs (BRAVO.Maintenance.Runtime.ps1). Спрацьовувало на кожному
                 # прогоні: подія в Operations не доходила взагалі.
                 stages = $script:BRAVOArchiveStepHistory.ToArray()
+                # #560: класифіковані причини збою компонентів (код і підказка),
+                # щоб сповіщення Operations несло причину навіть без Health.
+                componentReasons = @(Get-BRAVOArchiveComponentReasons -Results $results)
             }
         }
     } catch {

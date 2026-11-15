@@ -2799,15 +2799,16 @@ function Get-BRAVOCloudFilesSupport {
 
 function Test-BRAVOCloudFilesPlaceholderAttributes {
     # Віртуальний (не гідратований) файл чи каталог Cloud Files:
-    # RECALL_ON_DATA_ACCESS або RECALL_ON_OPEN, або OFFLINE разом із reparse
-    # point. PINNED/UNPINNED самі по собі не означають відсутності даних.
+    # RECALL_ON_DATA_ACCESS або RECALL_ON_OPEN. OFFLINE разом із reparse point
+    # сам по собі ознакою НЕ є: так само виглядають файли HSM / storage
+    # tiering / dedup інших постачальників, і політика Fail хибно вилучила б
+    # їх із бекапу (рев'ю #560). PINNED/UNPINNED — теж не ознака.
     [CmdletBinding()]
     [OutputType([bool])]
     param([Parameter(Mandatory = $true)][long]$Attributes)
 
     if (($Attributes -band 0x400000) -ne 0) { return $true }
     if (($Attributes -band 0x40000) -ne 0) { return $true }
-    if (($Attributes -band 0x1000) -ne 0 -and ($Attributes -band 0x400) -ne 0) { return $true }
     return $false
 }
 
@@ -2917,8 +2918,21 @@ function Get-BRAVOCloudFilesSourceState {
         }
     }
 
+    # Корінь джерела сам може бути віртуальним каталогом (джерело = корінь
+    # синхронізації або його підкаталог «лише онлайн»): його атрибути
+    # перевіряються ДО GetFileSystemInfos(), інакше перелік викликав би
+    # провайдер (гідратація) або впав би під SYSTEM без знахідки (рев'ю #560).
+    $rootInfo = New-Object System.IO.DirectoryInfo($rootPath)
+    $rootAttributes = [long](& $AttributeReader $rootInfo)
+    if (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes $rootAttributes) {
+        return [pscustomobject]@{
+            Path = $rootPath; Exists = $true; FilesScanned = 0; PlaceholderCount = 1
+            Placeholders = @('.'); Truncated = $false; InaccessibleCount = 0; SyncRootsInSource = $overlapping
+        }
+    }
+
     $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
-    $pending.Push((New-Object System.IO.DirectoryInfo($rootPath)))
+    $pending.Push($rootInfo)
     while ($pending.Count -gt 0) {
         $directory = $pending.Pop()
         try {

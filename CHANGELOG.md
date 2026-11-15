@@ -1,13 +1,13 @@
-# Changelog
+﻿# Changelog
 
 ## Не випущено (developer)
 
 - **Feat: виявлення віртуальних файлів Windows Cloud Files у джерелах бекапу й класифікація збоїв 7-Zip (#560,
   CF-01, фаза 1).** Клієнти синхронізації на Cloud Files API (Synology Drive, OneDrive, Google Drive, Dropbox) у
   режимі On-demand лишають у джерелі віртуальні файли («лише онлайн»: `RECALL_ON_DATA_ACCESS` 0x400000 /
-  `RECALL_ON_OPEN` 0x40000, `OFFLINE` + reparse). 7-Zip від SYSTEM із VSS-знімка не може прочитати їх без запущеного
+  `RECALL_ON_OPEN` 0x40000). 7-Zip від SYSTEM із VSS-знімка не може прочитати їх без запущеного
   клієнта й завершувався кодом 2 без зрозумілої причини. BRAVO_ARCHIV тепер до VSS і 7-Zip обходить джерело
-  MODEL/BLOG/BRAVOEXCH явно через .NET (вміст не читається, гідратація не запускається). Нове site-налаштування
+  MODEL/BLOG/BRAVOEXCH явно через .NET (вміст не читається, гідратація не запускається; віртуальний каталог, зокрема сам корінь джерела, не відкривається). `OFFLINE` + reparse без `RECALL_ON_*` (HSM, storage tiering, dedup) віртуальним файлом не вважається. Нове site-налаштування
   `backupConsistency.CloudPlaceholderPolicy` (`ALLOW_WITH_VALIDATOR`, `Fail` | `Warn`, дефолт `Fail`): `Fail` — компонент
   не архівується (етап `CLOUDFILES`, причина `CloudPlaceholdersInSource`, кількість і перші 20 файлів у журналі,
   рядок причини в консолі й «РЕЗУЛЬТАТ», `ReasonCode` у manifest generation, решта компонентів архівується —
@@ -15,7 +15,7 @@
   `HKLM\...\Explorer\SyncRootManager`, що перетинається з джерелом, — WARNING. Відомий stderr 7-Zip класифікується в код
   причини з підказкою замість голого «код 2»: `CloudFilesProviderUnavailable` (`The cloud file provider is not running`),
   `SourceAccessDenied`, `SourceFileLocked`, `SourcePathTooLong` (з російськими/українськими формами системних
-  текстів); код потрапляє в журнал, «РЕЗУЛЬТАТ» і manifest. Health показує код причини поруч з етапом збою generation
+  текстів); код потрапляє в журнал, «РЕЗУЛЬТАТ», manifest і фінальну подію Operations (`componentReasons`, а також `details` кроку архівації). Health показує код причини поруч з етапом збою generation
   (`BRAVOEXCH/CLOUDFILES (CloudPlaceholdersInSource)`) і попереджає про корінь On-demand у джерелі бекапу;
   `BRAVO_TASKS_DIAGNOSE.ps1` має розділ `=== CLOUD FILES У ДЖЕРЕЛАХ БЕКАПУ ===` (лише читання). На Windows без Cloud Files
   API (до Windows 10 1709, зокрема Windows 7 / Server 2016) перевірка пропускається з INFO. Нові функції — у
