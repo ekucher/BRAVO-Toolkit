@@ -464,6 +464,15 @@ if (-not (Test-Path -LiteralPath $script:ReleaseGatePath -PathType Leaf)) {
 }
 . $script:ReleaseGatePath
 
+# Звірка staged-дерева з перевіреним архівом перед першим записом у каталог
+# інсталяції (#545) — спільна з Update-BRAVOServer.ps1. Fail-closed, як і гейт.
+$script:StagingHelperPath = Join-Path $PSScriptRoot 'BRAVO.Deploy.Staging.ps1'
+if (-not (Test-Path -LiteralPath $script:StagingHelperPath -PathType Leaf)) {
+    throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1 (' + $script:StagingHelperPath +
+        '). Без нього staged-комплект нема чим звірити з архівом — скопіюйте весь каталог deploy\, а не один скрипт.')
+}
+. $script:StagingHelperPath
+
 # --- 0. Передумови ----------------------------------------------------------
 
 Write-Step '0. Передумови'
@@ -885,9 +894,18 @@ if ($null -ne $freeBytes) {
 
 Write-Step '3. Розгортання'
 
-# Остання звірка ДО першого запису в каталог інсталяції (#545): staged-дерево ==
-# RUNTIME_MANIFEST.json комплекту. Файл, змінений після SHA-256 архіву,
-# зупиняє інсталяцію тут, а не гейтом кроку 5 після копіювання.
+# Остання звірка ДО першого запису в каталог інсталяції (#545). Спершу
+# staged-дерево == усі записи перевіреної копії архіву (кожен файл, який
+# скопіює robocopy, будь-якого розширення), далі — RUNTIME_MANIFEST.json
+# комплекту. Файл, змінений після SHA-256 архіву, зупиняє інсталяцію тут, а не
+# гейтом кроку 5 після копіювання.
+$stagedArchiveMatch = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $ZipPath -StagedRoot $staged
+if (-not $stagedArchiveMatch.IsMatch) {
+    throw ('Staged-комплект не збігається з перевіреним архівом (' +
+        (@($stagedArchiveMatch.Problems | Select-Object -First 10) -join '; ') +
+        $(if (@($stagedArchiveMatch.Problems).Count -gt 10) { '; ...' } else { '' }) +
+        '). Нічого не розгорнуто. Візьміть комплект заново й повторіть запуск.')
+}
 Assert-BRAVOInstallBundleIntegrity -BundleRoot $staged -BeforeDeploy
 
 # Явний профіль (#434): BRAVO.local.config, перевірений у кроці 1, мусить

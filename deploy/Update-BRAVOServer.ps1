@@ -576,9 +576,18 @@ $excludeFiles = @('BRAVO.config', 'BRAVO.local.config', 'TOOLS_INTEGRITY.json',
                   'WinSCP.ini', 'BRAVO_OPERATION.lock')
 $excludeDirs  = @('LOGS', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA', 'BAZA_WWW', 'artifacts')
 
-# Остання звірка ДО першої зміни runtime (#545): staged-дерево == RUNTIME_MANIFEST.json
-# комплекту (той самий критерій, що BRAVO_RUNTIME_GUARD після заміни). Файл,
-# змінений після SHA-256 архіву, зупиняє оновлення тут, а не гейтом після robocopy.
+# Остання звірка ДО першої зміни runtime (#545). Спершу staged-дерево == усі
+# записи перевіреної копії архіву: кожен файл, який скопіює robocopy, будь-якого
+# розширення. Далі — RUNTIME_MANIFEST.json комплекту (той самий критерій, що
+# BRAVO_RUNTIME_GUARD після заміни). Файл, змінений після SHA-256 архіву,
+# зупиняє оновлення тут, а не гейтом після robocopy.
+$stagedArchiveMatch = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $ZipPath -StagedRoot $staged
+if (-not $stagedArchiveMatch.IsMatch) {
+    throw ('Staged-комплект не збігається з перевіреним архівом (' +
+        (@($stagedArchiveMatch.Problems | Select-Object -First 10) -join '; ') +
+        $(if (@($stagedArchiveMatch.Problems).Count -gt 10) { '; ...' } else { '' }) +
+        '). Runtime не змінено. Візьміть комплект заново й повторіть запуск.')
+}
 $stagedIntegrity = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $staged `
     -ManifestPath (Join-Path $staged 'RUNTIME_MANIFEST.json')
 if (-not $stagedIntegrity.IsMatch) {

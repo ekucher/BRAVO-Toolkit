@@ -6901,6 +6901,8 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
             [IO.File]::Exists($stgHelperPath) -and
             $stgUpdaterText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Staging.ps1'") -and
             $stgUpdaterText.Contains("throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1") -and
+            $stgInstallerText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Staging.ps1'") -and
+            $stgInstallerText.Contains("throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1") -and
             -not ($stgUpdaterText -match '(?i)''C:\\Temp\\BRAVO_') -and
             -not ($stgInstallerText -match '(?i)''C:\\Temp\\BRAVO_')
         ) `
@@ -6960,14 +6962,67 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
     $stgInstallerCheck = $stgInstallerText.IndexOf('Assert-BRAVOInstallBundleIntegrity -BundleRoot $staged -BeforeDeploy')
     $stgInstallerMkdir = $stgInstallerText.IndexOf('[void](New-Item -ItemType Directory -Path $RuntimeRoot -Force)')
     $stgInstallerCopy = $stgInstallerText.IndexOf('& robocopy.exe $staged $RuntimeRoot')
+    # Звірка з УСІМА записами перевіреної копії архіву (а не лише з маніфестом:
+    # він не охоплює .json/.md/.config, які robocopy теж копіює) і відмова за розбіжності.
+    $stgArchiveCall = '$stagedArchiveMatch = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $ZipPath -StagedRoot $staged'
+    $stgArchiveThrow = 'if (-not $stagedArchiveMatch.IsMatch) {'
+    $stgUpdaterArchive = $stgUpdaterText.IndexOf($stgArchiveCall)
+    $stgUpdaterArchiveThrow = $stgUpdaterText.IndexOf($stgArchiveThrow)
+    $stgInstallerArchive = $stgInstallerText.IndexOf($stgArchiveCall)
+    $stgInstallerArchiveThrow = $stgInstallerText.IndexOf($stgArchiveThrow)
+    $stgUpdaterExpand = $stgUpdaterText.IndexOf('Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged')
+    $stgInstallerExpand = $stgInstallerText.IndexOf('Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged')
     Test-BRAVOCondition `
         -Condition (
             $stgUpdaterCheck -ge 0 -and $stgUpdaterCheck -lt $stgUpdaterThrow -and $stgUpdaterThrow -lt $stgUpdaterFlag -and
             $stgUpdaterFlag -lt $stgUpdaterDeploy -and $stgUpdaterBackup -lt $stgUpdaterCheck -and
-            $stgInstallerCheck -ge 0 -and $stgInstallerCheck -lt $stgInstallerMkdir -and $stgInstallerCheck -lt $stgInstallerCopy
+            $stgUpdaterArchive -gt $stgUpdaterExpand -and $stgUpdaterArchive -lt $stgUpdaterArchiveThrow -and $stgUpdaterArchiveThrow -lt $stgUpdaterFlag -and
+            $stgInstallerCheck -ge 0 -and $stgInstallerCheck -lt $stgInstallerMkdir -and $stgInstallerCheck -lt $stgInstallerCopy -and
+            $stgInstallerArchive -gt $stgInstallerExpand -and $stgInstallerArchive -lt $stgInstallerArchiveThrow -and
+            $stgInstallerArchiveThrow -lt $stgInstallerMkdir -and $stgInstallerArchiveThrow -lt $stgInstallerCopy
         ) `
         -Name 'Deploy/StagedTreeVerifiedBeforeFirstRuntimeChange' `
-        -Failure 'staged-дерево має звірятися з RUNTIME_MANIFEST.json комплекту до першої зміни runtime: в оновлювачі — Test-BRAVODeployRuntimeMatchesManifest до DeployStarted і robocopy, в інсталяторі — Assert-BRAVOInstallBundleIntegrity -BeforeDeploy до створення каталогу й robocopy (#545)'
+        -Failure 'staged-дерево має звірятися з усіма записами перевіреної копії архіву (Test-BRAVODeployStagedTreeMatchesArchive) і з RUNTIME_MANIFEST.json до першої зміни runtime: в оновлювачі — до DeployStarted і robocopy, в інсталяторі — до створення каталогу й robocopy (#545)'
+
+    # Поведінка звірки з архівом: файл поза RUNTIME_MANIFEST.json (.md), змінений
+    # після хешування, зайвий і відсутній файл — відмова; чисте розпакування — збіг.
+    $stgZipSandbox = Join-Path ([IO.Path]::GetTempPath()) ('bravo_stg545zip_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $stgArchiveResults = & {
+            param([string]$HelperPath, [string]$Sandbox)
+            . $HelperPath
+            $utf8 = New-Object System.Text.UTF8Encoding($false)
+            $source = Join-Path $Sandbox 'source'
+            [void][IO.Directory]::CreateDirectory((Join-Path $source 'docs'))
+            [IO.File]::WriteAllText((Join-Path $source 'BRAVO_A.ps1'), "'a'", $utf8)
+            [IO.File]::WriteAllText((Join-Path $source 'docs\NOTES.md'), 'notes', $utf8)
+            [IO.File]::WriteAllText((Join-Path $source 'VERSION.json'), '{}', $utf8)
+            $zip = Join-Path $Sandbox 'bundle.zip'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($source, $zip)
+            $staged = Join-Path $Sandbox 'staged'
+            Expand-Archive -LiteralPath $zip -DestinationPath $staged
+            $out = [ordered]@{}
+            $out.Clean = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $zip -StagedRoot $staged
+            [IO.File]::WriteAllText((Join-Path $staged 'docs\NOTES.md'), 'tampered', $utf8)
+            [IO.File]::WriteAllText((Join-Path $staged 'EXTRA.config'), 'x', $utf8)
+            [IO.File]::Delete((Join-Path $staged 'VERSION.json'))
+            $out.Tampered = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $zip -StagedRoot $staged
+            return [pscustomobject]$out
+        } $stgHelperPath $stgZipSandbox
+        $stgTamperedProblems = @($stgArchiveResults.Tampered.Problems)
+        Test-BRAVOCondition `
+            -Condition (
+                $stgArchiveResults.Clean.IsMatch -and -not $stgArchiveResults.Tampered.IsMatch -and
+                $stgTamperedProblems -contains 'змінено після перевірки архіву: docs/NOTES.md' -and
+                $stgTamperedProblems -contains 'файла немає в архіві: EXTRA.config' -and
+                $stgTamperedProblems -contains 'відсутній у staging: VERSION.json'
+            ) `
+            -Name 'Deploy/StagedTreeMatchesArchiveCoversEveryFile' `
+            -Failure ("звірка staged-дерева з архівом має охоплювати кожен файл будь-якого розширення: змінений .md, зайвий і відсутній файл — відмова (#545). clean=[$(@($stgArchiveResults.Clean.Problems) -join '; ')] tampered=[$($stgTamperedProblems -join '; ')]")
+    } finally {
+        if (Test-Path -LiteralPath $stgZipSandbox) { Remove-Item -LiteralPath $stgZipSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 
     # Поведінка тієї самої звірки: файл, змінений після хешування, і сторонній скрипт.
     . (Join-Path $stgDeployRoot 'BRAVO.Deploy.Rollback.ps1')

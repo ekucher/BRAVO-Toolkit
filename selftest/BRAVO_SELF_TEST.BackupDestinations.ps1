@@ -895,6 +895,8 @@ Test-BRAVOCondition -Condition (
     try {
         [void](New-Item -ItemType Directory -Path $bdE2eRoot -Force)
         Copy-Item -LiteralPath (Join-Path $root 'deploy\BRAVO.Deploy.ReleaseGate.ps1') -Destination $bdE2eRoot -Force
+        # #545: звірка staged-дерева з архівом — спільний helper поруч з інсталятором.
+        Copy-Item -LiteralPath (Join-Path $root 'deploy\BRAVO.Deploy.Staging.ps1') -Destination $bdE2eRoot -Force
 
         # --- Дочірній скрипт: реальні оператори інсталятора до кроку 5 ---
         $bdE2eMainTry = @($bdInstallAst.EndBlock.Statements | Where-Object {
