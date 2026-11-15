@@ -113,6 +113,13 @@ $script:BRAVOConfigurationSchemaUndeterminedLeaf = @{
     # Дефолт @() (канонічно порожній перелік виключених дисків) не несе
     # жодного елемента, з якого можна вивести рід.
     'maintenanceSettings.Limits.ExcludedDrives' = @{ Kind = 'Array'; ElementKind = 'String' }
+
+    # #561: списки виключень з архівації й SFTP-синхронізації BAZA — дефолт @().
+    'componentSettings.Archive.Exclusions.MODEL'             = @{ Kind = 'Array'; ElementKind = 'String' }
+    'componentSettings.Archive.Exclusions.BLOG'              = @{ Kind = 'Array'; ElementKind = 'String' }
+    'componentSettings.Archive.Exclusions.BRAVOEXCH'         = @{ Kind = 'Array'; ElementKind = 'String' }
+    'componentSettings.Synchronization.Exclusions.BAZA_APP'  = @{ Kind = 'Array'; ElementKind = 'String' }
+    'componentSettings.Synchronization.Exclusions.BAZA_WWW'  = @{ Kind = 'Array'; ElementKind = 'String' }
 }
 
 function Get-BRAVOConfigurationSchemaValueKind {
@@ -655,6 +662,9 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'bravoSettings.NotificationRouting.WARNING' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
     'componentSettings.Archive.BLOG' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Archive.BRAVOEXCH' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Archive.Exclusions.MODEL' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
+    'componentSettings.Archive.Exclusions.BLOG' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
+    'componentSettings.Archive.Exclusions.BRAVOEXCH' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
     'componentSettings.Archive.MODEL' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.ArchiveLogUploadEnabled' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.SFTP.ArchiveUpload' = @{ Class = 'ALLOW_SITE' }
@@ -667,6 +677,8 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'componentSettings.Synchronization.BAZA_APP_SFTP' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_WWW_LOCAL' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_WWW_SFTP' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Synchronization.Exclusions.BAZA_APP' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
+    'componentSettings.Synchronization.Exclusions.BAZA_WWW' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
     'consoleSettings.BackgroundColor' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.ClearOnStart' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.ConsoleLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
@@ -1260,6 +1272,74 @@ function Test-BRAVOConfigurationAuthorizationOptionalUrl {
     return [pscustomobject]@{ IsValid = $true; Message = $null }
 }
 
+function Test-BRAVOExclusionPattern {
+    # #561: один елемент списку виключень (архівація 7-Zip, SFTP-синхронізація
+    # BAZA). Дозволено лише ім'я або відносний шаблон із '*' і '?'; роздільник
+    # сегментів — '\' або '/'. Повертає $null для допустимого значення або
+    # причину відмови (БЕЗ самого значення: воно з site-конфігу й не
+    # повторюється в журналі). Правило одне для валідатора конфігурації й для
+    # повторної перевірки в runtime перед передачею в 7-Zip / WinSCP.
+    #
+    # Відхиляються форми, що можуть стати аргументом інструмента чи змінити
+    # його розбір: абсолютний шлях (\x, /x, X:...), '..', порожній сегмент,
+    # кінцевий роздільник, керівні символи, пробіл на краях, лапки й `,
+    # префікси '-', '@', '!' (ключі 7-Zip, list-файл, заперечення), а також
+    # метасимволи масок WinSCP і списків ('|', ';', ',', '<', '>', '[', ']',
+    # ':', '=', а також '%' — підстановка змінних у скриптах WinSCP) — кома,
+    # крім того, роздільник списку в Configurator.
+    [CmdletBinding()]
+    param([AllowNull()]$Pattern)
+
+    if ($Pattern -isnot [string]) { return 'елемент має бути рядком' }
+    if ($Pattern.Length -eq 0) { return 'порожній елемент' }
+    if ($Pattern.Length -gt 200) { return 'елемент довший за 200 символів' }
+    if ($Pattern -ne $Pattern.Trim()) { return 'пробіл на початку чи в кінці елемента' }
+    foreach ($character in $Pattern.ToCharArray()) {
+        $code = [int]$character
+        if ($code -lt 0x20 -or $code -eq 0x7F) { return 'керівний символ' }
+    }
+    # '%' — підстановка змінних у скриптах WinSCP (рев'ю worker-а #561).
+    if ($Pattern.IndexOfAny([char[]]@('"', "'", '`', '|', ';', ',', '<', '>', '[', ']', ':', '=', '%')) -ge 0) {
+        return 'заборонений символ (лапки, ` | ; , < > [ ] : = %)'
+    }
+    if ($Pattern[0] -eq '-' -or $Pattern[0] -eq '@' -or $Pattern[0] -eq '!') {
+        return "елемент не може починатися з '-', '@' чи '!' (схоже на аргумент інструмента)"
+    }
+    if ($Pattern[0] -eq '\' -or $Pattern[0] -eq '/') { return 'абсолютний шлях' }
+    if ($Pattern.EndsWith('\') -or $Pattern.EndsWith('/')) { return 'кінцевий роздільник шляху' }
+    foreach ($segment in ($Pattern -split '[\\/]')) {
+        if ($segment.Length -eq 0) { return 'порожній сегмент шляху' }
+        if ($segment -eq '..' -or $segment -eq '.') { return "сегмент '.' чи '..'" }
+        if ($segment -ne $segment.Trim()) { return 'пробіл на краю сегмента' }
+    }
+    return $null
+}
+
+function Test-BRAVOConfigurationAuthorizationExclusionPatternList {
+    # #561: масив шаблонів виключень; кожен елемент — Test-BRAVOExclusionPattern.
+    # Порожній масив — допустимий (дефолт: поведінка не змінюється). Перше
+    # порушення — з точним індексом, без повторення значення.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [System.Collections.IEnumerable] -or $Value -is [string]) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: очікується масив шаблонів виключень (@('*.tmp', 'desktop.ini'))." }
+    }
+    $index = 0
+    foreach ($item in $Value) {
+        $problem = Test-BRAVOExclusionPattern -Pattern $item
+        if ($null -ne $problem) {
+            return [pscustomobject]@{ IsValid = $false; Message = ('{0}[{1}]: {2}. Дозволено лише ім''я або відносний шаблон із * і ?.' -f $Path, $index, $problem) }
+        }
+        $index++
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = '' }
+}
+
 function Test-BRAVOConfigurationAuthorizationUrlArray {
     # Кожен елемент — абсолютний URL з дозволеною схемою (http/https).
     # Масив як ціле не перевіряється по-елементно за схожими родами —
@@ -1564,6 +1644,7 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
         'TaskSchedulerPath'  { return Test-BRAVOConfigurationAuthorizationTaskSchedulerPath -Value $Value -Path $Path }
         'NonEmptyString'     { return Test-BRAVOConfigurationAuthorizationNonEmptyString -Value $Value -Path $Path }
         'SshHostKeyFingerprint' { return Test-BRAVOConfigurationAuthorizationSshHostKeyFingerprint -Value $Value -Path $Path }
+        'ExclusionPatternList' { return Test-BRAVOConfigurationAuthorizationExclusionPatternList -Value $Value -Path $Path }
         default {
             throw "Схема авторизації конфігурації: невідомий ідентифікатор валідатора '$ValidatorId' для '$Path' — це дефект реєстру схеми, не значення оператора."
         }
@@ -1959,6 +2040,7 @@ function Get-BRAVOConfigurationSchemaVersionDeclarationLine {
 
 Export-ModuleMember -Function @(
     'Get-BRAVOConfigurationSchema',
+    'Test-BRAVOExclusionPattern',
     'Test-BRAVOConfigurationOverrideSchema',
     'Get-BRAVOConfigurationSchemaVersionContract',
     'Resolve-BRAVOConfigurationSchemaVersion',

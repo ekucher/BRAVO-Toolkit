@@ -3174,11 +3174,56 @@ function Test-BAZAPendingSynchronizationOverdue {
     return $pendingAge.TotalHours -ge $alertAfterHours
 }
 
+function Get-BAZAHealthExclusionFailure {
+    # #561: повторна перевірка шаблонів виключень перед передачею в WinSCP
+    # (fail closed). $null — усі допустимі; інакше результат порівняння з
+    # помилкою у форматі, який уже розуміють виклики Invoke-WinSCPBAZAComparison*.
+    param([string[]]$Exclusions = @())
+
+    foreach ($exclusionPattern in @($Exclusions)) {
+        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        if ($null -ne $exclusionProblem) {
+            return [pscustomobject]@{
+                Success = $false
+                Error = "недопустимий шаблон виключення '$exclusionPattern': $exclusionProblem"
+                DifferenceCount = $null
+                SizeBytes = $null
+                OldestLastWriteTime = $null
+                ActionCounts = $null
+                IgnoredActionCounts = $null
+                Details = @()
+            }
+        }
+    }
+    return $null
+}
+
+function Get-BAZAHealthComponentExclusions {
+    # #561: виключення компонента з результату Get-BRAVOBazaSettingsEffective
+    # (єдина точка для Archive/Health/DryRun). Відсутня властивість —
+    # порожній список, без винятку під StrictMode.
+    param(
+        [AllowNull()][object]$Settings,
+        [Parameter(Mandatory = $true)][string]$ComponentKey
+    )
+    if ($null -eq $Settings) { return @() }
+    $exclusionsProperty = $Settings.PSObject.Properties['Exclusions']
+    if ($null -eq $exclusionsProperty -or $null -eq $exclusionsProperty.Value) { return @() }
+    $componentProperty = $exclusionsProperty.Value.PSObject.Properties[$ComponentKey]
+    if ($null -eq $componentProperty -or $null -eq $componentProperty.Value) { return @() }
+    return @(@($componentProperty.Value) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) } | ForEach-Object { [string]$_ })
+}
+
 function Invoke-WinSCPBAZAComparisonViaCli {
     param(
         [string]$LocalPath,
-        [string]$RemotePath
+        [string]$RemotePath,
+        # #561: виключення компонента. Порожньо — команда та сама, що раніше.
+        [string[]]$Exclusions = @()
     )
+
+    $exclusionFailure = Get-BAZAHealthExclusionFailure -Exclusions $Exclusions
+    if ($null -ne $exclusionFailure) { return $exclusionFailure }
 
     try {
         $previewOptions = [string]$backupMonitoring.SFTP.BAZAPreviewOptions
@@ -3189,9 +3234,15 @@ function Invoke-WinSCPBAZAComparisonViaCli {
             $previewOptions = "-preview $previewOptions".Trim()
         }
 
-        $command = "synchronize remote $previewOptions {0} {1}" -f `
+        # #561: -filemask — окремий ключ у лапках (не частина BAZAPreviewOptions)
+        # і лише для непорожнього списку. Передається аргументом {2}, а не
+        # вставляється в шаблон -f: у шаблоні фігурні дужки маски зламали б форматування.
+        $exclusionMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns $Exclusions
+        $filemaskToken = if ([string]::IsNullOrEmpty($exclusionMask)) { '' } else { ' -filemask="' + $exclusionMask + '"' }
+        $command = "synchronize remote $previewOptions{2} {0} {1}" -f `
             (ConvertTo-WinSCPScriptArgument $LocalPath), `
-            (ConvertTo-WinSCPScriptArgument $RemotePath)
+            (ConvertTo-WinSCPScriptArgument $RemotePath), `
+            $filemaskToken
         $sessionResult = Invoke-WinSCPHealthSession -Commands @($command)
         if (-not $sessionResult.Success) {
             throw [string]$sessionResult.Error
@@ -3381,8 +3432,15 @@ function Invoke-WinSCPBAZAComparisonViaCli {
 function Invoke-WinSCPBAZAComparison {
     param(
         [string]$LocalPath,
-        [string]$RemotePath
+        [string]$RemotePath,
+        # #561: виключення компонента. Порожньо — порівняння як раніше
+        # (CompareDirectories з $null-опціями, CLI без -filemask).
+        [string[]]$Exclusions = @()
     )
+
+    # Fail closed ДО будь-якого WinSCP-виклику (і .NET, і CLI-fallback).
+    $exclusionFailure = Get-BAZAHealthExclusionFailure -Exclusions $Exclusions
+    if ($null -ne $exclusionFailure) { return $exclusionFailure }
 
     $components = Get-BRAVOWinSCPDotNetComponents `
         -WinSCPAssemblyPath ([string]$winSCPAssemblyPath) `
@@ -3394,7 +3452,8 @@ function Invoke-WinSCPBAZAComparison {
         ) -Level "INFO"
         return Invoke-WinSCPBAZAComparisonViaCli `
             -LocalPath $LocalPath `
-            -RemotePath $RemotePath
+            -RemotePath $RemotePath `
+            -Exclusions $Exclusions
     }
 
     $session = $null
@@ -3444,6 +3503,16 @@ function Invoke-WinSCPBAZAComparison {
             }
         }
 
+        # #561: маска виключень лише для непорожнього списку; діє на обидві
+        # сторони порівняння (виключений файл не стає ні «відсутнім у хмарі»,
+        # ні «зайвим»). Без виключень — $null, як раніше.
+        $compareTransferOptions = $null
+        $exclusionMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns $Exclusions
+        if (-not [string]::IsNullOrEmpty($exclusionMask)) {
+            $compareTransferOptions = New-Object WinSCP.TransferOptions
+            $compareTransferOptions.FileMask = $exclusionMask
+        }
+
         # CompareDirectories є read-only еквівалентом synchronize -preview
         # і повертає структуровану колекцію запланованих змін.
         $comparison = @(
@@ -3454,7 +3523,7 @@ function Invoke-WinSCPBAZAComparison {
                 $removeFiles,
                 $mirror,
                 $criteria,
-                $null
+                $compareTransferOptions
             )
         )
 
@@ -3547,7 +3616,8 @@ function Invoke-WinSCPBAZAComparison {
         ) -Level "WARNING"
         $fallbackResult = Invoke-WinSCPBAZAComparisonViaCli `
             -LocalPath $LocalPath `
-            -RemotePath $RemotePath
+            -RemotePath $RemotePath `
+            -Exclusions $Exclusions
         if (-not $fallbackResult.Success) {
             $fallbackResult.Error =
                 ".NET: $dotNetError; WinSCP.com: $($fallbackResult.Error)"
@@ -3830,6 +3900,9 @@ function Get-SFTPHealthIssues {
             # тихо пишуть/читають ДВА РІЗНІ файли стану того самого
             # компонента.
             $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+            # #561: виключення компонента з тієї самої canonical точки; ними ж
+            # фільтрується і fallback-сесія, і підрахунок «нових після cutoff».
+            $healthComponentExclusions = @(Get-BAZAHealthComponentExclusions -Settings $bazaSettingsEffective -ComponentKey ([string]$folderCheck.ComponentKey))
             $bazaSyncResult = $null
             if ($null -ne $script:bazaSyncResults -and
                 $script:bazaSyncResults.ContainsKey($folderCheck.ComponentKey)) {
@@ -3870,13 +3943,15 @@ function Get-SFTPHealthIssues {
                         -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
                         -MutationPolicy $bazaSettingsEffective.MutationPolicy `
                         -AutoArchiveMutationThreshold $bazaSettingsEffective.AutoArchiveMutationThreshold `
-                        -WriteCheckpoint
+                        -WriteCheckpoint `
+                        -Exclusions $healthComponentExclusions
                 }
             }
             $bazaSyncResult = Update-BRAVOBazaSyncResultNewAfterCutoff `
                 -SyncResult $bazaSyncResult `
                 -LocalDirectory $folderCheck.LocalPath `
-                -StateRoot $bazaSettingsEffective.StateRoot
+                -StateRoot $bazaSettingsEffective.StateRoot `
+                -Exclusions $healthComponentExclusions
             $fastHealthResult = Get-BRAVOBazaFastHealthResult -SyncResult $bazaSyncResult
             if (-not $fastHealthResult.Healthy) {
                 $issues += [pscustomobject]@{
@@ -3900,9 +3975,26 @@ function Get-SFTPHealthIssues {
                 }
             }
         } else {
-            $previewSummary = Invoke-WinSCPBAZAComparison `
-                -LocalPath $folderCheck.LocalPath `
-                -RemotePath $folderCheck.RemotePath
+            # #561: Legacy-режим — повне порівняння з тією самою маскою
+            # виключень. Невалідний шаблон чи збій резолвера — не виконана
+            # перевірка (fail closed), а не порівняння без виключень.
+            $legacyHealthExclusions = @()
+            $legacyHealthExclusionError = $null
+            try {
+                $legacyHealthExclusions = @(Get-BAZAHealthComponentExclusions `
+                    -Settings (Get-BRAVOBazaSettingsEffective) `
+                    -ComponentKey ([string]$folderCheck.ComponentKey))
+            } catch {
+                $legacyHealthExclusionError = $_.Exception.Message
+            }
+            $previewSummary = if ($null -ne $legacyHealthExclusionError) {
+                [pscustomobject]@{ Success = $false; Error = "виключення синхронізації відхилено: $legacyHealthExclusionError" }
+            } else {
+                Invoke-WinSCPBAZAComparison `
+                    -LocalPath $folderCheck.LocalPath `
+                    -RemotePath $folderCheck.RemotePath `
+                    -Exclusions $legacyHealthExclusions
+            }
 
             if (-not $previewSummary.Success) {
                 $issues += [pscustomobject]@{

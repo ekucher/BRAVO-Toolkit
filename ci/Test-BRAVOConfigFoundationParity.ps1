@@ -506,6 +506,10 @@ $knownIntentionalDiffPrefixes = @(
     # каталог призначення, обидва адитивні ключі; у BEFORE (42cf9ad) не існує.
     'componentSettings.SFTP.RuntimeLogSyncEnabled',
     'sftpDirectories.RuntimeLogs',
+    # #561 (виключення) — нові вкладені вузли зі списками-масивами (дефолт
+    # @(), поведінка не змінюється); у BEFORE (42cf9ad) не існує.
+    'componentSettings.Archive.Exclusions',
+    'componentSettings.Synchronization.Exclusions',
     # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
     # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
     # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy

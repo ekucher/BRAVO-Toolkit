@@ -2355,7 +2355,7 @@
             # Приватний (module-scope, НЕ exported) двійник Get-BAZASFTPComparison
             # -- рівно та сама видимість, що в production runtime.
             function Get-BAZASFTPComparison {
-                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey)
+                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey, [string[]]$Exclusions = @())
                 $script:HR7ProviderProbe.Invoked++
                 $script:HR7ProviderProbe.Url = $RepositorySFTPUrl
                 $script:HR7ProviderProbe.HostKey = $HostKey
@@ -2423,7 +2423,7 @@
             param($Probe, $LocalDirectory)
             $script:HR7ProviderProbe = $Probe
             function Get-BAZASFTPComparison {
-                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey)
+                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey, [string[]]$Exclusions = @())
                 $script:HR7ProviderProbe.Invoked++
                 return [pscustomobject]@{ Success = $true; Error = $null; PendingFiles = @() }
             }
@@ -2671,7 +2671,9 @@
         $sbNeededFunctions = @(
             'Invoke-BRAVOBazaCanonicalSync', 'Invoke-BRAVOBazaIncrementalSync',
             'Invoke-ManualBAZASFTPSynchronization', 'New-BRAVOTransferOperationResult',
-            'Get-BRAVOManualSyncRunOutcomeLabel'
+            'Get-BRAVOManualSyncRunOutcomeLabel',
+            # #561: диспетчер читає виключення компонента й журналює їх.
+            'Get-BAZAComponentExclusionsFromSettings', 'Write-BAZAExclusionsApplied'
         )
         $sbDefinitions = (@($sbNeededFunctions | ForEach-Object { $sbFunctionAsts[$_].Extent.Text }) -join "`n`n")
         $sbSavedBackupMonitoring = $null
@@ -2706,11 +2708,11 @@
                 function Test-SFTPConnection { param($WinSCPPath, $RepositorySFTPUrl, $HostKey) return $true }
                 function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $RemoteDirectories) }
                 function Get-BRAVOWinSCPDotNetComponents { param($WinSCPAssemblyPath, $WinSCPPath) return [pscustomobject]@{ AssemblyPath = 'C:\fake\WinSCPnet.dll'; ExecutablePath = 'C:\fake\winscp.exe' } }
-                function New-BRAVOBazaArchiveFullAuditProvider { param($LocalDirectory, $RemotePath, $RepositorySFTPUrl, $HostKey) return $script:AuditProvider }
+                function New-BRAVOBazaArchiveFullAuditProvider { param($LocalDirectory, $RemotePath, $RepositorySFTPUrl, $HostKey, [string[]]$Exclusions = @()) return $script:AuditProvider }
                 # Legacy `synchronize remote -mirror -criteria=time,size`: remote
                 # приводиться до local (перезапис за розміром), без MutationPolicy.
                 function Sync-FolderToSFTP {
-                    param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName)
+                    param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName, [string[]]$Exclusions = @())
                     $script:LegacyMirrorCalls++
                     foreach ($f in @(Get-ChildItem -LiteralPath $LocalDirectory -File)) {
                         $script:EngineSession.State.RemoteSizes["/$($RemoteDirectory.Trim('/'))/$($f.Name)"] = [int64]$f.Length
@@ -2722,7 +2724,7 @@
                 function Invoke-BRAVOBazaComponentSyncSession {
                     param($Component, $LocalDirectory, $RemoteRootPath, $RepositorySFTPUrl, $HostKey, $WinSCPAssemblyPath, $WinSCPExecutablePath, $StateRoot,
                         $ConnectionTimeoutSeconds, $OperationTimeoutSeconds, $MutationPolicy, $AutoArchiveMutationThreshold,
-                        [switch]$BootstrapIfNeeded, $FullAuditProvider, $FullAuditEveryDays, [switch]$ForceFullAudit, [switch]$WriteCheckpoint)
+                        [switch]$BootstrapIfNeeded, $FullAuditProvider, $FullAuditEveryDays, [switch]$ForceFullAudit, [switch]$WriteCheckpoint, [string[]]$Exclusions = @())
                     $script:EngineSessionCalls++
                     if ($script:ForceSkippedConcurrent) {
                         $sk = New-BRAVOBazaSyncResult -Component $Component -CycleId (New-BRAVOBazaCycleId) -StartedUtc (Get-Date).ToUniversalTime() -CutoffUtc (Get-Date).ToUniversalTime()
@@ -3015,6 +3017,430 @@
         }
         # END SYNCBAZA-CANONICAL
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/SyncBazaUsesCanonicalEngine' } }
+        # =======================================================================
+        # #561: налаштовувані виключення SFTP-синхронізації BAZA
+        # (componentSettings.Synchronization.Exclusions.BAZA_APP / BAZA_WWW).
+        # Порожній список = поведінка без змін; непорожній = виключені файли
+        # не потрапляють у знімок/план/WinSCP-маску; невалідний шаблон = відмова.
+        # =======================================================================
+        if (Enter-BRAVOSelfTestSection -Name 'BazaSync/ConfigurableExclusions561') { try {
+        & {
+        if ($null -eq (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+            Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+        }
+        $ex561Root = Join-Path $bazaSyncTestRoot 'E561'
+        New-Item -ItemType Directory -Path $ex561Root -Force | Out-Null
+
+        $ex561ReadAsts = {
+            param([string]$RelativePath)
+            $text = [IO.File]::ReadAllText((Join-Path $root $RelativePath), [Text.Encoding]::UTF8)
+            $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$null)
+            $map = @{}
+            foreach ($fn in @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+                if (-not $map.ContainsKey($fn.Name)) { $map[$fn.Name] = $fn.Extent.Text }
+            }
+            return $map
+        }
+        $ex561ArchiveFn = & $ex561ReadAsts 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
+        $ex561HealthFn = & $ex561ReadAsts 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'
+        # Запускає Action у свіжому модулі, де визначено заглушки й справжні тексти функцій.
+        $ex561Run = {
+            param([string]$StubText, [string[]]$FunctionTexts, [scriptblock]$Action)
+            $module = New-Module -ScriptBlock {}
+            try {
+                $definition = [scriptblock]::Create($StubText + "`n" + ($FunctionTexts -join "`n"))
+                . $module.NewBoundScriptBlock($definition)
+                return (& $module $Action)
+            } finally {
+                Remove-Module -ModuleInfo $module -ErrorAction SilentlyContinue
+            }
+        }
+
+        # --- 1. Резолвер Get-BRAVOBazaSettingsEffective: стійкий до відсутнього вузла ---
+        $ex561HadBackup = $null -ne (Get-Variable -Name backupMonitoring -Scope Global -ErrorAction SilentlyContinue)
+        $ex561SavedBackup = if ($ex561HadBackup) { $global:backupMonitoring } else { $null }
+        $ex561HadComponent = $null -ne (Get-Variable -Name componentSettings -Scope Global -ErrorAction SilentlyContinue)
+        $ex561SavedComponent = if ($ex561HadComponent) { $global:componentSettings } else { $null }
+        try {
+            Set-StrictMode -Version Latest
+            $global:backupMonitoring = @{ SFTP = @{} }
+            $ex561Resolve = {
+                param($Settings, [switch]$Absent)
+                if ($Absent) { Remove-Variable -Name componentSettings -Scope Global -ErrorAction SilentlyContinue } else { $global:componentSettings = $Settings }
+                try { return (Get-BRAVOBazaSettingsEffective) } catch { return $_ }
+            }
+            $ex561Shape = {
+                param($Result)
+                if ($Result -is [System.Management.Automation.ErrorRecord]) { return "ERR:$($Result.Exception.Message)" }
+                return ('{0}|{1}' -f (@($Result.Exclusions.BAZA_APP) -join ','), (@($Result.Exclusions.BAZA_WWW) -join ','))
+            }
+            $ex561Absent = & $ex561Shape (& $ex561Resolve $null -Absent)
+            $ex561EmptyHash = & $ex561Shape (& $ex561Resolve @{})
+            $ex561NoExclHash = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ BAZA_APP_SFTP = $true } })
+            $ex561NoExclObj = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = [pscustomobject]@{ BAZA_APP_SFTP = $true } }))
+            $ex561NullSync = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = $null }))
+            Test-BRAVOCondition -Condition (
+                $ex561Absent -eq '|' -and $ex561EmptyHash -eq '|' -and $ex561NoExclHash -eq '|' -and $ex561NoExclObj -eq '|' -and $ex561NullSync -eq '|'
+            ) -Name 'BazaSync/ExclusionResolverMissingNodeReturnsEmptyUnderStrictMode' `
+              -Failure "резолвер не має падати без вузла Exclusions (змінна відсутня/hashtable/pscustomobject); absent='$ex561Absent' hash='$ex561EmptyHash' noExclHash='$ex561NoExclHash' noExclObj='$ex561NoExclObj' nullSync='$ex561NullSync' (#561)"
+
+            $ex561WithHash = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('*.log', 'cache'); BAZA_WWW = @() } } })
+            $ex561WithObj = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = [pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_APP = @(); BAZA_WWW = @('tmp*', 'a\b') } } }))
+            $ex561WithScalar = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = '*.log' } } })
+            Test-BRAVOCondition -Condition (
+                $ex561WithHash -eq '*.log,cache|' -and $ex561WithObj -eq '|tmp*,a\b' -and $ex561WithScalar -eq '*.log|'
+            ) -Name 'BazaSync/ExclusionResolverReadsPerComponentListsFromHashtableAndObject' `
+              -Failure "резолвер має віддавати списки BAZA_APP/BAZA_WWW окремо (hashtable, pscustomobject, скаляр); hash='$ex561WithHash' obj='$ex561WithObj' scalar='$ex561WithScalar' (#561)"
+
+            $ex561BadDotDot = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('..\evil') } } })
+            $ex561BadPipe = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_WWW = @('a|b') } } })
+            $ex561BadAbs = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('C:\x') } } })
+            Test-BRAVOCondition -Condition (
+                $ex561BadDotDot.StartsWith('ERR:') -and $ex561BadDotDot.Contains('BAZA_APP') -and
+                $ex561BadPipe.StartsWith('ERR:') -and $ex561BadPipe.Contains('BAZA_WWW') -and
+                $ex561BadAbs.StartsWith('ERR:')
+            ) -Name 'BazaSync/ExclusionResolverRejectsInjectedInvalidPatternFailClosed' `
+              -Failure "невалідний шаблон, підставлений повз валідатор конфігурації, має відхилятись резолвером; dotdot='$ex561BadDotDot' pipe='$ex561BadPipe' abs='$ex561BadAbs' (#561)"
+        } finally {
+            if ($ex561HadBackup) { $global:backupMonitoring = $ex561SavedBackup } else { Remove-Variable -Name backupMonitoring -Scope Global -ErrorAction SilentlyContinue }
+            if ($ex561HadComponent) { $global:componentSettings = $ex561SavedComponent } else { Remove-Variable -Name componentSettings -Scope Global -ErrorAction SilentlyContinue }
+        }
+
+        # --- 2. Знімок: виключені файли й каталоги відсутні; порожній список без змін ---
+        $ex561Local = Join-Path $ex561Root 'snap'
+        $ex561AllFiles = @('a.txt', 'b.log', 'logs\x.txt', 'sub\keep.dat', 'sub\skip.tmp', 'cache\deep\f.bin', 'other\cache2\y.bin', 'nested\cache\z.bin')
+        foreach ($ex561File in $ex561AllFiles) {
+            [void](New-BRAVOSelfTestBazaFile -Directory $ex561Local -RelativePath $ex561File -SizeBytes 10)
+        }
+        $ex561Patterns = @('*.log', 'cache', 'sub\*.tmp')
+        $ex561SnapPlain = Get-BRAVOBazaLocalSnapshot -LocalDirectory $ex561Local
+        $ex561SnapEmpty = Get-BRAVOBazaLocalSnapshot -LocalDirectory $ex561Local -Exclusions @()
+        $ex561SnapFiltered = Get-BRAVOBazaLocalSnapshot -LocalDirectory $ex561Local -Exclusions $ex561Patterns
+        $ex561PlainKeys = (@($ex561SnapPlain.Entries.Keys) | Sort-Object) -join '|'
+        $ex561EmptyKeys = (@($ex561SnapEmpty.Entries.Keys) | Sort-Object) -join '|'
+        $ex561FilteredKeys = (@($ex561SnapFiltered.Entries.Keys) | Sort-Object) -join '|'
+        Test-BRAVOCondition -Condition (
+            $ex561PlainKeys -eq $ex561EmptyKeys -and @($ex561SnapPlain.Entries.Keys).Count -eq 8 -and
+            $null -eq $ex561SnapEmpty.Directories -and $ex561SnapEmpty.Success
+        ) -Name 'BazaSync/ExclusionEmptyListSnapshotUnchanged' `
+          -Failure "порожній список виключень не має змінювати знімок; plain='$ex561PlainKeys' empty='$ex561EmptyKeys' (#561)"
+        $ex561ExpectedKept = (@('a.txt', 'logs\x.txt', 'sub\keep.dat', 'other\cache2\y.bin') | Sort-Object) -join '|'
+        Test-BRAVOCondition -Condition (
+            $ex561SnapFiltered.Success -and $ex561FilteredKeys -eq $ex561ExpectedKept
+        ) -Name 'BazaSync/ExclusionFilteredFilesAbsentFromSnapshot' `
+          -Failure "знімок із виключеннями має містити лише '$ex561ExpectedKept', отримано '$ex561FilteredKeys' (#561)"
+        $ex561SnapDirs = Get-BRAVOBazaLocalSnapshot -LocalDirectory $ex561Local -IncludeDirectories -Exclusions $ex561Patterns
+        $ex561DirList = (@($ex561SnapDirs.Directories) | Sort-Object) -join '|'
+        Test-BRAVOCondition -Condition (
+            $ex561SnapDirs.Success -and -not $ex561SnapDirs.Directories.Contains('cache') -and -not $ex561SnapDirs.Directories.Contains('cache\deep') -and
+            -not $ex561SnapDirs.Directories.Contains('nested\cache') -and $ex561SnapDirs.Directories.Contains('other\cache2') -and $ex561SnapDirs.Directories.Contains('sub')
+        ) -Name 'BazaSync/ExclusionExcludedDirectoriesAbsentFromSnapshotDirectories' `
+          -Failure "виключені каталоги (cache на будь-якому рівні) не мають бути в Directories, а other\cache2 і sub - мають; dirs='$ex561DirList' (#561)"
+        $ex561SnapBad = Get-BRAVOBazaLocalSnapshot -LocalDirectory $ex561Local -Exclusions @('..\evil')
+        Test-BRAVOCondition -Condition (
+            -not $ex561SnapBad.Success -and $ex561SnapBad.Error.Contains('..\evil') -and @($ex561SnapBad.Entries.Keys).Count -eq 0
+        ) -Name 'BazaSync/ExclusionInvalidPatternRefusedBySnapshot' `
+          -Failure "знімок із невалідним шаблоном має відмовити (Success=false) без перелічення дерева; Success=$($ex561SnapBad.Success) Error=$($ex561SnapBad.Error) (#561)"
+
+        # --- 3. План і Full Audit: виключене не вантажиться, не звітується, не мутація ---
+        $ex561State = New-BRAVOBazaEmptyState -Component 'BAZA_APP'
+        $ex561State.Files['b.log'] = [pscustomobject]@{ Size = 999; LastWriteTimeUtc = '2020-01-01T00:00:00.0000000Z'; UploadedUtc = '2020-01-01T00:00:00.0000000Z'; Verified = $true }
+        $ex561PlanPlain = Get-BRAVOBazaSyncPlan -Snapshot $ex561SnapPlain -State $ex561State
+        $ex561PlanFiltered = Get-BRAVOBazaSyncPlan -Snapshot $ex561SnapPlain -State $ex561State -Exclusions $ex561Patterns
+        $ex561PlanUploads = (@($ex561PlanFiltered.ToUpload | ForEach-Object { $_.RelativePath }) | Sort-Object) -join '|'
+        Test-BRAVOCondition -Condition (
+            @($ex561PlanPlain.MutationViolations).Count -eq 1 -and @($ex561PlanPlain.ToUpload).Count -eq 7 -and
+            $ex561PlanUploads -eq (@('a.txt', 'logs\x.txt', 'sub\keep.dat', 'other\cache2\y.bin') | Sort-Object) -join '|' -and
+            @($ex561PlanFiltered.MutationViolations).Count -eq 0 -and @($ex561PlanFiltered.TrustedSkip).Count -eq 0
+        ) -Name 'BazaSync/ExclusionPlanSkipsExcludedUploadsAndMutations' `
+          -Failure "план: виключені шляхи не в ToUpload/MutationViolations (без виключень було б 7 + 1 мутація); uploads='$ex561PlanUploads' mutations=$(@($ex561PlanFiltered.MutationViolations).Count) (#561)"
+
+        $ex561Pending = @(
+            [pscustomobject]@{ Path = (Join-Path $ex561Local 'b.log'); Action = 'UploadNew'; Reason = 'r'; IsDirectory = $false },
+            [pscustomobject]@{ Path = (Join-Path $ex561Local 'a.txt'); Action = 'UploadNew'; Reason = 'r'; IsDirectory = $false }
+        )
+        $ex561AuditPlain = ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -PendingFiles $ex561Pending -LocalDirectory $ex561Local -LocalSnapshot $ex561SnapPlain
+        $ex561AuditFiltered = ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -PendingFiles $ex561Pending -LocalDirectory $ex561Local -LocalSnapshot $ex561SnapPlain -Exclusions $ex561Patterns
+        Test-BRAVOCondition -Condition (
+            @($ex561AuditPlain.PendingItems).Count -eq 2 -and @($ex561AuditPlain.AlreadyMatchingRelativePaths).Count -eq 6 -and
+            @($ex561AuditFiltered.PendingItems).Count -eq 1 -and $ex561AuditFiltered.PendingItems[0].RelativePath -eq 'a.txt' -and
+            @($ex561AuditFiltered.AlreadyMatchingRelativePaths).Count -eq 3 -and -not (@($ex561AuditFiltered.AlreadyMatchingRelativePaths) -contains 'b.log')
+        ) -Name 'BazaSync/ExclusionFullAuditResultDropsExcludedPendingAndMatching' `
+          -Failure "Full Audit: виключені не в PendingItems і не засіваються як Verified; pending=$(@($ex561AuditFiltered.PendingItems).Count) matching=$(@($ex561AuditFiltered.AlreadyMatchingRelativePaths).Count) (#561)"
+
+        # --- 4. Повний цикл із фейковою сесією: ні upload, ні delete, ні "відсутній" ---
+        $ex561SyncLocal = Join-Path $ex561Root 'sync\local'
+        $ex561SyncState = Join-Path $ex561Root 'sync\state'
+        foreach ($ex561File in $ex561AllFiles) {
+            [void](New-BRAVOSelfTestBazaFile -Directory $ex561SyncLocal -RelativePath $ex561File -SizeBytes 10)
+        }
+        $ex561NoOpAudit = {
+            param($Snapshot)
+            return [pscustomobject]@{ Success = $true; Error = $null; AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{} }
+        }
+        $ex561Session1 = New-BRAVOSelfTestFakeBazaSession
+        $ex561Result1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $ex561SyncLocal -RemoteRootPath '/baza_app' -Session $ex561Session1 -StateRoot $ex561SyncState -BootstrapIfNeeded -FullAuditProvider $ex561NoOpAudit -Exclusions $ex561Patterns
+        $ex561Uploaded = (@($ex561Session1.State.PutFilesCalledFor) -join '|')
+        Test-BRAVOCondition -Condition (
+            $ex561Result1.Status -eq 'COMPLETE' -and $ex561Result1.Uploaded -eq 4 -and $ex561Result1.DiscoveredWithinCutoff -eq 4 -and
+            $ex561Session1.State.PutFilesCallCount -eq 4 -and $ex561Session1.State.RemoveFilesCalls.Count -eq 0 -and
+            $ex561Uploaded -notmatch 'b\.log' -and $ex561Uploaded -notmatch 'skip\.tmp' -and $ex561Uploaded -notmatch 'f\.bin' -and $ex561Uploaded -notmatch 'z\.bin' -and
+            @($ex561Result1.RemoteConflicts).Count -eq 0 -and @($ex561Result1.IncompatibleFiles).Count -eq 0 -and $ex561Result1.Failed -eq 0
+        ) -Name 'BazaSync/ExclusionCycleUploadsOnlyNonExcludedAndNeverDeletes' `
+          -Failure "цикл із виключеннями: 4 upload без виключених, 0 delete; Status=$($ex561Result1.Status) Uploaded=$($ex561Result1.Uploaded) PutFiles=$($ex561Session1.State.PutFilesCallCount) uploaded='$ex561Uploaded' Error=$($ex561Result1.Error) (#561)"
+        $ex561StateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $ex561SyncState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $ex561StateRead.Exists -and -not $ex561StateRead.Corrupt -and @($ex561StateRead.State.Files.Keys).Count -eq 4 -and -not $ex561StateRead.State.Files.ContainsKey('b.log')
+        ) -Name 'BazaSync/ExclusionExcludedFilesNeverEnterPersistedState' `
+          -Failure "виключені файли не мають потрапляти в state; ключів=$(@($ex561StateRead.State.Files.Keys).Count) (#561)"
+
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561SyncLocal -RelativePath 'later.log' -SizeBytes 10)
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561SyncLocal -RelativePath 'cache\more\g.bin' -SizeBytes 10)
+        $ex561Session2 = New-BRAVOSelfTestFakeBazaSession
+        $ex561Result2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $ex561SyncLocal -RemoteRootPath '/baza_app' -Session $ex561Session2 -StateRoot $ex561SyncState -Exclusions $ex561Patterns
+        $ex561Late = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $ex561Result2 -LocalDirectory $ex561SyncLocal -StateRoot $ex561SyncState -Exclusions $ex561Patterns
+        $ex561LateCount = $ex561Late.NewAfterCutoff
+        $ex561Result2Plain = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $ex561SyncLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $ex561SyncState
+        $ex561LatePlain = (Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $ex561Result2Plain -LocalDirectory $ex561SyncLocal -StateRoot $ex561SyncState).NewAfterCutoff
+        Test-BRAVOCondition -Condition (
+            $ex561Result2.Status -eq 'COMPLETE' -and $ex561Result2.Uploaded -eq 0 -and $ex561Result2.AlreadyVerified -eq 4 -and
+            $ex561Session2.State.PutFilesCallCount -eq 0 -and $ex561LateCount -eq 0
+        ) -Name 'BazaSync/ExclusionNewExcludedFilesNotUploadedNotReportedAsNew' `
+          -Failure "новий виключений файл: 0 upload, не 'нові після cutoff'; Status=$($ex561Result2.Status) Uploaded=$($ex561Result2.Uploaded) PutFiles=$($ex561Session2.State.PutFilesCallCount) newAfterCutoff=$ex561LateCount (#561)"
+        Test-BRAVOCondition -Condition (
+            $ex561Result2Plain.Uploaded -ge 1 -and $ex561LatePlain -eq 0
+        ) -Name 'BazaSync/ExclusionDisabledRunUploadsFilesPreviouslyExcluded' `
+          -Failure "контроль: без виключень ті самі файли вантажаться (поведінка за замовчуванням не змінена); Uploaded=$($ex561Result2Plain.Uploaded) (#561)"
+
+        # Невалідний шаблон: цикл і сесія відмовляють ДО будь-яких викликів WinSCP/передачі.
+        $ex561BadSession = New-BRAVOSelfTestFakeBazaSession
+        $ex561BadResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $ex561SyncLocal -RemoteRootPath '/baza_app' -Session $ex561BadSession -StateRoot (Join-Path $ex561Root 'badstate') -BootstrapIfNeeded -FullAuditProvider $ex561NoOpAudit -Exclusions @('..\evil')
+        $ex561BadSessionResult = Invoke-BRAVOBazaComponentSyncSession -Component 'BAZA_APP' -LocalDirectory $ex561SyncLocal -RemoteRootPath '/baza_app' `
+            -RepositorySFTPUrl 'sftp://user@invalid.invalid/' -HostKey 'ssh-ed25519 255 AAAA' -WinSCPAssemblyPath (Join-Path $root 'Tools\WinSCPnet.dll') `
+            -WinSCPExecutablePath (Join-Path $root 'Tools\WinSCP.exe') -StateRoot (Join-Path $ex561Root 'badstate2') -Exclusions @('a|b')
+        Test-BRAVOCondition -Condition (
+            $ex561BadResult.Status -eq 'ERROR' -and $ex561BadSession.State.PutFilesCallCount -eq 0 -and
+            $ex561BadSessionResult.Status -eq 'ERROR' -and ([string]$ex561BadSessionResult.Error).Contains('a|b') -and
+            -not (Test-Path -LiteralPath (Join-Path $ex561Root 'badstate')) -and -not (Test-Path -LiteralPath (Join-Path $ex561Root 'badstate2'))
+        ) -Name 'BazaSync/ExclusionInvalidPatternRefusedBeforeSessionAndTransfer' `
+          -Failure "невалідний шаблон: ERROR до lock/WinSCP/передачі; cycle=$($ex561BadResult.Status) session=$($ex561BadSessionResult.Status) err=$($ex561BadSessionResult.Error) (#561)"
+
+        # --- 5. Legacy Sync-FolderToSFTP: окремий -filemask, лише для непорожнього списку ---
+        $ex561SyncStubs = @'
+            $script:Ex561Probe = @{ Script = $null; ComparisonExclusions = @(); ComparisonCalls = 0; SnapshotCalls = 0; Logs = (New-Object System.Collections.Generic.List[string]) }
+            $script:synchronizationSafety = @{ RequireNonEmptyBAZASource = $false }
+            $script:sftpSynchronizationOptions = '-mirror -criteria=time -resumesupport=on'
+            $script:sftpConnectionTimeoutSeconds = 15
+            $script:winSCPScriptEncoding = 'utf8'
+            $script:winSCPIniPath = 'nul'
+            $script:progressSettings = @{ Enabled = $false; ShowWinSCPOutput = $false }
+            function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$NoConsole, [switch]$NoTimestamp) $script:Ex561Probe.Logs.Add([string]$Message) }
+            function ConvertTo-BRAVOSshHostKeyFingerprint { param($Value) return $Value }
+            function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes, [string[]]$Exclusions = @()) return [pscustomobject]@{ Success = $true; Error = $null; Issues = @() } }
+            function Write-BAZARemoteNameCompatibilityAudit { param($CompatibilityResult, $ComponentName) }
+            function Get-BAZASFTPComparison {
+                param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot, $PreAuditPending, [switch]$SnapshotUnavailable, [string[]]$Exclusions = @())
+                $script:Ex561Probe.ComparisonCalls++
+                $script:Ex561Probe.ComparisonExclusions = @($Exclusions)
+                return [pscustomobject]@{ Success = $true; Error = $null; PendingFiles = @() }
+            }
+            function Write-BAZASFTPComparisonAudit { param($Comparison, $Stage, $ComponentName, $IncompatibleIssues, $Outcome) }
+            function New-BRAVOWinSCPTemporaryScriptPath { return (Join-Path $script:Ex561TempDir ([guid]::NewGuid().ToString('N') + '.txt')) }
+            function Test-BRAVOWinSCPAvailable { param($WinSCPPath) return [pscustomobject]@{ Available = $false } }
+            function Get-BRAVOWinSCPBusyMessage { param($Availability, $Operation) return 'stub busy' }
+            function Remove-BRAVOWinSCPSensitiveTemporaryScript {
+                param($Path)
+                if (Test-Path -LiteralPath $Path) {
+                    $script:Ex561Probe.Script = [IO.File]::ReadAllText($Path)
+                    Remove-Item -LiteralPath $Path -Force
+                }
+            }
+            function Show-RunningProgress { param($Id, $Activity, $Status, [switch]$Completed) }
+'@
+        $ex561SyncFunctions = @(
+            $ex561ArchiveFn['Sync-FolderToSFTP'], $ex561ArchiveFn['Write-BAZAExclusionsApplied'], $ex561ArchiveFn['Test-BAZAPathExcludedByPatterns']
+        )
+        $ex561SyncDir = Join-Path $ex561Root 'legacy-src'
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561SyncDir -RelativePath 'a.txt' -SizeBytes 10)
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561SyncDir -RelativePath 'skip.log' -SizeBytes 10)
+        $ex561TempDir = Join-Path $ex561Root 'legacy-tmp'
+        New-Item -ItemType Directory -Path $ex561TempDir -Force | Out-Null
+        $ex561WinSCPFile = Join-Path $ex561Root 'fake-winscp.exe'
+        [IO.File]::WriteAllText($ex561WinSCPFile, 'x')
+        # Дія для модуля-пісочниці: локальні змінні тесту модулю невидимі, тож шляхи вшито в текст.
+        $ex561MakeLegacyAction = {
+            param([string]$ExclusionsLiteral, [string]$Directory, [string]$RequireNonEmpty = 'false')
+            return [scriptblock]::Create(@"
+`$script:Ex561TempDir = '$ex561TempDir'
+`$script:synchronizationSafety = @{ RequireNonEmptyBAZASource = `$$RequireNonEmpty }
+`$returned = Sync-FolderToSFTP -WinSCPPath '$ex561WinSCPFile' -RepositorySFTPUrl 'sftp://user@host/' -HostKey 'ssh-ed25519 255 AAAA' -LocalDirectory '$Directory' -RemoteDirectory 'baza_app' -ComponentName 'BAZA_APP' -Exclusions $ExclusionsLiteral
+[pscustomobject]@{ Returned = `$returned; Probe = `$script:Ex561Probe }
+"@)
+        }
+        $ex561LegacyEmpty = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction '@()' $ex561SyncDir)
+        $ex561LegacyMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.log', 'cache')
+        $ex561LegacyFull = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction "@('*.log','cache')" $ex561SyncDir)
+        $ex561EmptyScript = [string]$ex561LegacyEmpty.Probe.Script
+        $ex561FullScript = [string]$ex561LegacyFull.Probe.Script
+        $ex561ExpectedEmptyLine = "synchronize remote -mirror -criteria=time -resumesupport=on `"$ex561SyncDir`" `"/baza_app`""
+        $ex561ExpectedFullLine = "synchronize remote -mirror -criteria=time -resumesupport=on -filemask=`"$ex561LegacyMask`" `"$ex561SyncDir`" `"/baza_app`""
+        Test-BRAVOCondition -Condition (
+            $ex561EmptyScript.Contains($ex561ExpectedEmptyLine) -and $ex561EmptyScript -notmatch 'filemask' -and
+            @($ex561LegacyEmpty.Probe.ComparisonExclusions).Count -eq 0
+        ) -Name 'BazaSync/ExclusionLegacyEmptyListWinSCPScriptUnchanged' `
+          -Failure "legacy: без виключень рядок synchronize має лишитись попереднім і без -filemask; script='$ex561EmptyScript' (#561)"
+        Test-BRAVOCondition -Condition (
+            $ex561FullScript.Contains($ex561ExpectedFullLine) -and
+            $ex561LegacyMask -eq '|*.log;*.log/;cache;cache/' -and
+            (@($ex561LegacyFull.Probe.ComparisonExclusions) -join ',') -eq '*.log,cache'
+        ) -Name 'BazaSync/ExclusionLegacyNonEmptyListAddsSeparateQuotedFilemaskToken' `
+          -Failure "legacy: -filemask має бути окремим ключем у лапках після опцій синхронізації й до шляхів; очікувано '$ex561ExpectedFullLine'; script='$ex561FullScript' (#561)"
+        $ex561LegacyBad = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction "@('..\evil')" $ex561SyncDir)
+        Test-BRAVOCondition -Condition (
+            $ex561LegacyBad.Returned -eq $false -and $null -eq $ex561LegacyBad.Probe.Script -and $ex561LegacyBad.Probe.ComparisonCalls -eq 0
+        ) -Name 'BazaSync/ExclusionLegacyInvalidPatternNeverReachesWinSCP' `
+          -Failure "legacy: невалідний шаблон -> false, жодного скрипта WinSCP і жодного порівняння; returned=$($ex561LegacyBad.Returned) comparisons=$($ex561LegacyBad.Probe.ComparisonCalls) (#561)"
+        $ex561OnlyExcludedDir = Join-Path $ex561Root 'legacy-only-excluded'
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561OnlyExcludedDir -RelativePath 'only.log' -SizeBytes 10)
+        $ex561LegacyOnlyExcluded = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction "@('*.log')" $ex561OnlyExcludedDir 'true')
+        Test-BRAVOCondition -Condition (
+            $ex561LegacyOnlyExcluded.Returned -eq $false -and $null -eq $ex561LegacyOnlyExcluded.Probe.Script
+        ) -Name 'BazaSync/ExclusionLegacyRequireNonEmptySourceIgnoresExcludedFiles' `
+          -Failure "legacy: каталог, де лишились самі виключені файли, вважається порожнім для RequireNonEmptyBAZASource (#561)"
+
+        # --- 6. Імена: задовге ім'я виключеного файла не є проблемою сумісності ---
+        $ex561NamesDir = Join-Path $ex561Root 'names'
+        $ex561LongName = ([string][char]0x436) * 130
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561NamesDir -RelativePath ($ex561LongName + '.tmp') -SizeBytes 5)
+        [void](New-BRAVOSelfTestBazaFile -Directory $ex561NamesDir -RelativePath ('cache\' + $ex561LongName + '.dat') -SizeBytes 5)
+        $ex561NamesResult = & $ex561Run '$script:Ex561Names = $true' @($ex561ArchiveFn['Get-BAZARemoteNameCompatibilityIssues'], $ex561ArchiveFn['Test-BAZAPathExcludedByPatterns']) ([scriptblock]::Create(@"
+            [pscustomobject]@{
+                Plain = (Get-BAZARemoteNameCompatibilityIssues -LocalPath '$ex561NamesDir')
+                Filtered = (Get-BAZARemoteNameCompatibilityIssues -LocalPath '$ex561NamesDir' -Exclusions @('*.tmp', 'cache'))
+                PartlyFiltered = (Get-BAZARemoteNameCompatibilityIssues -LocalPath '$ex561NamesDir' -Exclusions @('*.tmp'))
+            }
+"@))
+        Test-BRAVOCondition -Condition (
+            $ex561NamesResult.Plain.Success -and @($ex561NamesResult.Plain.Issues).Count -ge 2 -and
+            $ex561NamesResult.Filtered.Success -and @($ex561NamesResult.Filtered.Issues).Count -eq 0 -and
+            @($ex561NamesResult.PartlyFiltered.Issues).Count -ge 1
+        ) -Name 'BazaSync/ExclusionLegacyNameCompatibilitySkipsExcludedFiles' `
+          -Failure "Get-BAZARemoteNameCompatibilityIssues: виключені файли й вміст виключених каталогів пропускаються; plain=$(@($ex561NamesResult.Plain.Issues).Count) filtered=$(@($ex561NamesResult.Filtered.Issues).Count) partly=$(@($ex561NamesResult.PartlyFiltered.Issues).Count) (#561)"
+
+        # --- 7. Порівняння WinSCP (Archive/Health): структурні й поведінкові перевірки ---
+        $ex561CompareText = [string]$ex561ArchiveFn['Get-BAZASFTPComparison']
+        $ex561HealthCompareText = [string]$ex561HealthFn['Invoke-WinSCPBAZAComparison']
+        $ex561TransferOptions = New-Object WinSCP.TransferOptions
+        $ex561TransferOptions.FileMask = (ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.log', 'cache'))
+        Test-BRAVOCondition -Condition (
+            $ex561CompareText -match '\$compareTransferOptions\s*=\s*\$null' -and $ex561CompareText -match 'New-Object WinSCP\.TransferOptions' -and
+            $ex561CompareText -match '\$compareTransferOptions\.FileMask\s*=\s*\$exclusionMask' -and
+            $ex561CompareText -match '\$criteria,\s*\r?\n\s*\$compareTransferOptions\s*\r?\n' -and
+            $ex561HealthCompareText -match '\$compareTransferOptions\s*=\s*\$null' -and $ex561HealthCompareText -match '\$compareTransferOptions\.FileMask\s*=\s*\$exclusionMask' -and
+            $ex561HealthCompareText -match '\$criteria,\s*\r?\n\s*\$compareTransferOptions\s*\r?\n' -and
+            $null -eq (ConvertTo-BRAVOWinSCPExclusionMask -Patterns @()) -and $ex561TransferOptions.FileMask -eq '|*.log;*.log/;cache;cache/'
+        ) -Name 'BazaSync/ExclusionCompareDirectoriesGetsFileMaskOnlyWhenNonEmpty' `
+          -Failure "CompareDirectories (Archive і Health): TransferOptions із FileMask лише для непорожнього списку, інакше `$null (#561)"
+        $ex561ArchiveCompare = & $ex561Run 'function Write-BRAVOLog {}' @($ex561ArchiveFn['Get-BAZASFTPComparison']) ([scriptblock]::Create(@'
+            Get-BAZASFTPComparison -LocalPath 'C:\x' -RemotePath '/x' -RepositorySFTPUrl 'sftp://u@h/' -HostKey 'k' -Exclusions @('..\evil')
+'@))
+        Test-BRAVOCondition -Condition (
+            $ex561ArchiveCompare.Success -eq $false -and ([string]$ex561ArchiveCompare.Error).Contains('..\evil')
+        ) -Name 'BazaSync/ExclusionArchiveComparisonInvalidPatternRefused' `
+          -Failure "Get-BAZASFTPComparison: невалідний шаблон -> Success=false до відкриття сесії; Error=$($ex561ArchiveCompare.Error) (#561)"
+
+        # Health: CLI-fallback додає той самий -filemask; порожній список - команда без змін.
+        $ex561HealthStubs = @'
+            $script:Ex561HealthCommands = New-Object System.Collections.Generic.List[string]
+            $script:backupMonitoring = @{ SFTP = @{ BAZAPreviewOptions = '-criteria=time -delete' } }
+            function Invoke-WinSCPHealthSession { param([string[]]$Commands) foreach ($c in $Commands) { $script:Ex561HealthCommands.Add($c) }; return [pscustomobject]@{ Success = $false; Error = 'stub' } }
+'@
+        $ex561HealthFunctions = @(
+            $ex561HealthFn['Invoke-WinSCPBAZAComparisonViaCli'], $ex561HealthFn['Get-BAZAHealthExclusionFailure'], $ex561HealthFn['ConvertTo-WinSCPScriptArgument']
+        )
+        $ex561HealthCli = & $ex561Run $ex561HealthStubs $ex561HealthFunctions ([scriptblock]::Create(@'
+            [void](Invoke-WinSCPBAZAComparisonViaCli -LocalPath 'D:\src' -RemotePath '/baza')
+            [void](Invoke-WinSCPBAZAComparisonViaCli -LocalPath 'D:\src' -RemotePath '/baza' -Exclusions @('*.log', 'cache'))
+            $badResult = Invoke-WinSCPBAZAComparisonViaCli -LocalPath 'D:\src' -RemotePath '/baza' -Exclusions @('a;b')
+            [pscustomobject]@{ Commands = @($script:Ex561HealthCommands); Bad = $badResult }
+'@))
+        $ex561HealthMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.log', 'cache')
+        Test-BRAVOCondition -Condition (
+            @($ex561HealthCli.Commands).Count -eq 2 -and
+            $ex561HealthCli.Commands[0] -ceq 'synchronize remote -preview -criteria=time "D:\src" "/baza"' -and
+            $ex561HealthCli.Commands[1] -ceq "synchronize remote -preview -criteria=time -filemask=`"$ex561HealthMask`" `"D:\src`" `"/baza`"" -and
+            $ex561HealthCli.Bad.Success -eq $false
+        ) -Name 'BazaSync/ExclusionHealthCliPreviewGetsSameFilemaskAndRefusesInvalid' `
+          -Failure "Health CLI preview: -filemask лише для непорожнього списку, невалідний шаблон відхиляється без команди; cmds=$(@($ex561HealthCli.Commands) -join ' // ') (#561)"
+        $ex561HealthCompare = & $ex561Run 'function Write-HealthLog {}' @($ex561HealthFn['Invoke-WinSCPBAZAComparison'], $ex561HealthFn['Get-BAZAHealthExclusionFailure']) ([scriptblock]::Create(@'
+            Invoke-WinSCPBAZAComparison -LocalPath 'D:\src' -RemotePath '/baza' -Exclusions @('..\evil')
+'@))
+        $ex561HealthList = & $ex561Run '' @($ex561HealthFn['Get-BAZAHealthComponentExclusions']) ([scriptblock]::Create(@'
+            param()
+            [pscustomobject]@{
+                App = @(Get-BAZAHealthComponentExclusions -Settings ([pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_APP = @('*.log'); BAZA_WWW = @() } }) -ComponentKey 'BAZA_APP')
+                Www = @(Get-BAZAHealthComponentExclusions -Settings ([pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_APP = @('*.log'); BAZA_WWW = @() } }) -ComponentKey 'BAZA_WWW')
+                Missing = @(Get-BAZAHealthComponentExclusions -Settings ([pscustomobject]@{ Mode = 'x' }) -ComponentKey 'BAZA_APP')
+                Null = @(Get-BAZAHealthComponentExclusions -Settings $null -ComponentKey 'BAZA_APP')
+            }
+'@))
+        Test-BRAVOCondition -Condition (
+            $ex561HealthCompare.Success -eq $false -and ([string]$ex561HealthCompare.Error).Contains('..\evil') -and
+            @($ex561HealthList.App).Count -eq 1 -and @($ex561HealthList.Www).Count -eq 0 -and @($ex561HealthList.Missing).Count -eq 0 -and @($ex561HealthList.Null).Count -eq 0
+        ) -Name 'BazaSync/ExclusionHealthComparisonRefusesInvalidAndReadsListSafely' `
+          -Failure "Health: Invoke-WinSCPBAZAComparison відхиляє невалідний шаблон до WinSCP, а читання списку з налаштувань стійке до відсутніх вузлів (#561)"
+
+        # --- 8. Диспетчери Archive передають виключення у двигун ---
+        $ex561DispatchStubs = @'
+            $script:lastBAZASyncOutcome = $null
+            $script:Ex561Dispatch = @{ SessionExclusions = $null; ProviderExclusions = $null; LegacyExclusions = $null; Mode = 'IncrementalAppendOnly' }
+            $script:sftpUrl = 'sftp://u@h/'
+            $script:sftpHostKey = 'ssh-ed25519 255 AAAA'
+            $script:sftpConnectionTimeoutSeconds = 5
+            $script:winSCPAssemblyPath = 'a.dll'
+            $script:winSCPPath = 'WinSCP.com'
+            $script:backupMonitoring = @{ SFTP = @{ SynchronizationTimeoutSeconds = 60; OperationTimeoutSeconds = 60 } }
+            function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$NoConsole, [switch]$NoTimestamp) }
+            function Get-BRAVOBazaSyncModeEffective { return $script:Ex561Dispatch.Mode }
+            function Get-BRAVOBazaSettingsEffective {
+                return [pscustomobject]@{
+                    Mode = $script:Ex561Dispatch.Mode; StateRoot = 'C:\state'; MutationPolicy = 'Fail'; FullAuditEnabled = $true; FullAuditEveryDays = 7
+                    AutoArchiveMutationThreshold = 0
+                    Exclusions = [pscustomobject]@{ BAZA_APP = @('*.log', 'cache'); BAZA_WWW = @('tmp*') }
+                }
+            }
+            function New-BRAVOBazaArchiveFullAuditProvider { param($LocalDirectory, $RemotePath, $RepositorySFTPUrl, $HostKey, [string[]]$Exclusions = @()) $script:Ex561Dispatch.ProviderExclusions = @($Exclusions); return { } }
+            function Get-BRAVOWinSCPDotNetComponents { param($WinSCPAssemblyPath, $WinSCPPath) return [pscustomobject]@{ AssemblyPath = 'a.dll'; ExecutablePath = 'WinSCP.exe' } }
+            function Invoke-BRAVOBazaComponentSyncSession {
+                param($Component, $LocalDirectory, $RemoteRootPath, $RepositorySFTPUrl, $HostKey, $WinSCPAssemblyPath, $WinSCPExecutablePath, $StateRoot, $ConnectionTimeoutSeconds, $OperationTimeoutSeconds,
+                    $MutationPolicy, $AutoArchiveMutationThreshold, [switch]$BootstrapIfNeeded, $FullAuditProvider, $FullAuditEveryDays, [switch]$ForceFullAudit, [switch]$WriteCheckpoint, [string[]]$Exclusions = @())
+                $script:Ex561Dispatch.SessionExclusions = @($Exclusions)
+                return [pscustomobject]@{ Status = 'COMPLETE'; Error = $null; Uploaded = 0; AlreadyVerified = 0; Failed = 0; IncompatibleFiles = @(); MutationViolations = @(); RemoteConflicts = @(); AuditDriftFiles = @() }
+            }
+            function Sync-FolderToSFTP { param($WinSCPPath, $RepositorySFTPUrl, $HostKey, $LocalDirectory, $RemoteDirectory, $ComponentName, [string[]]$Exclusions = @()) $script:Ex561Dispatch.LegacyExclusions = @($Exclusions); return $true }
+            function Test-BRAVOBazaSyncStatusSuccess { param($Status) return ($Status -in @('COMPLETE', 'MUTATION_AUTO_ARCHIVED')) }
+'@
+        $ex561DispatchFunctions = @(
+            $ex561ArchiveFn['Invoke-BRAVOBazaIncrementalSync'], $ex561ArchiveFn['Invoke-BRAVOBazaCanonicalSync'],
+            $ex561ArchiveFn['Get-BAZAComponentExclusionsFromSettings'], $ex561ArchiveFn['Write-BAZAExclusionsApplied']
+        )
+        $ex561Dispatch = & $ex561Run $ex561DispatchStubs $ex561DispatchFunctions ([scriptblock]::Create(@'
+            [void](Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_APP' -LocalDirectory 'C:\nonexistent-ex561' -RemoteDirectory 'baza_app')
+            $appSession = @($script:Ex561Dispatch.SessionExclusions) -join ','
+            $appProvider = @($script:Ex561Dispatch.ProviderExclusions) -join ','
+            [void](Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_WWW' -LocalDirectory 'C:\nonexistent-ex561' -RemoteDirectory 'baza_www')
+            $wwwSession = @($script:Ex561Dispatch.SessionExclusions) -join ','
+            $script:Ex561Dispatch.Mode = 'Legacy'
+            [void](Invoke-BRAVOBazaCanonicalSync -Component 'BAZA_WWW' -LocalDirectory 'C:\nonexistent-ex561' -RemoteDirectory 'baza_www')
+            [pscustomobject]@{ AppSession = $appSession; AppProvider = $appProvider; WwwSession = $wwwSession; Legacy = (@($script:Ex561Dispatch.LegacyExclusions) -join ',') }
+'@))
+        Test-BRAVOCondition -Condition (
+            $ex561Dispatch.AppSession -eq '*.log,cache' -and $ex561Dispatch.AppProvider -eq '*.log,cache' -and
+            $ex561Dispatch.WwwSession -eq 'tmp*' -and $ex561Dispatch.Legacy -eq 'tmp*'
+        ) -Name 'BazaSync/ExclusionDispatchersPassComponentListToEngineProviderAndLegacy' `
+          -Failure "Invoke-BRAVOBazaIncrementalSync/CanonicalSync: список компонента доходить до сесії, FullAuditProvider і legacy; appSession='$($ex561Dispatch.AppSession)' appProvider='$($ex561Dispatch.AppProvider)' wwwSession='$($ex561Dispatch.WwwSession)' legacy='$($ex561Dispatch.Legacy)' (#561)"
+        }
+        } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigurableExclusions561' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

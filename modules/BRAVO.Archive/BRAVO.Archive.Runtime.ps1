@@ -3605,7 +3605,8 @@ function Remove-BRAVOTemporaryArchiveArtifacts {
     if ([string]::IsNullOrWhiteSpace($TemporaryArchivePath)) {
         return
     }
-    foreach ($artifactPath in @($TemporaryArchivePath, ($TemporaryArchivePath + $hashFileExtension))) {
+    # #561: list-файл виключень 7-Zip (Get-BRAVOArchiveExclusionListPath) — теж артефакт generation.
+    foreach ($artifactPath in @($TemporaryArchivePath, ($TemporaryArchivePath + $hashFileExtension), (Get-BRAVOArchiveExclusionListPath -TemporaryArchivePath $TemporaryArchivePath))) {
         if (Test-Path -LiteralPath $artifactPath -PathType Leaf) {
             try {
                 Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
@@ -3746,6 +3747,60 @@ function New-BRAVOArchiveCreationResult {
     }
 }
 
+function Get-BRAVOArchiveExclusionListPath {
+    # #561: list-файл виключень поруч із тимчасовим архівом у .work. Ім'я
+    # містить '.partial', тож залишок після краху прибирає штатна зачистка
+    # Remove-BRAVOOrphanedTemporaryArchiveArtifacts.
+    param([string]$TemporaryArchivePath)
+    if ([string]::IsNullOrWhiteSpace($TemporaryArchivePath)) { return $null }
+    return ($TemporaryArchivePath + '.exclude.txt')
+}
+
+function Get-BRAVOArchiveComponentExclusions {
+    # #561: componentSettings.Archive.Exclusions.<Component> або порожньо.
+    # Читання стійке до конфігурації без вузла (старий формат, тестовий seed)
+    # і до hashtable / pscustomobject.
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [AllowNull()]$ComponentSettings
+    )
+    $current = $ComponentSettings
+    foreach ($segment in @('Archive', 'Exclusions', $Component)) {
+        if ($null -eq $current) { return @() }
+        if ($current -is [System.Collections.IDictionary]) {
+            if (-not $current.Contains($segment)) { return @() }
+            $current = $current[$segment]
+        } else {
+            $property = $current.PSObject.Properties[$segment]
+            if ($null -eq $property) { return @() }
+            $current = $property.Value
+        }
+    }
+    return @(@($current) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+}
+
+function Write-BRAVOArchiveExclusionList {
+    # #561: перевіряє кожен шаблон тим самим правилом, що й валідатор
+    # конфігурації (Test-BRAVOExclusionPattern), і пише list-файл для 7-Zip
+    # (-xr@<файл> -scsUTF-8): UTF-8 без BOM, один шаблон на рядок. Значення
+    # ніколи не потрапляє в командний рядок. Недопустимий шаблон — виняток
+    # (fail closed): архів без заявлених виключень оператор не замовляв.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Patterns
+    )
+    $index = 0
+    foreach ($pattern in $Patterns) {
+        $problem = Test-BRAVOExclusionPattern -Pattern $pattern
+        if ($null -ne $problem) {
+            throw ("виключення архівації [{0}]: {1}" -f $index, $problem)
+        }
+        $index++
+    }
+    $content = ($Patterns -join "`r`n") + "`r`n"
+    [IO.File]::WriteAllText($Path, $content, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 function New-Archive {
     param(
         [string]$SourcePath,
@@ -3756,7 +3811,10 @@ function New-Archive {
         # Точний шлях створюваного файла. Використовується atomic-конвеєром:
         # архів спершу створюється як тимчасовий артефакт у .work і лише
         # після всіх перевірок публікується під фінальним іменем.
-        [string]$FullArchivePath
+        [string]$FullArchivePath,
+        # #561: list-файл виключень (Write-BRAVOArchiveExclusionList) або порожньо.
+        # Порожньо — аргументи 7-Zip байт-у-байт ті самі, що й без виключень.
+        [string]$ExclusionListPath
     )
 
     # Причина відмови для консольного РЕЗУЛЬТАТ (Причина:/Інструмент:/Код
@@ -3817,6 +3875,12 @@ function New-Archive {
 
         # -p без значення вмикає шифрування і читає пароль зі stdin.
         $arguments = "$effectiveArcParams -p `"$fullArchivePath`" `"$SourcePath`""
+        # #561: виключення — лише як шлях до list-файлу (-xr@: рекурсивно, на
+        # будь-якому рівні), кодування імен UTF-8. Самі шаблони в командний
+        # рядок не потрапляють; шлях list-файлу — наш власний каталог .work.
+        if (-not [string]::IsNullOrWhiteSpace($ExclusionListPath)) {
+            $arguments = "$effectiveArcParams -scsUTF-8 `"-xr@$ExclusionListPath`" -p `"$fullArchivePath`" `"$SourcePath`""
+        }
         Write-BRAVOLog -Component 'ARCHIVE' -Message "Команда: $ArcPath $arguments (пароль передається через stdin)" -Level "DEBUG"
         
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -4015,7 +4079,10 @@ function Invoke-BRAVOComponentBackup {
         [Parameter(Mandatory = $true)][string]$DestinationDirectory,
         [Parameter(Mandatory = $true)][string]$ArchiveName,
         [Parameter(Mandatory = $true)][string]$ArcPath,
-        [string]$ArcParams
+        [string]$ArcParams,
+        # #561: виключення з архіву цього компонента (componentSettings.Archive.
+        # Exclusions.<Component>). Порожньо — 7-Zip запускається як раніше.
+        [string[]]$Exclusions = @()
     )
 
     $result = [pscustomobject]@{
@@ -4070,11 +4137,36 @@ function Invoke-BRAVOComponentBackup {
             return $result
         }
 
-        $creationResult = New-Archive `
-            -SourcePath $SourcePath `
-            -FullArchivePath $result.TemporaryArchivePath `
-            -ArcPath $ArcPath `
-            -ArcParams $ArcParams
+        $exclusionListPath = $null
+        $effectiveExclusions = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($effectiveExclusions.Count -gt 0) {
+            $exclusionListPath = Get-BRAVOArchiveExclusionListPath -TemporaryArchivePath $result.TemporaryArchivePath
+            try {
+                Write-BRAVOArchiveExclusionList -Path $exclusionListPath -Patterns $effectiveExclusions
+            } catch {
+                $result.ErrorStage = 'CREATE'
+                $result.Error = "не вдалося застосувати виключення ${Component}: $($_.Exception.Message)"
+                Write-BRAVOLog -Component 'ARCHIVE' -Message $result.Error -Level "ERROR"
+                Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+                return $result
+            }
+            $exclusionMatch = Get-BRAVOExclusionMatchCount -Path $SourcePath -Patterns $effectiveExclusions
+            Write-BRAVOLog -Component 'ARCHIVE' -Level 'INFO' -Message (
+                "{0}: виключення з архіву ({1}): {2}; збігів у джерелі: файлів {3}, каталогів {4}" -f
+                $Component, $effectiveExclusions.Count, ($effectiveExclusions -join '; '), $exclusionMatch.Files, $exclusionMatch.Directories)
+        }
+        try {
+            $creationResult = New-Archive `
+                -SourcePath $SourcePath `
+                -FullArchivePath $result.TemporaryArchivePath `
+                -ArcPath $ArcPath `
+                -ArcParams $ArcParams `
+                -ExclusionListPath $exclusionListPath
+        } finally {
+            if ($null -ne $exclusionListPath -and (Test-Path -LiteralPath $exclusionListPath -PathType Leaf)) {
+                Remove-Item -LiteralPath $exclusionListPath -Force -ErrorAction SilentlyContinue
+            }
+        }
         $result.CreateSuccess = [bool]$creationResult.CreateSuccess
         $result.IntegritySuccess = [bool]$creationResult.IntegritySuccess
         $result.LegacyBomPasswordFallbackUsed = [bool]$creationResult.LegacyBomPasswordFallbackUsed
@@ -4849,8 +4941,24 @@ function Get-BAZASFTPComparison {
         # Знімок циклу запитано, але він не вдався: LocalSnapshot тоді $null,
         # а об'єкти аудиту ДО перевіряються у хмарі в цій самій сесії
         # (Add-BAZASnapshotUnavailableEvidence).
-        [switch]$SnapshotUnavailable
+        [switch]$SnapshotUnavailable,
+        # #561: виключення SFTP-синхронізації компонента. Порожньо — порівняння
+        # як раніше (CompareDirectories з $null-опціями).
+        [string[]]$Exclusions = @()
     )
+
+    # #561: fail closed — шаблон, що потрапив повз валідатор конфігурації,
+    # до WinSCP не передається; порівняння не виконується.
+    foreach ($exclusionPattern in @($Exclusions)) {
+        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        if ($null -ne $exclusionProblem) {
+            return [pscustomobject]@{
+                Success = $false
+                Error = "недопустимий шаблон виключення '$exclusionPattern': $exclusionProblem"
+                PendingFiles = @()
+            }
+        }
+    }
 
     $components = Get-BRAVOWinSCPDotNetComponents `
         -WinSCPAssemblyPath ([string]$winSCPAssemblyPath) `
@@ -4906,6 +5014,17 @@ function Get-BAZASFTPComparison {
             }
         }
 
+        # #561: маска виключень передається ЛИШЕ коли список непорожній, тож
+        # без виключень CompareDirectories викликається з $null, як раніше.
+        # Маска діє на обидві сторони порівняння — виключений файл не
+        # потрапляє ні до очікуваних передач, ні до «зайвих» у хмарі.
+        $compareTransferOptions = $null
+        $exclusionMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns $Exclusions
+        if (-not [string]::IsNullOrEmpty($exclusionMask)) {
+            $compareTransferOptions = New-Object WinSCP.TransferOptions
+            $compareTransferOptions.FileMask = $exclusionMask
+        }
+
         # removeFiles = false: додаткові файли у накопичувальній хмарі
         # не видаляються і не потрапляють до списку очікуваних передач.
         $comparison = @(
@@ -4916,7 +5035,7 @@ function Get-BAZASFTPComparison {
                 $false,
                 $mirror,
                 $criteria,
-                $null
+                $compareTransferOptions
             )
         )
 
@@ -4985,7 +5104,8 @@ function Get-BAZASFTPComparison {
                 -RemotePath $RemotePath `
                 -LocalSnapshot $LocalSnapshot `
                 -LocalPath $LocalPath `
-                -PreAuditPending @($PreAuditPending)
+                -PreAuditPending @($PreAuditPending) `
+                -Exclusions $Exclusions
         } elseif ($SnapshotUnavailable) {
             $comparisonResult = Add-BAZASnapshotUnavailableEvidence `
                 -ComparisonResult $comparisonResult `
@@ -5395,10 +5515,12 @@ function Add-BAZASnapshotConsistencyEvidence {
         # Залишок аудиту ДО: об'єкти під коренем, яких немає у знімку (зникли
         # до обходу), теж перевіряються у хмарі — наявність на диску зараз
         # не доводить, що їх передано.
-        [object[]]$PreAuditPending = @()
+        [object[]]$PreAuditPending = @(),
+        # #561: живе дерево звіряється зі знімком без виключених об'єктів.
+        [string[]]$Exclusions = @()
     )
 
-    $snapshotDrift = Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $LocalSnapshot -LocalDirectory $LocalPath
+    $snapshotDrift = Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $LocalSnapshot -LocalDirectory $LocalPath -Exclusions $Exclusions
     $snapshotOmitted = New-Object System.Collections.Generic.List[object]
     if ([bool]$snapshotDrift.Success -and -not [string]::IsNullOrWhiteSpace($LocalPath) -and
         $null -ne $LocalSnapshot.PSObject.Properties['Directories'] -and $null -ne $LocalSnapshot.Directories) {
@@ -6224,11 +6346,77 @@ function Get-BAZASynchronizationOutcome {
     }
 }
 
+function Get-BAZAComponentExclusionsFromSettings {
+    # #561: список виключень компонента з результату
+    # Get-BRAVOBazaSettingsEffective; відсутня властивість (старий формат
+    # результату, тестова заглушка) = порожній список, без винятку під StrictMode.
+    param(
+        [AllowNull()][object]$Settings,
+        [Parameter(Mandatory = $true)][string]$Component
+    )
+    if ($null -eq $Settings) { return @() }
+    $exclusionsProperty = $Settings.PSObject.Properties['Exclusions']
+    if ($null -eq $exclusionsProperty -or $null -eq $exclusionsProperty.Value) { return @() }
+    $componentProperty = $exclusionsProperty.Value.PSObject.Properties[$Component]
+    if ($null -eq $componentProperty -or $null -eq $componentProperty.Value) { return @() }
+    return @(@($componentProperty.Value) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) } | ForEach-Object { [string]$_ })
+}
+
+function Write-BAZAExclusionsApplied {
+    # #561: один запис у журналі на синхронізацію компонента — які шаблони
+    # застосовано і скільки локальних об'єктів вони пропускають. Порожній
+    # список нічого не пише (журнал без змін). Підрахунок — лише для журналу;
+    # збій обходу не зупиняє синхронізацію.
+    param(
+        [string]$Component,
+        [string]$LocalDirectory,
+        [string[]]$Exclusions = @()
+    )
+    if (@($Exclusions).Count -eq 0) { return }
+    $filesText = 'невідомо'
+    $directoriesText = 'невідомо'
+    try {
+        $matchCount = Get-BRAVOExclusionMatchCount -Path $LocalDirectory -Patterns $Exclusions
+        $filesText = [string]$matchCount.Files
+        $directoriesText = [string]$matchCount.Directories
+        if ([int]$matchCount.Inaccessible -gt 0) {
+            $filesText += " (недоступних каталогів під час підрахунку: $($matchCount.Inaccessible))"
+        }
+    } catch {
+        Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося підрахувати об'єкти, виключені з синхронізації ${Component}: $($_.Exception.Message)" -Level "WARNING"
+    }
+    Write-BRAVOLog -Component 'SFTP' -Message (
+        "Виключення SFTP-синхронізації ${Component}: шаблонів: $(@($Exclusions).Count) ($(@($Exclusions) -join '; ')); " +
+        "пропущено файлів: $filesText; каталогів: $directoriesText"
+    ) -Level "INFO"
+}
+
+function Test-BAZAPathExcludedByPatterns {
+    # #561: шлях виключений, якщо під шаблон потрапляє він сам АБО будь-який
+    # його каталог-предок (збіглий каталог WinSCP/7-Zip пропускає цілком).
+    # Так локальні перевірки (імена, непорожнє джерело) бачать те саме
+    # дерево, що й синхронізація з -filemask.
+    param(
+        [string]$RelativePath,
+        [string[]]$Patterns = @()
+    )
+    if (@($Patterns).Count -eq 0) { return $false }
+    $segments = @(($RelativePath.Replace('/', '\').Trim('\')) -split '\\')
+    $prefix = ''
+    foreach ($segment in $segments) {
+        $prefix = if ($prefix.Length -eq 0) { $segment } else { $prefix + '\' + $segment }
+        if (Test-BRAVOExclusionMatch -RelativePath $prefix -Patterns $Patterns) { return $true }
+    }
+    return $false
+}
+
 function Get-BAZARemoteNameCompatibilityIssues {
     param(
         [string]$LocalPath,
         [int]$MaximumFileUtf8Bytes = 255,
-        [int]$MaximumDirectoryUtf8Bytes = 255
+        [int]$MaximumDirectoryUtf8Bytes = 255,
+        # #561: виключені об'єкти не передаються, тож їхні задовгі імена не є проблемою.
+        [string[]]$Exclusions = @()
     )
 
     $issues = @()
@@ -6240,6 +6428,14 @@ function Get-BAZARemoteNameCompatibilityIssues {
                 -Force `
                 -ErrorAction Stop
         )
+        if (@($Exclusions).Count -gt 0) {
+            $exclusionRoot = ([string]$LocalPath).TrimEnd('\')
+            $localItems = @($localItems | Where-Object {
+                    -not (Test-BAZAPathExcludedByPatterns `
+                            -RelativePath $_.FullName.Substring($exclusionRoot.Length) `
+                            -Patterns $Exclusions)
+                })
+        }
         foreach ($localItem in $localItems) {
             $utf8ByteCount = [System.Text.Encoding]::UTF8.GetByteCount($localItem.Name)
             $maximumUtf8Bytes = if ($localItem.PSIsContainer) {
@@ -6822,7 +7018,10 @@ function Sync-FolderToSFTP {
         [string]$HostKey,
         [string]$LocalDirectory,
         [string]$RemoteDirectory,
-        [string]$ComponentName = "BAZA"
+        [string]$ComponentName = "BAZA",
+        # #561: виключення цього компонента (Synchronization.Exclusions.*).
+        # Порожньо — скрипт WinSCP і порівняння ті самі, що раніше.
+        [string[]]$Exclusions = @()
     )
 
     $script:lastBAZASyncOutcome = $null
@@ -6835,17 +7034,38 @@ function Sync-FolderToSFTP {
 
     Write-BRAVOLog -Component 'SFTP' -Message "Синхронiзацiя каталогу через WinSCP: $LocalDirectory -> $remotePath"
 
+    # #561: fail closed. Шаблон, що потрапив повз валідатор конфігурації, не
+    # передається до WinSCP: синхронізація не починається.
+    $Exclusions = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    foreach ($exclusionPattern in $Exclusions) {
+        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        if ($null -ne $exclusionProblem) {
+            Write-BRAVOLog -Component 'SFTP' -Message "SFTP-синхронiзацiю $ComponentName заблоковано: недопустимий шаблон виключення '$exclusionPattern' ($exclusionProblem)" -Level "ERROR"
+            return $false
+        }
+    }
+    $exclusionMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns $Exclusions
+
     if (-not (Test-Path -Path $LocalDirectory -PathType Container)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Локальний каталог не знайдено: $LocalDirectory" -Level "ERROR"
         return $false
     }
 
     if ($synchronizationSafety.RequireNonEmptyBAZASource) {
+        # #561: «порожнє джерело» рахується без виключених об'єктів — інакше
+        # каталог, де лишилися самі виключені файли, пройшов би цей захист.
+        $sourceRootForExclusions = ([string]$LocalDirectory).TrimEnd('\')
         $firstSourceFile = Get-BRAVOFiles `
             -LiteralPath $LocalDirectory `
             -Recurse `
             -Force `
             |
+            Where-Object {
+                $Exclusions.Count -eq 0 -or
+                -not (Test-BAZAPathExcludedByPatterns `
+                        -RelativePath $_.FullName.Substring($sourceRootForExclusions.Length) `
+                        -Patterns $Exclusions)
+            } |
             Select-Object -First 1
         if ($null -eq $firstSourceFile) {
             Write-BRAVOLog -Component 'SFTP' -Message "SFTP-синхронiзацiю $ComponentName заблоковано: локальний каталог порожнiй або недоступний" -Level "ERROR"
@@ -6873,10 +7093,12 @@ function Sync-FolderToSFTP {
     } else {
         255
     }
+    Write-BAZAExclusionsApplied -Component $ComponentName -LocalDirectory $LocalDirectory -Exclusions $Exclusions
     $nameCompatibility = Get-BAZARemoteNameCompatibilityIssues `
         -LocalPath $LocalDirectory `
         -MaximumFileUtf8Bytes $fileNameUtf8Limit `
-        -MaximumDirectoryUtf8Bytes 255
+        -MaximumDirectoryUtf8Bytes 255 `
+        -Exclusions $Exclusions
     Write-BAZARemoteNameCompatibilityAudit `
         -CompatibilityResult $nameCompatibility `
         -ComponentName $ComponentName
@@ -6885,7 +7107,8 @@ function Sync-FolderToSFTP {
         -LocalPath $LocalDirectory `
         -RemotePath $remotePath `
         -RepositorySFTPUrl $RepositorySFTPUrl `
-        -HostKey $HostKey
+        -HostKey $HostKey `
+        -Exclusions $Exclusions
     Write-BAZASFTPComparisonAudit `
         -Comparison $comparisonBefore `
         -Stage "Before" `
@@ -6896,13 +7119,22 @@ function Sync-FolderToSFTP {
     # Не виконуємо mkdir: WinSCP повертає код 1, якщо каталог уже існує,
     # навіть коли option batch continue дозволяє перейти до синхронізації.
     # stat однозначно перевіряє каталог і не створює хибної помилки.
+    # #561: маска виключень — ОКРЕМИЙ ключ -filemask у лапках, лише для
+    # непорожнього списку. Вона не зливається з $sftpSynchronizationOptions
+    # (той — DENY_EXECUTION_CONTROL, не місце для даних користувача). Шаблони
+    # вже перевірено вище: лапок і метасимволів скрипту в масці немає.
+    $exclusionFilemaskToken = if ([string]::IsNullOrEmpty($exclusionMask)) {
+        ''
+    } else {
+        ' -filemask="' + $exclusionMask + '"'
+    }
     $winscpCommand = @"
 option confirm off
 open $RepositorySFTPUrl -hostkey="$HostKey" -timeout=$sftpConnectionTimeoutSeconds
 option batch abort
 stat "$remotePath"
 option batch continue
-synchronize remote $sftpSynchronizationOptions "$LocalDirectory" "$remotePath"
+synchronize remote $sftpSynchronizationOptions$exclusionFilemaskToken "$LocalDirectory" "$remotePath"
 exit
 "@
 
@@ -6947,7 +7179,8 @@ exit
         $cycleSnapshot = Get-BRAVOBazaLocalSnapshot `
             -LocalDirectory $LocalDirectory `
             -IncludeHiddenSystem `
-            -IncludeDirectories
+            -IncludeDirectories `
+            -Exclusions $Exclusions
         # Follow-up #501: межа старту передачі — після знімка, безпосередньо
         # перед стартом WinSCP. Новим вважається лише об'єкт, створений після неї.
         $syncStartBoundary = $null
@@ -7055,7 +7288,8 @@ exit
             -HostKey $HostKey `
             -LocalSnapshot $(if ($cycleSnapshot.Success) { $cycleSnapshot } else { $null }) `
             -PreAuditPending $(if ($null -ne $comparisonBefore -and $comparisonBefore.Success) { @($comparisonBefore.PendingFiles) } else { @() }) `
-            -SnapshotUnavailable:(-not $cycleSnapshot.Success)
+            -SnapshotUnavailable:(-not $cycleSnapshot.Success) `
+            -Exclusions $Exclusions
         $syncOutcome = Get-BAZASynchronizationOutcome `
             -WinSCPExitCode $winSCPExitCode `
             -ComparisonBefore $comparisonBefore `
@@ -7159,7 +7393,8 @@ exit
             -LocalPath $LocalDirectory `
             -RemotePath $remotePath `
             -RepositorySFTPUrl $RepositorySFTPUrl `
-            -HostKey $HostKey
+            -HostKey $HostKey `
+            -Exclusions $Exclusions
         Write-BAZASFTPComparisonAudit `
             -Comparison $comparisonAfterException `
             -Stage "After" `
@@ -7206,7 +7441,9 @@ function New-BRAVOBazaArchiveFullAuditProvider {
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
         [Parameter(Mandatory = $true)][string]$RemotePath,
         [Parameter(Mandatory = $true)][string]$RepositorySFTPUrl,
-        [Parameter(Mandatory = $true)][string]$HostKey
+        [Parameter(Mandatory = $true)][string]$HostKey,
+        # #561: виключення компонента для повного аудиту (та сама маска, що й у sync).
+        [string[]]$Exclusions = @()
     )
 
     $capturedComparisonCommand = Get-Command `
@@ -7221,6 +7458,7 @@ function New-BRAVOBazaArchiveFullAuditProvider {
     $capturedRemotePath = $RemotePath
     $capturedSftpUrl = $RepositorySFTPUrl
     $capturedHostKey = $HostKey
+    $capturedExclusions = @($Exclusions)
 
     return {
         param($Snapshot)
@@ -7228,13 +7466,15 @@ function New-BRAVOBazaArchiveFullAuditProvider {
             -LocalPath $capturedLocalDirectory `
             -RemotePath $capturedRemotePath `
             -RepositorySFTPUrl $capturedSftpUrl `
-            -HostKey $capturedHostKey
+            -HostKey $capturedHostKey `
+            -Exclusions $capturedExclusions
         return & $capturedConvertAuditCommand `
             -ComparisonSuccess $comparison.Success `
             -ComparisonError $comparison.Error `
             -PendingFiles $comparison.PendingFiles `
             -LocalDirectory $capturedLocalDirectory `
-            -LocalSnapshot $Snapshot
+            -LocalSnapshot $Snapshot `
+            -Exclusions $capturedExclusions
     }.GetNewClosure()
 }
 
@@ -7254,16 +7494,23 @@ function Invoke-BRAVOBazaIncrementalSync {
     $normalizedRemoteDirectory = $RemoteDirectory.Replace("\", "/").Trim("/")
     $remotePath = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { "/" } else { "/$normalizedRemoteDirectory" }
 
-    $fullAuditProvider = New-BRAVOBazaArchiveFullAuditProvider `
-        -LocalDirectory $LocalDirectory `
-        -RemotePath $remotePath `
-        -RepositorySFTPUrl $sftpUrl `
-        -HostKey $sftpHostKey
-
     # Одна canonical точка інтерпретації для Archive/Health/DryRun
     # (Get-BRAVOBazaSettingsEffective, BRAVO.ArchiveRuntime) — StateRoot з
     # можливим override, MutationPolicy, FullAuditEnabled/EveryDays.
     $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+    # #561: виключення цього компонента з тієї самої точки (читання стійке до
+    # відсутнього вузла). Вони доходять і до повного аудиту (провайдер), і до
+    # сесії синхронізації (знімок/план), тож розходження між ними неможливе.
+    $componentExclusions = Get-BAZAComponentExclusionsFromSettings -Settings $bazaSettingsEffective -Component $Component
+    Write-BAZAExclusionsApplied -Component $Component -LocalDirectory $LocalDirectory -Exclusions $componentExclusions
+
+    $fullAuditProvider = New-BRAVOBazaArchiveFullAuditProvider `
+        -LocalDirectory $LocalDirectory `
+        -RemotePath $remotePath `
+        -RepositorySFTPUrl $sftpUrl `
+        -HostKey $sftpHostKey `
+        -Exclusions $componentExclusions
+
     $mutationPolicy = $bazaSettingsEffective.MutationPolicy
     $autoArchiveMutationThreshold = $bazaSettingsEffective.AutoArchiveMutationThreshold
     $stateRootPath = $bazaSettingsEffective.StateRoot
@@ -7323,7 +7570,8 @@ function Invoke-BRAVOBazaIncrementalSync {
         -FullAuditProvider $fullAuditProvider `
         -FullAuditEveryDays $fullAuditEveryDays `
         -ForceFullAudit:$ForceFullAudit `
-        -WriteCheckpoint
+        -WriteCheckpoint `
+        -Exclusions $componentExclusions
 }
 
 function Invoke-BRAVOBazaCanonicalSync {
@@ -7396,13 +7644,25 @@ function Invoke-BRAVOBazaCanonicalSync {
         }
     } elseif ($mode -eq 'Legacy') {
         Write-BRAVOLog -Component 'SFTP' -Message "BAZA.Mode = Legacy: синхронізація $ComponentName через legacy mirror (synchronize remote -mirror) без MutationPolicy/incremental-стану" -Level "WARNING"
+        # #561: виключення компонента з єдиної точки інтерпретації. Невалідний
+        # шаблон — виняток резолвера: legacy-синхронізація не стартує (fail closed).
+        $legacyExclusions = @()
+        try {
+            $legacyExclusions = @(Get-BAZAComponentExclusionsFromSettings -Settings (Get-BRAVOBazaSettingsEffective) -Component $Component)
+        } catch {
+            $outcome.Error = "виключення SFTP-синхронізації відхилено: $($_.Exception.Message)"
+            Write-BRAVOLog -Component 'SFTP' -Message $outcome.Error -Level "ERROR"
+            $outcome.Status = 'LEGACY_FAILED'
+            return $outcome
+        }
         $legacySuccess = Sync-FolderToSFTP `
             -WinSCPPath $winSCPPath `
             -RepositorySFTPUrl $sftpUrl `
             -HostKey $sftpHostKey `
             -LocalDirectory $LocalDirectory `
             -RemoteDirectory $RemoteDirectory `
-            -ComponentName $ComponentName
+            -ComponentName $ComponentName `
+            -Exclusions $legacyExclusions
         $outcome.Success = [bool]$legacySuccess
         $outcome.Status = if ($outcome.Success) { 'LEGACY_OK' } else { 'LEGACY_FAILED' }
         if ($null -ne $script:lastBAZASyncOutcome) {
@@ -9851,7 +10111,8 @@ function Main {
                     -DestinationDirectory $archive.Destination `
                     -ArchiveName $archiveName `
                     -ArcPath $arcPath `
-                    -ArcParams $archiveParams
+                    -ArcParams $archiveParams `
+                    -Exclusions @(Get-BRAVOArchiveComponentExclusions -Component ([string]$archive.Type) -ComponentSettings $componentSettings)
             } catch {
                 Write-Log "Не вдалося виконати узгоджену VSS-архівацію $($archive.Type): $($_.Exception.Message)" -Level "ERROR"
                 $componentResult = [pscustomobject]@{
