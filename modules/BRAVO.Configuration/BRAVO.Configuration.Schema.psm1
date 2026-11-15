@@ -575,6 +575,7 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'archiveTimestampFormat' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'backupConsistency.Mode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:VSS,Direct' }
     'backupConsistency.SnapshotContext' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:ClientAccessible' }
+    'backupConsistency.CloudPlaceholderPolicy' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Fail,Warn' }
     'backupMonitoring.CandidateLimit' = @{ Class = 'ALLOW_SITE' }
     'backupMonitoring.CheckManagedServices' = @{ Class = 'ALLOW_SITE' }
     'backupMonitoring.Enabled' = @{ Class = 'ALLOW_SITE' }

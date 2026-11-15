@@ -3719,6 +3719,75 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
     }
 }
 
+function Invoke-BRAVOArchiveCloudPlaceholderPreflight {
+    # #560: віртуальні файли Cloud Files (On-demand sync) у джерелі
+    # MODEL/BLOG/BRAVOEXCH виявляються ДО VSS і 7-Zip. 7-Zip від SYSTEM із
+    # VSS-знімка не може їх прочитати без запущеного клієнта синхронізації й
+    # падав кодом 2 без зрозумілої причини. Сканується живе джерело (дешевше
+    # й без VSS-symlink); вміст файлів не читається, гідратація не
+    # запускається.
+    #   Policy Fail (дефолт) — компонент НЕ архівується, причина
+    #                          CloudPlaceholdersInSource (Blocked=$true);
+    #   Policy Warn          — WARNING і архівація продовжується.
+    # Windows без Cloud Files API (до 10 1709, зокрема Win7) — INFO і пропуск.
+    # -AttributeReader, -OSVersion і -SyncRootRegistryPath — лише для self-test.
+    param(
+        [object[]]$Archives,
+        [string]$Policy,
+        [scriptblock]$AttributeReader,
+        [Version]$OSVersion,
+        [string]$SyncRootRegistryPath,
+        [int]$MaxListed = 20
+    )
+
+    $effectivePolicy = if ([string]::Equals($Policy, 'Warn', [StringComparison]::OrdinalIgnoreCase)) { 'Warn' } else { 'Fail' }
+    $support = if ($null -ne $OSVersion) { Get-BRAVOCloudFilesSupport -OSVersion $OSVersion } else { Get-BRAVOCloudFilesSupport }
+    if (-not $support.Supported) {
+        Write-BRAVOLog -Component 'CLOUDFILES' -Message $support.Reason -Level 'INFO'
+        return @()
+    }
+    $syncRoots = @($(if ([string]::IsNullOrWhiteSpace($SyncRootRegistryPath)) {
+        Get-BRAVOCloudFilesSyncRoots
+    } else {
+        Get-BRAVOCloudFilesSyncRoots -RegistryPath $SyncRootRegistryPath
+    }))
+    $findings = New-Object System.Collections.Generic.List[object]
+    foreach ($archive in @($Archives)) {
+        $type = [string]$archive.Type
+        $stateParameters = @{ Path = [string]$archive.Source; MaxListed = $MaxListed; SyncRoots = $syncRoots }
+        if ($null -ne $AttributeReader) { $stateParameters['AttributeReader'] = $AttributeReader }
+        $state = Get-BRAVOCloudFilesSourceState @stateParameters
+        foreach ($root in @($state.SyncRootsInSource)) {
+            Write-BRAVOLog -Component 'CLOUDFILES' -Level 'WARNING' -Message (
+                "{0}: корінь синхронізації Cloud Files {1} ({2}, On-demand={3}) перетинається з джерелом бекапу {4}" -f
+                $type, $root.Provider, $root.Path, $root.OnDemand, $state.Path)
+        }
+        if ($state.InaccessibleCount -gt 0) {
+            Write-BRAVOLog -Component 'CLOUDFILES' -Level 'WARNING' -Message (
+                "{0}: перевірку віртуальних файлів не виконано для {1} недоступних каталогів джерела {2}" -f
+                $type, $state.InaccessibleCount, $state.Path)
+        }
+        if ($state.PlaceholderCount -eq 0) { continue }
+        $listText = (@($state.Placeholders) -join '; ') + $(if ($state.Truncated) { '; ...' } else { '' })
+        $message = ("{0}: у джерелі {1} віртуальних файлів Cloud Files (On-demand sync): {2}. 7-Zip не прочитає їх без запущеного клієнта синхронізації. Перші: {3}" -f
+            $type, $state.Path, $state.PlaceholderCount, $listText)
+        if ($effectivePolicy -eq 'Fail') {
+            Write-BRAVOLog -Component 'CLOUDFILES' -Level 'ERROR' -Message ("CloudPlaceholdersInSource: {0}. Компонент не архівується (backupConsistency.CloudPlaceholderPolicy = Fail)." -f $message)
+        } else {
+            Write-BRAVOLog -Component 'CLOUDFILES' -Level 'WARNING' -Message ("CloudPlaceholdersInSource: {0}. Архівація продовжується (backupConsistency.CloudPlaceholderPolicy = Warn), 7-Zip може завершитися кодом 2." -f $message)
+        }
+        $findings.Add([pscustomobject]@{
+            Type = $type
+            Policy = $effectivePolicy
+            Blocked = ($effectivePolicy -eq 'Fail')
+            PlaceholderCount = [int]$state.PlaceholderCount
+            Placeholders = @($state.Placeholders)
+            Message = $message
+        })
+    }
+    return @($findings.ToArray())
+}
+
 function New-BRAVOArchiveCreationResult {
     # Створення й перевірка цілісності — ДВІ різні події, а не одна.
     # Раніше New-Archive повертав один bool на обидві, тому "архів створено,
@@ -3966,16 +4035,31 @@ function New-Archive {
             # $lastSevenZipOutput — це був останній непорожній рядок
             # $standardOutput, тобто підмножина того, що виклик вище вже
             # отримує цілим потоком; інших читачів у змінної не було.
+            # #560: відомий збій джерела в stderr (Cloud Files без провайдера,
+            # відмова в доступі, зайнятий файл, задовгий шлях) — код причини й
+            # підказка замість голого "код 2". Невідомий текст — як раніше.
+            $sevenZipFailureReason = Get-BRAVOSevenZipFailureReason -StandardError $errorOutput -StandardOutput $standardOutput
+            $sevenZipErrorText = "7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+            if ($null -ne $sevenZipFailureReason) {
+                Write-BRAVOLog -Component 'ARCHIVE' -Level 'ERROR' -Message (
+                    "{0}: {1} ({2})" -f $sevenZipFailureReason.ReasonCode, $sevenZipFailureReason.Hint, $sevenZipErrorText)
+                $sevenZipErrorText = "{0}: {1} ({2})" -f $sevenZipFailureReason.ReasonCode, $sevenZipFailureReason.Hint, $sevenZipErrorText
+            }
             $script:lastArchiveToolFailure = [pscustomobject]@{
                 Tool = '7-Zip'
                 ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
-                ReasonText = "7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+                ReasonCode = $(if ($null -ne $sevenZipFailureReason) { [string]$sevenZipFailureReason.ReasonCode } else { $null })
+                ReasonText = $(if ($null -ne $sevenZipFailureReason) {
+                    "{0}: {1}" -f $sevenZipFailureReason.ReasonCode, $sevenZipFailureReason.Hint
+                } else {
+                    "7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+                })
             }
             return (New-BRAVOArchiveCreationResult `
                 -ArchivePath $fullArchivePath `
                 -ExitCode ([int]$process.ExitCode) `
                 -ErrorStage 'CREATE' `
-                -Error ("7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription))
+                -Error $sevenZipErrorText)
         }
     } catch {
         Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї: $($_.Exception.Message)" -Level "ERROR"
@@ -4266,6 +4350,10 @@ function Write-BRAVOBackupGenerationManifest {
             Status = $componentStatus
             ErrorStage = [string]$component.ErrorStage
             Error = [string]$component.Error
+            # #560: код причини (CloudPlaceholdersInSource,
+            # CloudFilesProviderUnavailable, ...) або $null.
+            ReasonCode = $(if ($null -ne $component.PSObject.Properties['ReasonCode'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$component.ReasonCode)) { [string]$component.ReasonCode } else { $null })
         }
     }
 
@@ -9751,6 +9839,73 @@ function Main {
     $generationFinalizationFailureReason = $null
 
     try {
+        # #560: віртуальні файли Cloud Files у джерелі — до VSS і 7-Zip.
+        # Компонент із ними за політикою Fail отримує власний результат-відмову
+        # (ErrorStage CLOUDFILES, причина CloudPlaceholdersInSource) і в manifest
+        # generation, а решта архівується (generation INCOMPLETE).
+        if ($readyArchives.Count -gt 0) {
+            # Ключ може бути відсутнім у конфігурації, зібраній не канонічним
+            # pipeline (старий формат, тестовий seed): тоді діє дефолт Fail.
+            $cloudPlaceholderPolicy = 'Fail'
+            if ($backupConsistency -is [System.Collections.IDictionary]) {
+                if ($backupConsistency.Contains('CloudPlaceholderPolicy')) { $cloudPlaceholderPolicy = [string]$backupConsistency['CloudPlaceholderPolicy'] }
+            } elseif ($null -ne $backupConsistency -and $null -ne $backupConsistency.PSObject.Properties['CloudPlaceholderPolicy']) {
+                $cloudPlaceholderPolicy = [string]$backupConsistency.CloudPlaceholderPolicy
+            }
+            $cloudPlaceholderFindings = @(Invoke-BRAVOArchiveCloudPlaceholderPreflight `
+                -Archives $readyArchives `
+                -Policy $cloudPlaceholderPolicy)
+            $cloudBlockedTypes = @()
+            foreach ($cloudFinding in @($cloudPlaceholderFindings | Where-Object { $_.Blocked })) {
+                $cloudBlockedTypes += [string]$cloudFinding.Type
+                $cloudArchive = @($readyArchives | Where-Object { [string]$_.Type -eq [string]$cloudFinding.Type })[0]
+                $cloudError = 'CloudPlaceholdersInSource: ' + [string]$cloudFinding.Message
+                $generationResults.Add([pscustomobject]@{
+                    Component = [string]$cloudFinding.Type
+                    GenerationId = $generationId
+                    OriginalSourcePath = [string]$cloudArchive.Source
+                    SnapshotSourcePath = $null
+                    TemporaryArchivePath = $null
+                    ArchivePath = $null
+                    HashPath = $null
+                    CreateSuccess = $false
+                    IntegritySuccess = $false
+                    HashSuccess = $false
+                    ArchiveSize = $null
+                    SHA512 = $null
+                    ErrorStage = 'CLOUDFILES'
+                    Error = $cloudError
+                    ReasonCode = 'CloudPlaceholdersInSource'
+                })
+                $results[[string]$cloudFinding.Type] = @{
+                    ArchiveSuccess = $false
+                    HashSuccess = $false
+                    CreateSuccess = $false
+                    IntegritySuccess = $false
+                    GenerationId = $generationId
+                    ErrorStage = 'CLOUDFILES'
+                    Error = $cloudError
+                    ToolFailure = [pscustomobject]@{
+                        Tool = 'Cloud Files'
+                        ToolExitCodeText = $null
+                        ReasonCode = 'CloudPlaceholdersInSource'
+                        ReasonText = ("CloudPlaceholdersInSource: {0} віртуальних файлів у джерелі {1}" -f $cloudFinding.PlaceholderCount, $cloudFinding.Type)
+                    }
+                }
+                Write-BRAVOArchiveStep `
+                    -Name ("Архівація {0}" -f $cloudFinding.Type) `
+                    -Status 'ERROR' `
+                    -Duration ([timespan]::Zero)
+                Write-BRAVOOperatorReason `
+                    -Reason ("CloudPlaceholdersInSource: у джерелі {0} віртуальних файлів Cloud Files (On-demand sync)" -f $cloudFinding.PlaceholderCount) `
+                    -Details ("Компонент {0} не архівовано. Вимкніть On-demand для каталогу або зробіть файли «завжди на цьому пристрої»; перелік — у журналі." -f $cloudFinding.Type)
+                $operationFailed = $true
+            }
+            if ($cloudBlockedTypes.Count -gt 0) {
+                $readyArchives = @($readyArchives | Where-Object { $cloudBlockedTypes -notcontains [string]$_.Type })
+            }
+        }
+
         if ($readyArchives.Count -gt 0) {
             Write-Log "==="
             Write-Log "=== VSS SNAPSHOT SET ДЛЯ GENERATION $generationId ==="
@@ -9870,6 +10025,14 @@ function Main {
                     ErrorStage = 'VSS'
                     Error = $_.Exception.Message
                 }
+            }
+            # #560: код причини класифікованого збою 7-Zip — у manifest
+            # generation, щоб Health назвав причину, а не лише етап CREATE.
+            if ($null -ne $script:lastArchiveToolFailure -and
+                $null -ne $script:lastArchiveToolFailure.PSObject.Properties['ReasonCode'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$script:lastArchiveToolFailure.ReasonCode) -and
+                $null -eq $componentResult.PSObject.Properties['ReasonCode']) {
+                $componentResult | Add-Member -NotePropertyName 'ReasonCode' -NotePropertyValue ([string]$script:lastArchiveToolFailure.ReasonCode)
             }
             $generationResults.Add($componentResult)
 
@@ -10924,13 +11087,21 @@ function Main {
             -GenerationFinalizationFailureReason $generationFinalizationFailureReason
     } elseif ($null -ne $firstFailedComponent) {
         $failedResult = $results[$firstFailedComponent.Type]
-        $summaryReason = switch ([string]$failedResult.ErrorStage) {
+        # #560: класифікована причина (код + підказка) має пріоритет над
+        # загальним текстом етапу — оператор бачить, ЩО робити.
+        $failedToolFailure = $failedResult.ToolFailure
+        $failedReasonCode = $(if ($null -ne $failedToolFailure -and $null -ne $failedToolFailure.PSObject.Properties['ReasonCode']) {
+            [string]$failedToolFailure.ReasonCode
+        } else { '' })
+        $summaryReason = if (-not [string]::IsNullOrWhiteSpace($failedReasonCode)) {
+            "{0} ({1})" -f [string]$failedToolFailure.ReasonText, $firstFailedComponent.Type
+        } else { switch ([string]$failedResult.ErrorStage) {
             'VSS' { "VSS SNAPSHOT SET FAILED for $($firstFailedComponent.Type)" }
             'INTEGRITY' { "Integrity test failed for $($firstFailedComponent.Type)" }
             'HASH' { "SHA512 generation/verification failed for $($firstFailedComponent.Type)" }
             'PUBLISH' { "Atomic publish failed for $($firstFailedComponent.Type)" }
             default { "Не вдалося створити архів $($firstFailedComponent.Type)" }
-        }
+        } }
         $toolFailure = $results[$firstFailedComponent.Type].ToolFailure
         if ($null -ne $toolFailure) {
             $summaryTool = $toolFailure.Tool
