@@ -3578,6 +3578,26 @@ Test-BRAVOCondition -Condition (
         ) -Name 'Archive/CloudFilesPopulatedSyncDirectoryIsInspected' `
           -Failure ("заповнений каталог Cloud Files (reparse без RECALL_ON_*) у корені синхронізації має обходитися, а reparse-каталог поза коренями — ні (#560). inRoot=[$(@($cfPopulatedInRoot.Placeholders) -join '; ')] noRoot=[$(@($cfPopulatedNoRoot.Placeholders) -join '; ')]")
 
+        # Junction на предка всередині кореня синхронізації — не каталог Cloud
+        # Files: обхід у нього не заходить (інакше цикл до вичерпання ресурсів
+        # ще до VSS; рев'ю PR #563). Junction створюється без прав адміністратора.
+        $cfLoopRoot = Join-Path $cfSandbox 'LOOP'
+        [void][IO.Directory]::CreateDirectory((Join-Path $cfLoopRoot 'inner'))
+        [IO.File]::WriteAllText((Join-Path $cfLoopRoot 'inner\f.txt'), 'x', $cfUtf8)
+        $cfJunction = Join-Path $cfLoopRoot 'inner\back'
+        $cfJunctionOutput = & cmd.exe /c mklink /J "$cfJunction" "$cfLoopRoot" 2>&1
+        $cfJunctionCreated = [IO.Directory]::Exists($cfJunction) -and
+            (([IO.File]::GetAttributes($cfJunction) -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $cfLoopRoots = @([pscustomobject]@{ Id = 'X!S!loop'; Provider = 'X'; UserSid = 'S'; Path = $cfLoopRoot; HydrationPolicy = $null; OnDemand = $true })
+        $cfLoopWatch = [Diagnostics.Stopwatch]::StartNew()
+        $cfLoopState = Get-BRAVOCloudFilesSourceState -Path $cfLoopRoot -SyncRoots $cfLoopRoots
+        $cfLoopWatch.Stop()
+        if ($cfJunctionCreated) { [IO.Directory]::Delete($cfJunction) }
+        Test-BRAVOCondition -Condition (
+            $cfJunctionCreated -and $cfLoopState.FilesScanned -eq 1 -and $cfLoopState.PlaceholderCount -eq 0 -and $cfLoopWatch.Elapsed.TotalSeconds -lt 30
+        ) -Name 'Archive/CloudFilesJunctionInsideSyncRootNotTraversed' `
+          -Failure ("junction/symlink усередині кореня синхронізації не має обходитися як каталог Cloud Files (цикл на предка) (#560, PR #563). created=$cfJunctionCreated files=$($cfLoopState.FilesScanned) ms=$($cfLoopWatch.ElapsedMilliseconds) mklink=[$($cfJunctionOutput -join ' ')]")
+
         # Віртуальний корінь джерела визначається лише за атрибутами кореня — до
         # перевірки шляхів і read probe у Main.
         $cfRootTypesAst = @([System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null).FindAll({ param($node)

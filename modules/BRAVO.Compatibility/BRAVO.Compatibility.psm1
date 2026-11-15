@@ -2882,6 +2882,24 @@ function Test-BRAVOPathContainsOrWithin {
         $b.StartsWith($a, [StringComparison]::OrdinalIgnoreCase))
 }
 
+$script:BRAVOCloudFilesMaxDepth = 256
+
+function Test-BRAVOCloudFilesDirectoryIsNotLink {
+    # $true — reparse-каталог не є junction/symlink (тобто це може бути
+    # каталог Cloud Files, у який можна заходити). LinkType провайдера
+    # FileSystem з'явився в PowerShell 5.0; без нього або за будь-якої помилки
+    # — $false (не заходимо: обережно, як до #560).
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $linkTypeProperty = $item.PSObject.Properties['LinkType']
+        if ($null -eq $linkTypeProperty) { return $false }
+        return [string]::IsNullOrEmpty([string]$linkTypeProperty.Value)
+    } catch {
+        return $false
+    }
+}
+
 function Get-BRAVOCloudFilesSourceState {
     # Обхід джерела бекапу ЯВНО через .NET (DirectoryInfo.GetFileSystemInfos),
     # без залежності від семантики Get-ChildItem -Recurse для reparse point у
@@ -2960,13 +2978,25 @@ function Get-BRAVOCloudFilesSourceState {
                 $descend = (($attributes -band 0x400) -eq 0)
                 if (-not $descend) {
                     $entryPrefix = $entry.FullName.TrimEnd('\') + '\'
+                    $insideSyncRoot = $false
                     foreach ($syncRoot in @($SyncRoots)) {
                         if ($null -eq $syncRoot -or [string]::IsNullOrWhiteSpace([string]$syncRoot.Path)) { continue }
                         if ($entryPrefix.StartsWith(([string]$syncRoot.Path).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
-                            $descend = $true
+                            $insideSyncRoot = $true
                             break
                         }
                     }
+                    # Junction/symlink навіть усередині кореня синхронізації — НЕ
+                    # каталог Cloud Files: посилання на предка дало б нескінченний
+                    # чи експоненційний обхід ще до VSS (рев'ю PR #563).
+                    if ($insideSyncRoot) { $descend = Test-BRAVOCloudFilesDirectoryIsNotLink -Path $entry.FullName }
+                }
+                # Запобіжник: глибина понад $script:BRAVOCloudFilesMaxDepth рівнів —
+                # не заходимо (рахується як недоступний каталог).
+                if ($descend -and (($entry.FullName.Length - $rootPath.Length) -gt 0) -and
+                    @($entry.FullName.Substring($rootPath.Length).Split('\') | Where-Object { $_ }).Count -gt $script:BRAVOCloudFilesMaxDepth) {
+                    $inaccessible++
+                    $descend = $false
                 }
                 if ($descend) { $pending.Push([System.IO.DirectoryInfo]$entry) }
                 continue
