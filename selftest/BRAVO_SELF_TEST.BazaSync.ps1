@@ -3440,6 +3440,45 @@
         ) -Name 'BazaSync/ExclusionDispatchersPassComponentListToEngineProviderAndLegacy' `
           -Failure "Invoke-BRAVOBazaIncrementalSync/CanonicalSync: список компонента доходить до сесії, FullAuditProvider і legacy; appSession='$($ex561Dispatch.AppSession)' appProvider='$($ex561Dispatch.AppProvider)' wwwSession='$($ex561Dispatch.WwwSession)' legacy='$($ex561Dispatch.Legacy)' (#561)"
         }
+        # Рев'ю Codex (#561): нечитабельний ВИКЛЮЧЕНИЙ каталог не зриває знімок і
+        # звірку з живим деревом — виключені каталоги відсікаються до спуску.
+        # Каталог робиться нечитабельним для поточного користувача (deny ACE),
+        # ACE прибирається у finally. Без виключення той самий каталог — відмова.
+        & {
+            $exDenyRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_EX561_DENY_' + [guid]::NewGuid().ToString('N'))
+            $exDenyDir = Join-Path $exDenyRoot 'locked'
+            $exIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $exDenyRule = New-Object Security.AccessControl.FileSystemAccessRule($exIdentity, [Security.AccessControl.FileSystemRights]::ListDirectory, [Security.AccessControl.AccessControlType]::Deny)
+            $exDenyApplied = $false
+            try {
+                [void][IO.Directory]::CreateDirectory($exDenyDir)
+                [IO.File]::WriteAllText((Join-Path $exDenyRoot 'keep.txt'), 'x')
+                [IO.File]::WriteAllText((Join-Path $exDenyDir 'secret.txt'), 'x')
+                $exAcl = Get-Acl -LiteralPath $exDenyDir
+                $exAcl.AddAccessRule($exDenyRule)
+                Set-Acl -LiteralPath $exDenyDir -AclObject $exAcl
+                $exDenyApplied = $true
+                $exExcludedSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $exDenyRoot -IncludeDirectories -Exclusions @('locked')
+                $exUnexcludedSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $exDenyRoot -IncludeDirectories
+                $exCompare = $(if ([bool]$exExcludedSnapshot.Success) {
+                    Compare-BRAVOBazaLocalSnapshotToLiveTree -Snapshot $exExcludedSnapshot -LocalDirectory $exDenyRoot -Exclusions @('locked')
+                } else { $null })
+                Test-BRAVOCondition -Condition (
+                    [bool]$exExcludedSnapshot.Success -and $exExcludedSnapshot.Entries.ContainsKey('keep.txt') -and
+                    -not $exExcludedSnapshot.Directories.Contains('locked') -and
+                    -not [bool]$exUnexcludedSnapshot.Success -and
+                    $null -ne $exCompare -and [bool]$exCompare.Success -and @($exCompare.Vanished).Count -eq 0
+                ) -Name 'BazaSync/ExclusionUnreadableExcludedDirectoryIsPrunedBeforeDescent' `
+                  -Failure "нечитабельний виключений каталог має відсікатися до спуску у знімку й звірці з живим деревом, а без виключення — давати відмову (#561). excluded=$($exExcludedSnapshot.Success) '$($exExcludedSnapshot.Error)' unexcluded=$($exUnexcludedSnapshot.Success) compare=$(if ($null -ne $exCompare) { $exCompare.Success } else { 'n/a' })"
+            } finally {
+                if ($exDenyApplied) {
+                    $exAcl = Get-Acl -LiteralPath $exDenyDir
+                    [void]$exAcl.RemoveAccessRule($exDenyRule)
+                    Set-Acl -LiteralPath $exDenyDir -AclObject $exAcl
+                }
+                if (Test-Path -LiteralPath $exDenyRoot) { Remove-Item -LiteralPath $exDenyRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
         } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'BazaSync/ConfigurableExclusions561' } }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {

@@ -305,6 +305,38 @@ function Test-BRAVOBazaPathExcluded {
     return $excluded
 }
 
+function Get-BRAVOBazaPrunedTreeItems {
+    # #561: перелік дерева по одному каталогу (TopDirectoryOnly) з відсіканням
+    # виключених файлів і каталогів ДО спуску. Семантика спуску та сама, що в
+    # SearchOption.AllDirectories (зокрема reparse-каталоги проходяться), а
+    # помилка переліку НЕвиключеного каталогу так само кидає виняток. Повертає
+    # List[FileSystemInfo]: файли і, з -IncludeDirectories, каталоги.
+    param(
+        [Parameter(Mandatory = $true)][IO.DirectoryInfo]$Root,
+        [Parameter(Mandatory = $true)][string]$NormalizedRoot,
+        [Parameter(Mandatory = $true)][string[]]$Patterns,
+        [Parameter(Mandatory = $true)][hashtable]$Cache,
+        [switch]$IncludeDirectories
+    )
+    $items = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
+    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+    $pending.Push($Root)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in $directory.EnumerateFileSystemInfos('*', [IO.SearchOption]::TopDirectoryOnly)) {
+            $relativePath = $item.FullName.Substring($NormalizedRoot.Length).TrimStart('\', '/')
+            if (Test-BRAVOBazaPathExcluded -RelativePath $relativePath -Patterns $Patterns -Cache $Cache) { continue }
+            if ($item -is [IO.DirectoryInfo]) {
+                $pending.Push([IO.DirectoryInfo]$item)
+                if ($IncludeDirectories) { $items.Add($item) }
+            } else {
+                $items.Add($item)
+            }
+        }
+    }
+    return ,$items
+}
+
 function Get-BRAVOBazaLocalSnapshot {
     # Один прохід .NET-переліку (не Get-ChildItem provider layer — той самий
     # підхід, що вже застосований у Maintenance для великих дерев) —
@@ -355,7 +387,13 @@ function Get-BRAVOBazaLocalSnapshot {
         $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
         # Пряме присвоєння результату методу зберігає лінивий перелік; вираз
         # if { ... } розгорнув би все дерево в масив до початку циклу.
-        if ($IncludeDirectories) {
+        if ($exclusionPatterns.Count -gt 0) {
+            # #561 (рев'ю Codex): з виключеннями — обхід по одному каталогу з
+            # відсіканням виключених ДО спуску, інакше нечитабельний виключений
+            # каталог зривав би знімок (AllDirectories спускається в нього).
+            $items = Get-BRAVOBazaPrunedTreeItems -Root $rootInfo -NormalizedRoot $normalizedRoot `
+                -Patterns $exclusionPatterns -Cache $exclusionCache -IncludeDirectories:$IncludeDirectories
+        } elseif ($IncludeDirectories) {
             $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
         } else {
             $items = $rootInfo.EnumerateFiles('*', [IO.SearchOption]::AllDirectories)
@@ -438,7 +476,13 @@ function Compare-BRAVOBazaLocalSnapshotToLiveTree {
     try {
         $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
         $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
-        $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        if ($exclusionPatterns.Count -gt 0) {
+            # #561 (рев'ю Codex): відсікання виключених каталогів до спуску.
+            $items = Get-BRAVOBazaPrunedTreeItems -Root $rootInfo -NormalizedRoot $normalizedRoot `
+                -Patterns $exclusionPatterns -Cache $exclusionCache -IncludeDirectories
+        } else {
+            $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        }
         foreach ($item in $items) {
             $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
             if ($exclusionPatterns.Count -gt 0 -and
