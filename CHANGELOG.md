@@ -7,7 +7,7 @@
   режимі On-demand лишають у джерелі віртуальні файли («лише онлайн»: `RECALL_ON_DATA_ACCESS` 0x400000 /
   `RECALL_ON_OPEN` 0x40000). 7-Zip від SYSTEM із VSS-знімка не може прочитати їх без запущеного
   клієнта й завершувався кодом 2 без зрозумілої причини. BRAVO_ARCHIV тепер до VSS і 7-Zip обходить джерело
-  MODEL/BLOG/BRAVOEXCH явно через .NET (вміст не читається, гідратація не запускається; віртуальний каталог, зокрема сам корінь джерела, не відкривається). `OFFLINE` + reparse без `RECALL_ON_*` (HSM, storage tiering, dedup) віртуальним файлом не вважається. Нове site-налаштування
+  MODEL/BLOG/BRAVOEXCH явно через .NET (вміст не читається, гідратація не запускається; віртуальний каталог, зокрема сам корінь джерела, не відкривається; заповнений каталог Cloud Files — reparse point без `RECALL_ON_*` — обходиться всередині зареєстрованого кореня синхронізації, junction/symlink поза коренями — ні). Віртуальний корінь джерела визначається за атрибутами ще до перевірки шляхів і SYSTEM read probe, які перелічували б його вміст. `OFFLINE` + reparse без `RECALL_ON_*` (HSM, storage tiering, dedup) віртуальним файлом не вважається. Нове site-налаштування
   `backupConsistency.CloudPlaceholderPolicy` (`ALLOW_WITH_VALIDATOR`, `Fail` | `Warn`, дефолт `Fail`): `Fail` — компонент
   не архівується (етап `CLOUDFILES`, причина `CloudPlaceholdersInSource`, кількість і перші 20 файлів у журналі,
   рядок причини в консолі й «РЕЗУЛЬТАТ», `ReasonCode` у manifest generation, решта компонентів архівується —

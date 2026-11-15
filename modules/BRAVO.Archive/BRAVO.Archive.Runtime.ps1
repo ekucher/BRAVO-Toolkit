@@ -3788,6 +3788,37 @@ function Invoke-BRAVOArchiveCloudPlaceholderPreflight {
     return @($findings.ToArray())
 }
 
+function Get-BRAVOArchiveCloudPlaceholderRootTypes {
+    # #560: компоненти, корінь джерела яких сам є віртуальним каталогом Cloud
+    # Files. Лише атрибути кореня (Directory.Exists / File.GetAttributes
+    # вміст не перелічують); на ОС без Cloud Files API — порожньо.
+    # -OSVersion і -AttributeReader — лише для self-test.
+    param(
+        [object[]]$Archives,
+        [Version]$OSVersion,
+        [scriptblock]$AttributeReader
+    )
+    $support = if ($null -ne $OSVersion) { Get-BRAVOCloudFilesSupport -OSVersion $OSVersion } else { Get-BRAVOCloudFilesSupport }
+    if (-not $support.Supported) { return @() }
+    $types = New-Object System.Collections.Generic.List[string]
+    foreach ($archive in @($Archives)) {
+        $rootPath = ([string]$archive.Source).TrimEnd('*').TrimEnd('\')
+        if ([string]::IsNullOrWhiteSpace($rootPath)) { continue }
+        try {
+            if (-not [System.IO.Directory]::Exists($rootPath)) { continue }
+            $attributes = if ($null -ne $AttributeReader) {
+                [long](& $AttributeReader (New-Object System.IO.DirectoryInfo($rootPath)))
+            } else {
+                [long][int][System.IO.File]::GetAttributes($rootPath)
+            }
+        } catch {
+            continue
+        }
+        if (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes $attributes) { $types.Add([string]$archive.Type) }
+    }
+    return @($types.ToArray())
+}
+
 function Get-BRAVOArchiveComponentReasons {
     # #560: {component; reasonCode; reason} для компонентів, чий збій має
     # класифікований код причини (ToolFailure.ReasonCode). Порядок — за назвою.
@@ -9459,11 +9490,24 @@ function Main {
         }
     }
 
+    # #560: джерело, корінь якого сам є віртуальним каталогом Cloud Files,
+    # визначається лише за атрибутами кореня — ДО Test-PathWithLog ('<src>\*'
+    # розгортає wildcard переліком) і SYSTEM read probe (EnumerateFileSystemEntries).
+    # Перелік такого каталогу запустив би провайдер (гідратація) або впав би під
+    # SYSTEM, і компонент вибув би як «шлях відсутній» замість
+    # CloudPlaceholdersInSource. Для нього обидві перевірки пропускаються, а
+    # рішення ухвалює preflight Cloud Files нижче (рев'ю #560).
+    $cloudPlaceholderRootTypes = @(Get-BRAVOArchiveCloudPlaceholderRootTypes -Archives $enabledArchives)
     foreach ($archive in $enabledArchives) {
-        $sourceAvailable = Test-PathWithLog `
-            -Path $archive.Source `
-            -Description "Джерело архiву $($archive.Type) мiстить данi" `
-            -CreateIfMissing $false
+        $sourceAvailable = if ($cloudPlaceholderRootTypes -contains [string]$archive.Type) {
+            $null = Write-BRAVOLog -Component 'PATHS' -Level 'INFO' -Message ("Джерело архiву {0} ({1}) — віртуальний каталог Cloud Files: перевірку вмісту пропущено, рішення ухвалить preflight Cloud Files" -f $archive.Type, $archive.Source)
+            $true
+        } else {
+            Test-PathWithLog `
+                -Path $archive.Source `
+                -Description "Джерело архiву $($archive.Type) мiстить данi" `
+                -CreateIfMissing $false
+        }
         $destinationAvailable = Test-PathWithLog `
             -Path $archive.Destination `
             -Description "Каталог архiву $($archive.Type)" `
@@ -9625,6 +9669,8 @@ function Main {
 
     $sourceProbeTargets = New-Object System.Collections.Generic.List[object]
     foreach ($archive in $enabledArchives) {
+        # #560: віртуальний корінь Cloud Files не відкриваємо (див. вище).
+        if ($cloudPlaceholderRootTypes -contains [string]$archive.Type) { continue }
         [void]$sourceProbeTargets.Add([pscustomobject]@{
             Path = [string]$archive.Source; Owner = 'Archive'; Component = [string]$archive.Type
         })

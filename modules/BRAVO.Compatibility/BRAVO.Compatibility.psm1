@@ -2952,7 +2952,23 @@ function Get-BRAVOCloudFilesSourceState {
                 continue
             }
             if ($isDirectory) {
-                if (($attributes -band 0x400) -eq 0) { $pending.Push([System.IO.DirectoryInfo]$entry) }
+                # Звичайний каталог — обходимо. Reparse-каталог обходимо лише
+                # всередині зареєстрованого кореня синхронізації: заповнений
+                # локально каталог Cloud Files лишається reparse point без
+                # бітів RECALL_ON_*, а під ним можуть бути віртуальні файли
+                # (рев'ю #560). Junction/symlink поза коренями не проходимо.
+                $descend = (($attributes -band 0x400) -eq 0)
+                if (-not $descend) {
+                    $entryPrefix = $entry.FullName.TrimEnd('\') + '\'
+                    foreach ($syncRoot in @($SyncRoots)) {
+                        if ($null -eq $syncRoot -or [string]::IsNullOrWhiteSpace([string]$syncRoot.Path)) { continue }
+                        if ($entryPrefix.StartsWith(([string]$syncRoot.Path).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                            $descend = $true
+                            break
+                        }
+                    }
+                }
+                if ($descend) { $pending.Push([System.IO.DirectoryInfo]$entry) }
                 continue
             }
             $filesScanned++

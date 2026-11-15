@@ -982,6 +982,7 @@ function Remove-BRAVOVSSSnapshotSet {
 function Resolve-BRAVOSnapshotSourcePath { param($SnapshotSet, $OriginalPath) return $OriginalPath }
 # #560: preflight Cloud Files — без віртуальних файлів у джерелах (окремі тести Archive/Cloud*).
 function Invoke-BRAVOArchiveCloudPlaceholderPreflight { param($Archives, $Policy) return @() }
+function Get-BRAVOArchiveCloudPlaceholderRootTypes { param($Archives) return @() }
 function Invoke-BRAVOComponentBackup {
     param($Component, $GenerationId, $OriginalSourcePath, $SourcePath, $DestinationDirectory, $ArchiveName, $ArcPath, $ArcParams)
     Add-ProbeEvent "COMPONENT-BACKUP $Component"
@@ -3554,6 +3555,51 @@ Test-BRAVOCondition -Condition (
             $cfMissingRegistry.Count -eq 0
         ) -Name 'Archive/CloudFilesSyncRootsFromRegistry' `
           -Failure ("корені синхронізації: провайдер з Id до '!', On-demand = не ALWAYS_FULL, перетин із джерелом, відсутній реєстр — порожній список (#560). roots=$($cfRoots.Count) overlap=$(@($cfOverlap.SyncRootsInSource).Count)")
+
+        # Заповнений каталог Cloud Files: reparse point без RECALL_ON_*,
+        # усередині — віртуальний файл. У корені синхронізації його обходимо,
+        # поза коренями (як junction) — ні.
+        $cfPopulatedReader = & {
+            {
+                param($Item)
+                $value = [long][int]$Item.Attributes
+                if ($Item.Name -eq 'sub') { $value = $value -bor 0x400 }
+                if ($Item.Name -eq 'b.txt') { $value = $value -bor 0x400000 }
+                if ($Item.Name -eq 'cloudDir') { $value = $value -bor 0x400000 }
+                return $value
+            }
+        }
+        $cfPopulatedInRoot = Get-BRAVOCloudFilesSourceState -Path $cfSource -SyncRoots $cfRoots -AttributeReader $cfPopulatedReader
+        $cfPopulatedNoRoot = Get-BRAVOCloudFilesSourceState -Path $cfSource -SyncRoots @() -AttributeReader $cfPopulatedReader
+        Test-BRAVOCondition -Condition (
+            @($cfPopulatedInRoot.Placeholders) -contains 'sub\b.txt' -and
+            -not (@($cfPopulatedNoRoot.Placeholders) -contains 'sub\b.txt') -and
+            @($cfPopulatedNoRoot.Placeholders) -contains 'cloudDir'
+        ) -Name 'Archive/CloudFilesPopulatedSyncDirectoryIsInspected' `
+          -Failure ("заповнений каталог Cloud Files (reparse без RECALL_ON_*) у корені синхронізації має обходитися, а reparse-каталог поза коренями — ні (#560). inRoot=[$(@($cfPopulatedInRoot.Placeholders) -join '; ')] noRoot=[$(@($cfPopulatedNoRoot.Placeholders) -join '; ')]")
+
+        # Віртуальний корінь джерела визначається лише за атрибутами кореня — до
+        # перевірки шляхів і read probe у Main.
+        $cfRootTypesAst = @([System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null).FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOArchiveCloudPlaceholderRootTypes' }, $true))
+        $cfRootTypes = @(& {
+            param([string]$FunctionText, [object[]]$Archives, [scriptblock]$Reader)
+            . ([scriptblock]::Create($FunctionText))
+            Get-BRAVOArchiveCloudPlaceholderRootTypes -Archives $Archives -OSVersion (New-Object Version(10, 0, 19045)) -AttributeReader $Reader
+        } $(if ($cfRootTypesAst.Count -eq 1) { $cfRootTypesAst[0].Extent.Text } else { 'function Get-BRAVOArchiveCloudPlaceholderRootTypes { @() }' }) @(
+            @{ Type = 'MODEL'; Source = ($cfSource + '\*') },
+            @{ Type = 'BRAVOEXCH'; Source = ((Join-Path $cfSandbox 'cloudDir') + '\*') },
+            @{ Type = 'BLOG'; Source = (Join-Path $cfSandbox 'absent\*') }) $cfReader)
+        $cfRootTypesCall = $archiveScriptText.IndexOf('$cloudPlaceholderRootTypes = @(Get-BRAVOArchiveCloudPlaceholderRootTypes -Archives $enabledArchives)')
+        $cfSourcePathCheck = $archiveScriptText.IndexOf('-Description "Джерело архiву $($archive.Type) мiстить данi"')
+        $cfSourceProbeSkip = $archiveScriptText.IndexOf('if ($cloudPlaceholderRootTypes -contains [string]$archive.Type) { continue }')
+        $cfSourceProbeLoop = $archiveScriptText.IndexOf('$readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probeGroup.Path)')
+        Test-BRAVOCondition -Condition (
+            $cfRootTypes.Count -eq 1 -and $cfRootTypes[0] -eq 'BRAVOEXCH' -and
+            $cfRootTypesCall -gt 0 -and $cfRootTypesCall -lt $cfSourcePathCheck -and
+            $cfSourceProbeSkip -gt $cfRootTypesCall -and $cfSourceProbeSkip -lt $cfSourceProbeLoop
+        ) -Name 'Archive/CloudFilesVirtualRootSkipsPathAndProbeEnumeration' `
+          -Failure ("віртуальний корінь джерела визначається за атрибутами кореня до Test-PathWithLog (wildcard = перелік) і виключається з SYSTEM read probe, щоб рішення ухвалив preflight Cloud Files (#560). types=[$($cfRootTypes -join ', ')]")
 
         # --- Preflight Archive: обидві політики й пропуск на старій ОС ---
         $cfAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
