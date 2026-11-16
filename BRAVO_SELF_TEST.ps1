@@ -3249,6 +3249,12 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
 
         # 1. Oracle comparison across sizes and algorithms.
         $fileHashOracleMismatch = ""
+        $fileHashOracleAlgorithms = $fileHashAlgorithms
+        $fileHashOracleNote = ""
+        if ([System.Security.Cryptography.CryptoConfig]::AllowOnlyFipsAlgorithms) {
+            $fileHashOracleAlgorithms = @($fileHashAlgorithms | Where-Object { $_ -ne "MD5" })
+            $fileHashOracleNote = " (MD5 skipped: FIPS-only host)"
+        }
         try {
             $fileHashRandom = New-Object System.Random(498)
             $fileHashGetFileHash = Get-Command -Name "Get-FileHash" -CommandType Cmdlet, Function -ErrorAction SilentlyContinue
@@ -3257,7 +3263,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 $fileHashRandom.NextBytes($fileHashBytes)
                 $fileHashOraclePath = Join-Path $fileHashTestRoot ("oracle_{0}.bin" -f $fileHashSize)
                 [IO.File]::WriteAllBytes($fileHashOraclePath, $fileHashBytes)
-                foreach ($fileHashAlg in $fileHashAlgorithms) {
+                foreach ($fileHashAlg in $fileHashOracleAlgorithms) {
                     $fileHashOracleHasher = New-Object -TypeName ("System.Security.Cryptography.{0}CryptoServiceProvider" -f $fileHashAlg)
                     try {
                         $fileHashExpected = ([BitConverter]::ToString($fileHashOracleHasher.ComputeHash([IO.File]::ReadAllBytes($fileHashOraclePath)))).Replace("-", "")
@@ -3285,7 +3291,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Test-BRAVOCondition `
             -Condition ($fileHashOracleMismatch -eq "") `
             -Name "Compatibility/FileHashMatchesOracleAllAlgorithms" `
-            -Failure "Get-BRAVOFileHash differs from the CryptoServiceProvider/Get-FileHash oracle: $fileHashOracleMismatch"
+            -Failure "Get-BRAVOFileHash differs from the CryptoServiceProvider/Get-FileHash oracle: $fileHashOracleMismatch$fileHashOracleNote"
 
         # 2. Known-answer SHA512.
         $fileHashKatEmpty = Join-Path $fileHashTestRoot "kat_empty.bin"
@@ -3451,6 +3457,57 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             -Name "Compatibility/FileHashResultShape" `
             -Failure "unexpected result shape: $fileHashShapeProblem"
 
+        # 11. Failures are terminating even with no outer try (separate runspace).
+        $fileHashTermProblem = ""
+        $fileHashTermLock = $null
+        try {
+            $fileHashTermModulePath = Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"
+            $fileHashTermScript = 'param($ModulePath, $TargetPath) Import-Module -Name $ModulePath -Force -DisableNameChecking; $r = BRAVO.Compatibility\Get-BRAVOFileHash -Path $TargetPath; "REACHED"'
+            $fileHashTermInvoke = {
+                param([string]$TargetPath)
+                $ps = [powershell]::Create()
+                $outcome = @{ Output = @(); Threw = $false; HadErrors = $false }
+                try {
+                    [void]$ps.AddScript($fileHashTermScript).AddArgument($fileHashTermModulePath).AddArgument($TargetPath)
+                    try {
+                        $outcome.Output = @($ps.Invoke() | ForEach-Object { [string]$_ })
+                    } catch {
+                        $outcome.Threw = $true
+                    }
+                    $outcome.HadErrors = [bool]$ps.HadErrors
+                } finally {
+                    $ps.Dispose()
+                }
+                return $outcome
+            }
+            $fileHashTermLock = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $fileHashTermLocked = & $fileHashTermInvoke $fileHashSharePath
+            $fileHashTermLock.Dispose()
+            $fileHashTermLock = $null
+            $fileHashTermMissing = & $fileHashTermInvoke (Join-Path $fileHashTestRoot "missing_term.bin")
+            $fileHashTermDir = & $fileHashTermInvoke $fileHashBracketDir
+            foreach ($fileHashTermCase in @(@("locked", $fileHashTermLocked), @("missing", $fileHashTermMissing))) {
+                $fileHashTermOutcome = $fileHashTermCase[1]
+                if ($fileHashTermOutcome.Output -contains "REACHED") {
+                    $fileHashTermProblem += "$($fileHashTermCase[0]): REACHED printed after failure; "
+                }
+                if (-not ($fileHashTermOutcome.Threw -or $fileHashTermOutcome.HadErrors)) {
+                    $fileHashTermProblem += "$($fileHashTermCase[0]): no error reported; "
+                }
+            }
+            if (-not ($fileHashTermDir.Output -contains "REACHED") -or $fileHashTermDir.Threw -or $fileHashTermDir.HadErrors) {
+                $fileHashTermProblem += "directory control: REACHED=$($fileHashTermDir.Output -contains 'REACHED') threw=$($fileHashTermDir.Threw) hadErrors=$($fileHashTermDir.HadErrors); "
+            }
+        } catch {
+            $fileHashTermProblem += "exception: $($_.Exception.Message)"
+        } finally {
+            if ($null -ne $fileHashTermLock) { $fileHashTermLock.Dispose() }
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashTermProblem -eq "") `
+            -Name "Compatibility/FileHashFailureIsTerminatingWithoutOuterTry" `
+            -Failure "failures must stop a caller without an outer try, and a directory must reach the next statement: $fileHashTermProblem"
+
         # 10. Static contract over the function body.
         $fileHashStaticProblem = ""
         try {
@@ -3485,16 +3542,52 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                     $fileHashBufferAssignment.Right.Expression -is [System.Management.Automation.Language.ConstantExpressionAst]) {
                     $fileHashBufferValue = [long]$fileHashBufferAssignment.Right.Expression.Value
                 }
+                $fileHashStreamCommand = @($fileHashFunctionAst.Body.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.CommandAst] -and
+                            $node.GetCommandName() -eq "New-Object" -and
+                            $node.Extent.Text.Contains("System.IO.FileStream")
+                        }, $true)) | Select-Object -First 1
+                $fileHashShareReadFound = $false
+                if ($null -ne $fileHashStreamCommand) {
+                    $fileHashShareReadFound = (@($fileHashStreamCommand.FindAll({
+                                    param($node)
+                                    $node -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                                    $node.Static -and
+                                    $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+                                    $node.Expression.TypeName.FullName -eq "System.IO.FileShare" -and
+                                    $node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                                    $node.Member.Value -eq "Read"
+                                }, $true)).Count -gt 0)
+                }
+                $fileHashFnStart = $fileHashFunctionAst.Extent.StartOffset
+                $fileHashFnEnd = $fileHashFunctionAst.Extent.EndOffset
+                $fileHashReadWriteTokens = @($fileHashParseTokens | Where-Object {
+                        $_.Kind -ne [System.Management.Automation.Language.TokenKind]::Comment -and
+                        $_.Extent.StartOffset -ge $fileHashFnStart -and
+                        $_.Extent.EndOffset -le $fileHashFnEnd -and
+                        $_.Text -like "*ReadWrite*"
+                    })
+                $fileHashCatchThrows = (@($fileHashFunctionAst.Body.FindAll({
+                                param($node)
+                                $node -is [System.Management.Automation.Language.CatchClauseAst] -and
+                                @($node.Body.FindAll({
+                                            param($inner)
+                                            $inner -is [System.Management.Automation.Language.ThrowStatementAst]
+                                        }, $true)).Count -gt 0
+                            }, $true)).Count -gt 0)
                 if ($fileHashCommandNames -contains "Get-FileHash") {
                     $fileHashStaticProblem = "calls Get-FileHash"
                 } elseif (-not $fileHashBodyText.Contains("System.IO.FileStream")) {
                     $fileHashStaticProblem = "no System.IO.FileStream"
                 } elseif (-not $fileHashBodyText.Contains("SequentialScan")) {
                     $fileHashStaticProblem = "no SequentialScan"
-                } elseif (-not $fileHashBodyText.Contains("FileShare]::Read")) {
-                    $fileHashStaticProblem = "no FileShare]::Read"
-                } elseif ($fileHashBodyText.Contains("ReadWrite")) {
-                    $fileHashStaticProblem = "contains ReadWrite"
+                } elseif (-not $fileHashShareReadFound) {
+                    $fileHashStaticProblem = "FileStream New-Object arguments lack [System.IO.FileShare]::Read"
+                } elseif ($fileHashReadWriteTokens.Count -gt 0) {
+                    $fileHashStaticProblem = "non-comment token contains ReadWrite"
+                } elseif (-not $fileHashCatchThrows) {
+                    $fileHashStaticProblem = "no catch clause containing a throw statement"
                 } elseif (-not $fileHashBodyText.Contains("CryptoServiceProvider")) {
                     $fileHashStaticProblem = "no CryptoServiceProvider"
                 } elseif ($fileHashBufferValue -lt 1048576) {
