@@ -16,6 +16,8 @@
 | `docs/engineering/documentation-language.md` | Мовна політика документації |
 | `docs/engineering/selftest-performance/baseline.md` | Baseline продуктивності SELF_TEST і opt-in профіль секцій (`BRAVO_SELFTEST_PROFILE=1`) |
 | `docs/engineering/selftest-performance/results.md` | Результати оптимізації SELF_TEST (OPT-12): 3 пари Full before/after, межі доказу |
+| `docs/engineering/selftest-parallel/VAL-01-suite-inventory.md` | VAL-01: інвентар 30 suite, root-порядок, check-universe і виміряні числа для `3d441d4e` |
+| `docs/engineering/selftest-parallel/VAL-02-check-identity.md` | VAL-02: ідентичність перевірок (`-Name`), контекст K, модель еквівалентності (Name, Result) |
 
 ## Що це за проект
 
