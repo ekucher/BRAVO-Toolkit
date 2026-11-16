@@ -6873,6 +6873,263 @@ function Show-FlowOrderParamForm($Items) { $copy = $Items; $Items = New-Object S
         -Name "Rollback/UpdaterRollsBackOnFailureAfterDeployStarted" `
         -Failure "виняток/збій robocopy після backup і до проходження гейтів мусить запускати той самий точний відкат (прапорець DeployStarted між backup і розгортанням, відкат у catch, exit 2 при невдачі) — інакше лишається напіврозгорнутий комплект із exit 33 (#289)"
 }
+
+# =====================================================================
+# Приватний staging розкатки (#545, AUD-AG14-001)
+# =====================================================================
+# Раніше Update-BRAVOServer.ps1 і Install-BRAVOServer.ps1 розпаковували комплект
+# у C:\Temp\BRAVO_UPDATE / C:\Temp\BRAVO_INSTALL, створені звичайним New-Item.
+# C:\Temp може створити й контролювати будь-який локальний користувач: архів між
+# Get-FileHash і Expand-Archive чи staged-файли перед robocopy підмінювались, і
+# підмінений код виконувався від SYSTEM. Контракт тепер:
+#   * staging — щоразу новий каталог у $env:SystemRoot\Temp, створений ОДРАЗУ з
+#     DACL «лише Administrators і SYSTEM», власник Administrators; наявний
+#     каталог або інший DACL — відмова до розпакування;
+#   * SHA-256 рахується на копії архіву в цьому каталозі, і розпаковується вона ж;
+#   * staged-дерево звіряється з RUNTIME_MANIFEST.json комплекту ДО першої зміни
+#     runtime: файл, змінений після хешування, зупиняє розкатку.
+# Блок — у власній області (& { ... }) за конвенцією #163.
+& {
+    $stgDeployRoot = Join-Path $root 'deploy'
+    $stgUpdaterText = [IO.File]::ReadAllText((Join-Path $stgDeployRoot 'Update-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+    $stgInstallerText = [IO.File]::ReadAllText((Join-Path $stgDeployRoot 'Install-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+    $stgHelperPath = Join-Path $stgDeployRoot 'BRAVO.Deploy.Staging.ps1'
+
+    # --- Статично: канонічний helper, жодного C:\Temp ---
+    Test-BRAVOCondition `
+        -Condition (
+            [IO.File]::Exists($stgHelperPath) -and
+            $stgUpdaterText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Staging.ps1'") -and
+            $stgUpdaterText.Contains("throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1") -and
+            $stgInstallerText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.Staging.ps1'") -and
+            $stgInstallerText.Contains("throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1") -and
+            -not ($stgUpdaterText -match '(?i)''C:\\Temp\\BRAVO_') -and
+            -not ($stgInstallerText -match '(?i)''C:\\Temp\\BRAVO_')
+        ) `
+        -Name 'Deploy/StagingNotInUserCreatableTemp' `
+        -Failure 'скрипти розкатки не повинні мати staging у C:\Temp (його створює й контролює звичайний користувач); оновлювач бере приватний staging з deploy\BRAVO.Deploy.Staging.ps1 і зупиняється без нього (#545)'
+
+    # Порядок операторів: приватний каталог -> копія архіву -> SHA-256 копії ->
+    # розпакування копії. Будь-який запис у staging раніше за створення каталогу
+    # з DACL лишив би вікно з правами батьківського каталогу.
+    $stgOrder = {
+        param([string]$Text, [string]$RootVar, [string]$BaseFunction, [string]$CreateFunction)
+        $problems = @()
+        $assign = $Text.IndexOf('$' + $RootVar + ' = Join-Path (' + $BaseFunction + ') ')
+        $create = $Text.IndexOf($CreateFunction + ' -Path $' + $RootVar)
+        $firstWrites = @(
+            $Text.IndexOf('Invoke-WebRequest -Uri ($base + $zipName)'),
+            $Text.IndexOf('Copy-Item -LiteralPath $sourceZipPath'),
+            $Text.IndexOf('Get-FileHash -LiteralPath $ZipPath'),
+            $Text.IndexOf('Expand-Archive -LiteralPath $ZipPath')) | Where-Object { $_ -ge 0 }
+        $zipReassign = $Text.IndexOf('$ZipPath = Join-Path $' + $RootVar + ' (Split-Path -Leaf $sourceZipPath)')
+        $copy = $Text.IndexOf('Copy-Item -LiteralPath $sourceZipPath -Destination $ZipPath')
+        $hash = $Text.IndexOf('Get-FileHash -LiteralPath $ZipPath')
+        $expand = $Text.IndexOf('Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged')
+        if ($assign -lt 0) { $problems += ('немає $' + $RootVar + ' = Join-Path (' + $BaseFunction + ') ...') }
+        if ($create -lt 0 -or $create -lt $assign) { $problems += ($CreateFunction + ' -Path $' + $RootVar + ' не знайдено після присвоєння') }
+        if (@($firstWrites).Count -ne 4) { $problems += ('знайдено ' + @($firstWrites).Count + ' з 4 операцій staging') }
+        foreach ($write in @($firstWrites)) { if ($write -lt $create) { $problems += ('запис у staging до ' + $CreateFunction + ' (позиція ' + $write + ')') } }
+        if (-not ($zipReassign -ge 0 -and $zipReassign -lt $copy -and $copy -lt $hash -and $hash -lt $expand)) {
+            $problems += 'порядок «копія архіву в приватний staging -> SHA-256 копії -> розпакування копії» порушено'
+        }
+        if (-not $Text.Contains('$staged = Join-Path $' + $RootVar + " 'staged'")) { $problems += ('$staged не під $' + $RootVar) }
+        if ($Text -match '(?i)New-Item[^\r\n]*-Path\s+\$StagingRoot\b' -or $Text -match '(?i)Join-Path\s+\$StagingRoot\b') {
+            $problems += '$StagingRoot оператора досі використовується як каталог'
+        }
+        if ($Text -match '(?i)Join-Path \(Split-Path -Parent \$ZipPath\) ''release-manifest\.json''') {
+            $problems += 'release-manifest.json шукається поруч із копією, а не з вихідним архівом'
+        }
+        return @($problems)
+    }
+    $stgUpdaterOrder = @(& $stgOrder $stgUpdaterText 'privateStagingRoot' 'Get-BRAVODeployPrivateDirectoryBase' 'New-BRAVODeployPrivateDirectory')
+    Test-BRAVOCondition `
+        -Condition ($stgUpdaterOrder.Count -eq 0) `
+        -Name 'Deploy/UpdaterStagingPrivateBeforeFirstWrite' `
+        -Failure ('Update-BRAVOServer.ps1: приватний staging має створюватись до першого запису, а SHA-256 і розпакування — над тією самою копією архіву (#545): ' + ($stgUpdaterOrder -join '; '))
+    $stgInstallerOrder = @(& $stgOrder $stgInstallerText 'installStagingRoot' 'Get-BRAVOInstallPrivateDirectoryBase' 'New-BRAVOInstallPrivateDirectory')
+    Test-BRAVOCondition `
+        -Condition ($stgInstallerOrder.Count -eq 0) `
+        -Name 'Deploy/InstallerStagingPrivateBeforeFirstWrite' `
+        -Failure ('Install-BRAVOServer.ps1: приватний staging має створюватись до першого запису, а SHA-256 і розпакування — над тією самою копією архіву (#545): ' + ($stgInstallerOrder -join '; '))
+
+    # --- Staged-дерево звіряється ДО першої зміни runtime ---
+    $stgUpdaterCheck = $stgUpdaterText.IndexOf('$stagedIntegrity = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $staged')
+    $stgUpdaterThrow = $stgUpdaterText.IndexOf('if (-not $stagedIntegrity.IsMatch) {')
+    $stgUpdaterFlag = $stgUpdaterText.IndexOf('$script:DeployStarted = $true')
+    $stgUpdaterDeploy = $stgUpdaterText.IndexOf('$rcDeploy = robocopy')
+    $stgUpdaterBackup = $stgUpdaterText.IndexOf('$rcBackup = robocopy')
+    $stgInstallerCheck = $stgInstallerText.IndexOf('Assert-BRAVOInstallBundleIntegrity -BundleRoot $staged -BeforeDeploy')
+    $stgInstallerMkdir = $stgInstallerText.IndexOf('[void](New-Item -ItemType Directory -Path $RuntimeRoot -Force)')
+    $stgInstallerCopy = $stgInstallerText.IndexOf('& robocopy.exe $staged $RuntimeRoot')
+    # Звірка з УСІМА записами перевіреної копії архіву (а не лише з маніфестом:
+    # він не охоплює .json/.md/.config, які robocopy теж копіює) і відмова за розбіжності.
+    $stgArchiveCall = '$stagedArchiveMatch = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $ZipPath -StagedRoot $staged'
+    $stgArchiveThrow = 'if (-not $stagedArchiveMatch.IsMatch) {'
+    $stgUpdaterArchive = $stgUpdaterText.IndexOf($stgArchiveCall)
+    $stgUpdaterArchiveThrow = $stgUpdaterText.IndexOf($stgArchiveThrow)
+    $stgInstallerArchive = $stgInstallerText.IndexOf($stgArchiveCall)
+    $stgInstallerArchiveThrow = $stgInstallerText.IndexOf($stgArchiveThrow)
+    $stgUpdaterExpand = $stgUpdaterText.IndexOf('Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged')
+    $stgInstallerExpand = $stgInstallerText.IndexOf('Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged')
+    Test-BRAVOCondition `
+        -Condition (
+            $stgUpdaterCheck -ge 0 -and $stgUpdaterCheck -lt $stgUpdaterThrow -and $stgUpdaterThrow -lt $stgUpdaterFlag -and
+            $stgUpdaterFlag -lt $stgUpdaterDeploy -and $stgUpdaterBackup -lt $stgUpdaterCheck -and
+            $stgUpdaterArchive -gt $stgUpdaterExpand -and $stgUpdaterArchive -lt $stgUpdaterArchiveThrow -and $stgUpdaterArchiveThrow -lt $stgUpdaterFlag -and
+            $stgInstallerCheck -ge 0 -and $stgInstallerCheck -lt $stgInstallerMkdir -and $stgInstallerCheck -lt $stgInstallerCopy -and
+            $stgInstallerArchive -gt $stgInstallerExpand -and $stgInstallerArchive -lt $stgInstallerArchiveThrow -and
+            $stgInstallerArchiveThrow -lt $stgInstallerMkdir -and $stgInstallerArchiveThrow -lt $stgInstallerCopy
+        ) `
+        -Name 'Deploy/StagedTreeVerifiedBeforeFirstRuntimeChange' `
+        -Failure 'staged-дерево має звірятися з усіма записами перевіреної копії архіву (Test-BRAVODeployStagedTreeMatchesArchive) і з RUNTIME_MANIFEST.json до першої зміни runtime: в оновлювачі — до DeployStarted і robocopy, в інсталяторі — до створення каталогу й robocopy (#545)'
+
+    # Поведінка звірки з архівом: файл поза RUNTIME_MANIFEST.json (.md), змінений
+    # після хешування, зайвий і відсутній файл — відмова; чисте розпакування — збіг.
+    $stgZipSandbox = Join-Path ([IO.Path]::GetTempPath()) ('bravo_stg545zip_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $stgArchiveResults = & {
+            param([string]$HelperPath, [string]$Sandbox)
+            . $HelperPath
+            $utf8 = New-Object System.Text.UTF8Encoding($false)
+            $source = Join-Path $Sandbox 'source'
+            [void][IO.Directory]::CreateDirectory((Join-Path $source 'docs'))
+            [IO.File]::WriteAllText((Join-Path $source 'BRAVO_A.ps1'), "'a'", $utf8)
+            [IO.File]::WriteAllText((Join-Path $source 'docs\NOTES.md'), 'notes', $utf8)
+            [IO.File]::WriteAllText((Join-Path $source 'VERSION.json'), '{}', $utf8)
+            $zip = Join-Path $Sandbox 'bundle.zip'
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory($source, $zip)
+            $staged = Join-Path $Sandbox 'staged'
+            Expand-Archive -LiteralPath $zip -DestinationPath $staged
+            $out = [ordered]@{}
+            $out.Clean = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $zip -StagedRoot $staged
+            [IO.File]::WriteAllText((Join-Path $staged 'docs\NOTES.md'), 'tampered', $utf8)
+            [IO.File]::WriteAllText((Join-Path $staged 'EXTRA.config'), 'x', $utf8)
+            [IO.File]::Delete((Join-Path $staged 'VERSION.json'))
+            $out.Tampered = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $zip -StagedRoot $staged
+            return [pscustomobject]$out
+        } $stgHelperPath $stgZipSandbox
+        $stgTamperedProblems = @($stgArchiveResults.Tampered.Problems)
+        Test-BRAVOCondition `
+            -Condition (
+                $stgArchiveResults.Clean.IsMatch -and -not $stgArchiveResults.Tampered.IsMatch -and
+                $stgTamperedProblems -contains 'змінено після перевірки архіву: docs/NOTES.md' -and
+                $stgTamperedProblems -contains 'файла немає в архіві: EXTRA.config' -and
+                $stgTamperedProblems -contains 'відсутній у staging: VERSION.json'
+            ) `
+            -Name 'Deploy/StagedTreeMatchesArchiveCoversEveryFile' `
+            -Failure ("звірка staged-дерева з архівом має охоплювати кожен файл будь-якого розширення: змінений .md, зайвий і відсутній файл — відмова (#545). clean=[$(@($stgArchiveResults.Clean.Problems) -join '; ')] tampered=[$($stgTamperedProblems -join '; ')]")
+    } finally {
+        if (Test-Path -LiteralPath $stgZipSandbox) { Remove-Item -LiteralPath $stgZipSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Поведінка тієї самої звірки: файл, змінений після хешування, і сторонній скрипт.
+    . (Join-Path $stgDeployRoot 'BRAVO.Deploy.Rollback.ps1')
+    $stgSandbox = Join-Path ([IO.Path]::GetTempPath()) ('bravo_stg545_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $stgUtf8 = New-Object System.Text.UTF8Encoding($false)
+        [void][IO.Directory]::CreateDirectory((Join-Path $stgSandbox 'modules'))
+        [IO.File]::WriteAllText((Join-Path $stgSandbox 'BRAVO_A.ps1'), "'a'", $stgUtf8)
+        [IO.File]::WriteAllText((Join-Path $stgSandbox 'modules\B.psm1'), "'b'", $stgUtf8)
+        $stgFiles = [ordered]@{}
+        foreach ($stgRel in @('BRAVO_A.ps1', 'modules\B.psm1')) {
+            $stgFiles[$stgRel] = Get-BRAVODeployFileSha256 -Path (Join-Path $stgSandbox $stgRel)
+        }
+        $stgManifest = Join-Path $stgSandbox 'RUNTIME_MANIFEST.json'
+        [IO.File]::WriteAllText($stgManifest, (([pscustomobject]@{ files = $stgFiles }) | ConvertTo-Json -Depth 4), $stgUtf8)
+        $stgClean = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $stgSandbox -ManifestPath $stgManifest
+        [IO.File]::WriteAllText((Join-Path $stgSandbox 'modules\B.psm1'), "'tampered'", $stgUtf8)
+        $stgTampered = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $stgSandbox -ManifestPath $stgManifest
+        [IO.File]::WriteAllText((Join-Path $stgSandbox 'modules\B.psm1'), "'b'", $stgUtf8)
+        [IO.File]::WriteAllText((Join-Path $stgSandbox 'BRAVO_EXTRA.ps1'), "'x'", $stgUtf8)
+        $stgExtra = Test-BRAVODeployRuntimeMatchesManifest -RuntimeRoot $stgSandbox -ManifestPath $stgManifest
+        Test-BRAVOCondition `
+            -Condition (
+                $stgClean.IsMatch -and
+                -not $stgTampered.IsMatch -and @($stgTampered.Problems) -contains 'змінено: modules/B.psm1' -and
+                -not $stgExtra.IsMatch -and @($stgExtra.Problems) -contains 'сторонній скрипт: BRAVO_EXTRA.ps1'
+            ) `
+            -Name 'Deploy/StagedFileChangedAfterHashIsRefused' `
+            -Failure ("звірка staged-дерева має відхиляти файл, змінений після хешування, і сторонній скрипт (#545). clean=$($stgClean.IsMatch) tampered=[$(@($stgTampered.Problems) -join '; ')] extra=[$(@($stgExtra.Problems) -join '; ')]")
+    } finally {
+        if (Test-Path -LiteralPath $stgSandbox) { Remove-Item -LiteralPath $stgSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- Поведінка helper-а приватного каталогу ---
+    $stgAclFailures = @()
+    $stgIsWindows = ($env:OS -eq 'Windows_NT')
+    $stgIsElevated = $false
+    if ($stgIsWindows) {
+        $stgIsElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    }
+    $stgAclResults = & {
+        param([string]$HelperPath, [bool]$IsWindows)
+        . $HelperPath
+        $out = [ordered]@{}
+        # Основа: без $env:SystemRoot чи з неіснуючим — відмова з українською причиною.
+        $savedSystemRoot = $env:SystemRoot
+        $baseOutcomes = @()
+        try {
+            foreach ($caseRoot in @('', (Join-Path ([IO.Path]::GetTempPath()) ('no_systemroot_' + [guid]::NewGuid().ToString('N'))))) {
+                $env:SystemRoot = $caseRoot
+                try { [void](Get-BRAVODeployPrivateDirectoryBase); $baseOutcomes += "'$caseRoot': без відмови" } catch {
+                    if ($_.Exception.Message -notmatch '[\u0400-\u04FF]') { $baseOutcomes += "'$caseRoot': причина не українська" }
+                }
+            }
+        } finally { $env:SystemRoot = $savedSystemRoot }
+        $out.BaseOutcomes = @($baseOutcomes)
+        # Наявний каталог (підкладений заздалегідь) — відмова, вміст не чіпається.
+        $squat = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_STG545_SQUAT_' + [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($squat)
+        [IO.File]::WriteAllText((Join-Path $squat 'planted.ps1'), "'planted'")
+        try {
+            try { New-BRAVODeployPrivateDirectory -Path $squat; $out.Squat = 'без відмови' } catch {
+                $out.Squat = $(if ($_.Exception.Message -match 'уже існує' -and [IO.File]::Exists((Join-Path $squat 'planted.ps1'))) { 'OK' } else { 'інша причина: ' + $_.Exception.Message })
+            }
+        } finally { Remove-Item -LiteralPath $squat -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($IsWindows) {
+            $probe = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_STG545_ACL_' + [guid]::NewGuid().ToString('N'))
+            try {
+                try {
+                    New-BRAVODeployPrivateDirectory -Path $probe
+                    $out.Threw = $false; $out.Message = ''; $out.Acl = (Get-Acl -LiteralPath $probe)
+                } catch {
+                    $out.Threw = $true; $out.Message = $_.Exception.Message; $out.Acl = $null
+                }
+            } finally {
+                if (Test-Path -LiteralPath $probe) { Remove-Item -LiteralPath $probe -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        return [pscustomobject]$out
+    } $stgHelperPath $stgIsWindows
+    foreach ($stgBaseOutcome in @($stgAclResults.BaseOutcomes)) { $stgAclFailures += ('Get-BRAVODeployPrivateDirectoryBase ' + $stgBaseOutcome) }
+    if ($stgAclResults.Squat -ne 'OK') { $stgAclFailures += ('наявний каталог: ' + $stgAclResults.Squat) }
+    if ($stgIsWindows) {
+        if ($stgIsElevated) {
+            if ($stgAclResults.Threw -or $null -eq $stgAclResults.Acl) {
+                $stgAclFailures += ('елевований Windows: каталог не створено: ' + $stgAclResults.Message)
+            } else {
+                $stgRules = @($stgAclResults.Acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                $stgSids = @($stgRules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+                if (-not $stgAclResults.Acl.AreAccessRulesProtected) { $stgAclFailures += 'успадкування DACL не вимкнено' }
+                if (@($stgRules | Where-Object { $_.IsInherited }).Count -ne 0) { $stgAclFailures += 'є успадковані правила' }
+                if (($stgSids -join ',') -ne 'S-1-5-18,S-1-5-32-544') { $stgAclFailures += ('SID у DACL: ' + ($stgSids -join ',')) }
+                $stgOwner = $stgAclResults.Acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+                if ($stgOwner -ne 'S-1-5-32-544') { $stgAclFailures += ('власник: ' + $stgOwner) }
+            }
+        } elseif (-not $stgAclResults.Threw -or $stgAclResults.Message -notmatch '[\u0400-\u04FF]') {
+            # Без елевації DACL «лише Administrators/SYSTEM» з власником
+            # Administrators не встановити — fail closed.
+            $stgAclFailures += ("неелевований Windows: очікувалась відмова з українською причиною, отримано Threw=$($stgAclResults.Threw) '$($stgAclResults.Message)'")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($stgAclFailures.Count -eq 0) `
+        -Name 'Deploy/PrivateStagingDirectoryProtectedOrRefused' `
+        -Failure ('BRAVO.Deploy.Staging.ps1: приватний staging — новий каталог у $env:SystemRoot\Temp з DACL лише Administrators/SYSTEM (власник Administrators); наявний каталог чи неможливість встановити DACL — відмова до розпакування (#545): ' + ($stgAclFailures -join '; '))
+}
 } catch { Register-BRAVOSelfTestSectionFault -ErrorRecord $_ } finally { Complete-BRAVOSelfTestSection -Name 'Governance/GenericObjectListBinderGate' } }
 if (Enter-BRAVOSelfTestSection -Name 'Governance/SelfTestClosureScope') { try {
 
