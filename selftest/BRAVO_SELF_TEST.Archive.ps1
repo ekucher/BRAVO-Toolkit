@@ -2445,6 +2445,30 @@ try {
     ) -Name 'Archive/501/S18TypeReplacementIsChangedNotNew' `
       -Failure "заміна файл<->каталог під час циклу має бути ChangedDuringSync, справжні нові — NewAfterCutoff; changed=$($c18Changed -join ',') new=$($c18New -join ',')"
 
+    # 19. BAZA_WWW поводиться так само, як BAZA_APP: файл, створений у WWW під час
+    # власної синхронізації BAZA_WWW (APP чистий), — ПОПЕРЕДЖЕННЯ/10, не ПОМИЛКА.
+    $c19 = & $late501NewCase 'S19'
+    $r19 = & $late501Run -CaseRoot $c19.Root -Remote $c19.Remote -WithWWW -DuringSyncWrites @(
+        & $late501Write 'BAZA_WWW' (Join-Path $c19.Www 'KZ\2026\late-www.pdf') 50
+    )
+    Test-BRAVOCondition -Condition (
+        $r19.Manual.Success -and $r19.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r19.ExitCode -eq 10 -and
+        $r19.App.IsComplete -and
+        $r19.Www.NewAfterCutoffCount -eq 1 -and $r19.Www.RealMissingCount -eq 0 -and $r19.Www.IsCompleteWithNewAfterCutoff
+    ) -Name 'Archive/501/S19WwwLateFileDuringWwwSyncIsWarning' `
+      -Failure "файл, створений у WWW під час синхронізації BAZA_WWW, має давати ПОПЕРЕДЖЕННЯ/10; label=$($r19.Label) exit=$($r19.ExitCode) wwwNew=$($r19.Www.NewAfterCutoffCount) wwwReal=$($r19.Www.RealMissingCount)"
+
+    # 20. НЕГАТИВНИЙ КОНТРОЛЬ для WWW: старий (до старту) файл WWW не передано при
+    # коді WinSCP 0 — ПОМИЛКА/50. Файл лише в WWW, щоб FailPaths не зачепили APP.
+    $c20 = & $late501NewCase 'S20'
+    & $late501NewFile (Join-Path $c20.Www 'KZ\2026\www-only-pending.pdf') 300
+    $r20 = & $late501Run -CaseRoot $c20.Root -Remote $c20.Remote -WithWWW -FailPaths @('KZ\2026\www-only-pending.pdf')
+    Test-BRAVOCondition -Condition (
+        -not $r20.Manual.Success -and $r20.Label -eq 'ПОМИЛКА' -and $r20.ExitCode -eq 50 -and
+        $r20.Www.RealMissingCount -eq 1 -and $r20.Www.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/S20WwwPreexistingNotTransferredIsError' `
+      -Failure "непередане старе в WWW має давати ПОМИЛКА/50; label=$($r20.Label) exit=$($r20.ExitCode) wwwReal=$($r20.Www.RealMissingCount) wwwNew=$($r20.Www.NewAfterCutoffCount)"
+
     # ------------------------------------------------------------
     # #501 follow-up: консистентність знімка.
     #   P2 — обхід знімка неатомарний: об'єкт поза знімком "новий" лише тоді,
