@@ -94,8 +94,10 @@
   Self-test: `Compatibility/FileHashMatchesOracleAllAlgorithms`, `FileHashKnownAnswerSha512`,
   `FileHashLiteralBracketPath`, `FileHashMissingFileThrows`, `FileHashDirectoryReturnsNothing`,
   `FileHashExclusiveLockThrows`, `FileHashConcurrentReaderSucceeds`, `FileHashReleasesHandle`,
-  `FileHashResultShape`, `FileHashStaticContract`, `FileHashFailureIsTerminatingWithoutOuterTry`. Oracle-порівняння
-  пропускає MD5 на хості лише з FIPS.
+  `FileHashResultShape`, `FileHashStaticContract`, `FileHashFailureIsTerminatingWithoutOuterTry`,
+  `FileHashFipsAlgorithmSelection`, `FileHashFipsFilterAppliedToAllLoops`. Oracle-порівняння і перевірка форми
+  результату пропускають MD5 на хості лише з FIPS (один спільний відфільтрований список алгоритмів), тому self-test
+  там не переривається.
 
 - **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
   шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
