@@ -75,6 +75,25 @@
   недостатньо verified generation, пошкоджена COMPLETE між порогами під час активного SHA512, збій читання
   всередині `Get-BRAVOFileHash`, перевірка логів).
 
+- **Perf: `Get-BRAVOFileHash` читає файл буфером 1 MiB замість `Get-FileHash` (#498).**
+  `Get-BRAVOFileHash` (`modules/BRAVO.Compatibility`) більше не делегує Windows PowerShell 5.1 `Get-FileHash`,
+  який читає по 4 KB. Хеш рахується через `FileStream` з буфером 1 MiB і `FileOptions.SequentialScan`, тому
+  кількість викликів ReadFile на файл під час перевірки SHA512 N найновіших generation у retention зменшується
+  приблизно в 256 разів. Зміна стосується всіх викликачів (створення архіву, retention, Maintenance, Health,
+  перевірки інструментів DataRestore). Контракт не змінено: ті самі значення хешу; семантика `-LiteralPath` через
+  `Resolve-Path` (ProviderPath); відсутній файл кидає виняток; для каталогу результату немає (як у
+  `Get-FileHash`); `FileShare.Read`; фабрика хешера в тому ж порядку, що й у `Get-FileHash`
+  (`<Alg>CryptoServiceProvider` першим, сумісність із FIPS); результат `Algorithm`/`Hash` (верхній
+  регістр)/`Path`. Рішення retention і гарантії безпеки #335 без змін, нових ключів конфігурації немає,
+  контракт журналу не змінено (поле `FileHashProvider` у стартовому записі лишається як є). Не перевірено:
+  фактичне зменшення дискових IOPS чи часу на store, подібному до production (кеш Windows з read-ahead уже
+  об'єднує послідовні читання; стенда немає), тому прискорення в разах не заявляється. Не входить (лишається
+  відкритим у #498): кешування результатів перевірки в manifest і перенесення retention після SFTP-вивантаження.
+  Self-test: `Compatibility/FileHashMatchesOracleAllAlgorithms`, `FileHashKnownAnswerSha512`,
+  `FileHashLiteralBracketPath`, `FileHashMissingFileThrows`, `FileHashDirectoryReturnsNothing`,
+  `FileHashExclusiveLockThrows`, `FileHashConcurrentReaderSucceeds`, `FileHashReleasesHandle`,
+  `FileHashResultShape`, `FileHashStaticContract`.
+
 - **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
   шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
   (1) якщо записаний у manifest шлях збігався з канонічним, файла за ним не було, а каталог компонента був
