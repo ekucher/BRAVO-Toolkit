@@ -189,7 +189,7 @@ release-manifest.json
 `ci/New-BRAVOReleaseArtifact.ps1`: збірка з конкретного git ref із
 провенанс-гейтом (`sourceCommit` має бути повним hash), `*.zip.sha256`,
 `release-manifest.json` (product/version/sourceCommit/files+hashes),
-повний self-test із розпакованого артефакту перед публікацією; процедура
+повний self-test із розпакованого артефакту (з #556 — на checkout того самого коміта) перед публікацією; процедура
 отримання/перевірки описана в `BRAVO_SETUP.md`, розділ «Отримання
 комплекту (release artifact)».
 
