@@ -3235,6 +3235,30 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         return $fixtureRoot
     }
 
+    # #239 (прогалини 2 і 5): канонічний шаблон BRAVO_CONFIG_LOADER.ps1 для
+    # фікстур гейта LEGACY_READER_ISOLATION. Гейт фіксує (R0-R6) саме цю форму
+    # guard'а, тож CLEAN-фікстури мусять її повторювати, а DETECTED-варіанти
+    # відхилятися від неї в одному місці ($lc* - окремі фрагменти шаблону для .Replace()).
+    $lcParam = 'param($ConfigRoot, [switch]$ConfigPathWasExplicit, [switch]$DisallowLegacyPrimaryAutoDetect)'
+    $lcExplicit = '$configPathWasExplicit = [bool]$ConfigPathWasExplicit'
+    $lcBlocked = '$legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and $legacyConfigFileExistsOnDisk -and -not $configPathWasExplicit'
+    $lcExists = '$legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked'
+    $lcImportCall = 'Import-BravoLegacyPrimaryConfiguration -ConfigPath X'
+    $lcIf = 'if ($legacyConfigFileExists) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }'
+    $lcReadCall = '; $x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath $ConfigPath'
+    $legacyReaderCanonicalLoaderText = @'
+function Read-BRAVOLegacyPrimaryRawOverrides { param($ConfigPath) }
+function Import-BravoLegacyPrimaryConfiguration { param($ConfigPath); $x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath $ConfigPath }
+function Import-BravoConfiguration {
+    param($ConfigRoot, [switch]$ConfigPathWasExplicit, [switch]$DisallowLegacyPrimaryAutoDetect)
+    $configPathWasExplicit = [bool]$ConfigPathWasExplicit
+    $legacyConfigFileExistsOnDisk = Test-Path -LiteralPath X -PathType Leaf
+    $legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and $legacyConfigFileExistsOnDisk -and -not $configPathWasExplicit
+    $legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked
+    if ($legacyConfigFileExists) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }
+}
+'@
+
     $releaseGateBareFlagRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
     try {
         $releaseGateBareFlagResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateBareFlagRoot -ProductionEntryPointRelativePath @('entry.ps1')
@@ -3359,7 +3383,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     try {
         [IO.File]::WriteAllText(
             (Join-Path $legacyReaderSelfReferenceFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
-            "function Read-BRAVOLegacyPrimaryRawOverrides { }`nfunction Import-BravoLegacyPrimaryConfiguration { Read-BRAVOLegacyPrimaryRawOverrides }",
+            $legacyReaderCanonicalLoaderText,
             (New-Object Text.UTF8Encoding($false))
         )
         $legacyReaderSelfReferenceFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderSelfReferenceFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
@@ -3618,9 +3642,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     # Import-BravoLegacyPrimaryConfiguration лише з Import-BravoConfiguration).
     $legacyReaderLoaderSanctionedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
     try {
-        $sanctionedLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
-            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
-            "function Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }"
+        $sanctionedLoaderText = $legacyReaderCanonicalLoaderText
         [IO.File]::WriteAllText(
             (Join-Path $legacyReaderLoaderSanctionedFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
             $sanctionedLoaderText,
@@ -3645,10 +3667,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     # гейт — файл більше не отримує повний file-level allowlist.
     $legacyReaderLoaderUnsanctionedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
     try {
-        $unsanctionedLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
-            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
-            "function Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }`n" +
-            "function Invoke-RogueShortcut { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Y }"
+        $unsanctionedLoaderText = $legacyReaderCanonicalLoaderText + "`nfunction Invoke-RogueShortcut { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Y }"
         [IO.File]::WriteAllText(
             (Join-Path $legacyReaderLoaderUnsanctionedFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
             $unsanctionedLoaderText,
@@ -3658,7 +3677,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         Test-BRAVOCondition `
             -Condition (
                 -not $legacyReaderLoaderUnsanctionedFixtureResult.Passed -and
-                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') }).Count -eq 1
+                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1 (Read-BRAVOLegacyPrimaryRawOverrides)') -and -not $_.Contains('структура guard') -and -not $_.Contains('знайдено') }).Count -eq 1
             ) `
             -Name "ReleaseGate/CutoverGateDetectsUnsanctionedCallSiteInsideCanonicalLoader" `
             -Failure "не санкціонований третій виклик Read-BRAVOLegacyPrimaryRawOverrides з довільної функції всередині самого BRAVO_CONFIG_LOADER.ps1 мусить провалювати гейт LEGACY_READER_ISOLATION"
@@ -3731,13 +3750,8 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
     # пару в усьому файлі — другий провалює гейт.
     $legacyReaderSecondCallFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
     try {
-        $secondCallLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
-            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
-            "function Import-BravoConfiguration {`n" +
-            "    param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect)`n" +
-            "    if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }`n" +
-            "    Import-BravoLegacyPrimaryConfiguration -ConfigPath Y`n" +
-            "}"
+        # Канонічний шаблон + другий виклик у тій самій Import-BravoConfiguration (поза if): має спрацювати саме R1 (знайдено 2).
+        $secondCallLoaderText = $legacyReaderCanonicalLoaderText.Replace($lcIf, $lcIf + "`n    Import-BravoLegacyPrimaryConfiguration -ConfigPath Y")
         [IO.File]::WriteAllText(
             (Join-Path $legacyReaderSecondCallFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
             $secondCallLoaderText,
@@ -3747,7 +3761,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
         Test-BRAVOCondition `
             -Condition (
                 -not $legacyReaderSecondCallFixtureResult.Passed -and
-                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') }).Count -eq 1
+                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') -and $_.Contains('(Import-BravoLegacyPrimaryConfiguration: знайдено 2 виклик') -and -not $_.Contains('структура guard') }).Count -eq 1
             ) `
             -Name "ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller" `
             -Failure "другий виклик Import-BravoLegacyPrimaryConfiguration з Import-BravoConfiguration (поза відомим guard'ом) мусить провалювати гейт LEGACY_READER_ISOLATION, навіть коли перший виклик санкціонований"
@@ -3899,11 +3913,38 @@ if (Enter-BRAVOSelfTestSection -Name 'Governance/RequiredChecksListCoversCiWorkf
 
     $matrixModule = 'modules\BRAVO.Matrix\BRAVO.Matrix.psm1'
     $matrixLoader = 'BRAVO_CONFIG_LOADER.ps1'
-    $matrixSanctionedLoader = @'
-function Read-BRAVOLegacyPrimaryRawOverrides { param($ConfigPath) }
-function Import-BravoLegacyPrimaryConfiguration { param($ConfigPath); $x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath $ConfigPath }
-function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyPrimaryAutoDetect); if (-not $DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }
-'@
+    # #239 (прогалини 2 і 5): канонічний шаблон завантажувача
+    # ($legacyReaderCanonicalLoaderText) і детерміновані варіанти через
+    # .Replace() одного фрагмента шаблону ($lc*, визначені разом із шаблоном).
+    # Проба після циклу перевіряє, що кожен варіант відрізняється від шаблону.
+    $matrixSanctionedLoader = $legacyReaderCanonicalLoaderText
+    $matrixC06Text = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists) { if ($configPathWasExplicit -or $true) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } } else { Import-BravoSyntheticConfiguration }')
+    $matrixC07Text = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists) { foreach ($item in 1) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } } else { Import-BravoSyntheticConfiguration }')
+    $matrixC08Text = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, '$legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and $legacyConfigFileExistsOnDisk -and !$configPathWasExplicit').Replace($lcExists, '$legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and !$legacyPrimaryAutoDetectBlocked')
+    # C05: реальний BRAVO_CONFIG_LOADER.ps1 з кореня репозиторію (той самий $root, що й проби вище).
+    $matrixRealLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    $matrixG2Text = $legacyReaderCanonicalLoaderText.Replace($lcIf, $lcImportCall)
+    $matrixG2aText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists) { Import-BravoSyntheticConfiguration } else { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }')
+    $matrixG2bText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists) { Import-BravoSyntheticConfiguration } else { Import-BravoSyntheticConfiguration }; Import-BravoLegacyPrimaryConfiguration -ConfigPath X')
+    $matrixG2cText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($true) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2dText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExistsOnDisk) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2eText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if (-not $legacyConfigFileExists) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2fText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists -or $true) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2gText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ($legacyConfigFileExists) { Import-BravoSyntheticConfiguration } elseif ($true) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }')
+    $matrixG2hText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'if ((Import-BravoLegacyPrimaryConfiguration -ConfigPath X) -and $legacyConfigFileExists) { Import-BravoSyntheticConfiguration } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2iText = $legacyReaderCanonicalLoaderText.Replace($lcIf, '$sb = { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }; if ($legacyConfigFileExists) { & $sb } else { Import-BravoSyntheticConfiguration }')
+    $matrixG2jText = $legacyReaderCanonicalLoaderText.Replace($lcExists, $lcExists + "`n    `$legacyConfigFileExists = `$true")
+    $matrixG2kText = $legacyReaderCanonicalLoaderText.Replace($lcExists, $lcExists + "`n    if (`$configPathWasExplicit) { `$legacyConfigFileExists = `$true }")
+    $matrixG2lText = $legacyReaderCanonicalLoaderText.Replace($lcExists, 'if ($true) { ' + $lcExists + ' }')
+    $matrixG2mText = $legacyReaderCanonicalLoaderText.Replace($lcExists, '$legacyConfigFileExists = $legacyConfigFileExistsOnDisk')
+    $matrixG2nText = $legacyReaderCanonicalLoaderText.Replace($lcExists, $lcExists + ' -or $true')
+    $matrixG2oText = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, $lcBlocked + "`n    `$legacyPrimaryAutoDetectBlocked = `$false")
+    $matrixG2pText = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, $lcBlocked + ' -and $false')
+    $matrixG2qText = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, '$legacyPrimaryAutoDetectBlocked = $legacyConfigFileExistsOnDisk -and -not $configPathWasExplicit')
+    $matrixG2rText = $legacyReaderCanonicalLoaderText.Replace($lcExplicit, $lcExplicit + "`n    `$DisallowLegacyPrimaryAutoDetect = `$false")
+    $matrixG2sText = $legacyReaderCanonicalLoaderText.Replace($lcParam, 'param($ConfigRoot, [switch]$ConfigPathWasExplicit)')
+    $matrixG5aText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'Import-BravoSyntheticConfiguration')
+    $matrixG5bText = $legacyReaderCanonicalLoaderText.Replace($lcReadCall, '')
     $matrixRows = @(
         # --- Виявлені класи ---
         @{ Id = 'D01.DirectCall'; Kind = 'DETECTED'; Path = $matrixModule; Text = 'function F { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X }' },
@@ -3922,6 +3963,11 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'C01.SanctionedLoaderCallSites'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixSanctionedLoader },
         @{ Id = 'C02.CommentAndStringMention'; Kind = 'CLEAN'; Path = $matrixModule; Text = "# Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { 'Read-BRAVOLegacyPrimaryRawOverrides' }" },
         @{ Id = 'C03.SafeReassignmentShadowsRiskyLiteral'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$c = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$c = 'Get-ChildItem'; & `$c }" },
+        @{ Id = 'C04.CanonicalLoaderTemplate'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $legacyReaderCanonicalLoaderText },
+        @{ Id = 'C05.RealLoaderText'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixRealLoaderText },
+        @{ Id = 'C06.NestedIfInsideGuardBody'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixC06Text },
+        @{ Id = 'C07.LoopInsideGuardBody'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixC07Text },
+        @{ Id = 'C08.ExclaimNegationOperands'; Kind = 'CLEAN'; Path = $matrixLoader; Text = $matrixC08Text },
         # --- Gap 3: alias (виправлено в цьому PR) ---
         @{ Id = 'A01.SetAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "Set-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
         @{ Id = 'A02.NewAliasPositional'; Kind = 'DETECTED'; Path = $matrixModule; Text = "New-Alias rdr Read-BRAVOLegacyPrimaryRawOverrides`nfunction F { rdr -ConfigPath X }" },
@@ -4022,9 +4068,30 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
         @{ Id = 'T03.TypedSafeReassignmentShadows'; Kind = 'CLEAN'; Path = $matrixModule; Text = "function F { `$r = 'Read-BRAVOLegacyPrimaryRawOverrides'; [string]`$r = 'Get-ChildItem'; & `$r }" },
         # --- Відомі обмеження (рішення власника, issue #239) ---
         @{ Id = 'G1.ExecutionOrderVsTextOffset'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { & `$cmd }`n`$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'`nF" },
-        @{ Id = 'G2.NoGuardControlFlowCheck'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`nfunction Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); Import-BravoLegacyPrimaryConfiguration -ConfigPath X }" },
+        @{ Id = 'G2.NoGuardControlFlowCheck'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2Text },
+        @{ Id = 'G2a.CallInElseBranch'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2aText },
+        @{ Id = 'G2b.CallOutsideIf'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2bText },
+        @{ Id = 'G2c.GuardConditionConstantTrue'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2cText },
+        @{ Id = 'G2d.GuardConditionOnDiskVariable'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2dText },
+        @{ Id = 'G2e.GuardConditionNegated'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2eText },
+        @{ Id = 'G2f.GuardConditionOrTrue'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2fText },
+        @{ Id = 'G2g.CallInElseIfConstantTrue'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2gText },
+        @{ Id = 'G2h.CallInsideGuardCondition'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2hText },
+        @{ Id = 'G2i.CallInStoredScriptBlock'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2iText },
+        @{ Id = 'G2j.GuardVariableReassigned'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2jText },
+        @{ Id = 'G2k.GuardVariableReassignedNested'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2kText },
+        @{ Id = 'G2l.GuardAssignmentNotTopLevel'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2lText },
+        @{ Id = 'G2m.BlockedNegationRemoved'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2mText },
+        @{ Id = 'G2n.BlockedNegationNeutralizedByOrTrue'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2nText },
+        @{ Id = 'G2o.BlockedVariableReassigned'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2oText },
+        @{ Id = 'G2p.BlockedExtraAndFalseOperand'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2pText },
+        @{ Id = 'G2q.BlockedWithoutDisallowOperand'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2qText },
+        @{ Id = 'G2r.DisallowParameterReassigned'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2rText },
+        @{ Id = 'G2s.DisallowParameterMissing'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2sText },
         @{ Id = 'G4.MutuallyExclusiveIfElse'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { param(`$u); if (`$u) { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides' } else { `$cmd = 'Get-ChildItem' }; & `$cmd }" },
-        @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'MISSED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
+        @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
+        @{ Id = 'G5a.ImportCallDeletedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG5aText },
+        @{ Id = 'G5b.ReadCallDeletedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG5bText },
         @{ Id = 'G6.NonLiteralReassignmentDoesNotShadow'; Kind = 'FALSE-POSITIVE'; Path = $matrixModule; Text = "function F { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd = Get-SafeCommand; & `$cmd }" },
         @{ Id = 'G7a.ScriptQualifiedAssignmentInFunctionCalledElsewhere'; Kind = 'MISSED'; Path = $matrixModule; Text = "function Set-It { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides' }`nfunction Use-It { & `$script:r }" },
         @{ Id = 'G7b.ScriptQualifiedAssignmentAndCallSameFunction'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { `$script:r = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$script:r }" },
@@ -4049,6 +4116,18 @@ function Import-BravoConfiguration { param($ConfigRoot, [switch]$DisallowLegacyP
             -Name ("ReleaseGate/LegacyReaderMatrix/" + $matrixRow.Id + "." + $matrixLabel) `
             -Failure ("рядок матриці " + $matrixRow.Id + " (" + $matrixRow.Kind + "): очікувано violation=" + $matrixExpectViolation + ", отримано " + $matrixViolation + ". Для KnownLimit-рядків зміну результату (покращення гейта) треба свідомо відобразити тут і в docs\design\BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md (issue #239)")
     }
+
+    # #239: кожен варіант канонічного завантажувача (C06-C08, G2*, G5*) мусить
+    # справді відрізнятися від шаблону і від решти варіантів - інакше рядок
+    # перевіряв би не те, що заявлено в Id.
+    $matrixVariantRows = @($matrixRows | Where-Object { $_.Path -eq $matrixLoader -and $_.Id -match '^(C0[678]|G2[a-s]?|G5[ab]?)\.' })
+    $matrixVariantTexts = @($matrixVariantRows | ForEach-Object { $_.Text })
+    $matrixVariantsEqualToCanonical = @($matrixVariantTexts | Where-Object { $_ -ceq $legacyReaderCanonicalLoaderText })
+    $matrixVariantsDistinctCount = @($matrixVariantTexts | Sort-Object -Unique).Count
+    Test-BRAVOCondition `
+        -Condition ($matrixVariantRows.Count -eq 26 -and $matrixVariantsEqualToCanonical.Count -eq 0 -and $matrixVariantsDistinctCount -eq $matrixVariantRows.Count) `
+        -Name "ReleaseGate/LegacyReaderMatrix/LoaderVariantsDifferFromCanonicalAndEachOther" `
+        -Failure ("варіанти канонічного завантажувача мусять відрізнятися від шаблону й один від одного; рядків=" + $matrixVariantRows.Count + " (очікувано 26), збігаються з шаблоном=" + $matrixVariantsEqualToCanonical.Count + ", унікальних=" + $matrixVariantsDistinctCount)
 
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
