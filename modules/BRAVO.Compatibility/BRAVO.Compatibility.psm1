@@ -503,20 +503,20 @@ function Get-BRAVOFileHash {
         [string]$Algorithm = "SHA512"
     )
 
-    $resolved = @(Resolve-Path -LiteralPath $Path -ErrorAction Stop | ForEach-Object { $_.ProviderPath })
-    if ($resolved.Count -ne 1) {
-        throw "Шлях має вказувати рівно на один елемент: $Path"
-    }
-    $p = $resolved[0]
-    if (Test-Path -LiteralPath $p -PathType Container) {
-        return
-    }
-
     $bufferSize = 1048576  # #498: 1 MiB, а не 4 MiB (LOH, 32-бітні хости)
     $stream = $null
     $hasher = $null
     try {
-        $hasherType ="System.Security.Cryptography.${Algorithm}CryptoServiceProvider" -as [Type]
+        $resolved = @(Resolve-Path -LiteralPath $Path -ErrorAction Stop | ForEach-Object { $_.ProviderPath })
+        if ($resolved.Count -ne 1) {
+            throw "Шлях має вказувати рівно на один елемент: $Path"
+        }
+        $p = $resolved[0]
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            return
+        }
+
+        $hasherType = "System.Security.Cryptography.${Algorithm}CryptoServiceProvider" -as [Type]
         if ($null -ne $hasherType) {
             $hasher = New-Object -TypeName $hasherType.FullName
         } else {
@@ -542,6 +542,10 @@ function Get-BRAVOFileHash {
             Hash = ([System.BitConverter]::ToString($hashBytes)).Replace("-", "")
             Path = $p
         }
+    } catch {
+        # Помилка конструктора (statement-terminating) без зовнішнього try інакше
+        # дала б мовчазний $null; перекидаємо як завершальний виняток.
+        throw
     } finally {
         if ($null -ne $hasher) {
             $hasher.Dispose()
