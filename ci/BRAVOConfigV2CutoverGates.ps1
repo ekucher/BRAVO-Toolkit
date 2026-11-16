@@ -756,6 +756,34 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
         }
     }
 
+    # Розгортає AttributedExpressionAst/ConvertExpressionAst до цільового виразу.
+    function Resolve-BRAVOAstAssignmentTarget {
+        param($AstNode)
+        $target = $AstNode
+        while ($target -is [System.Management.Automation.Language.AttributedExpressionAst] -or
+               $target -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+            $target = $target.Child
+        }
+        return $target
+    }
+
+    # Додає до $Sink усі VariableExpressionAst-цілі присвоєння (включно з
+    # багатоцільовим `$a, $b = ...` та дужками).
+    function Add-BRAVOAstAssignmentTargetVariables {
+        param($AstNode, $Sink)
+        $target = Resolve-BRAVOAstAssignmentTarget -AstNode $AstNode
+        if ($target -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+            foreach ($element in $target.Elements) {
+                Add-BRAVOAstAssignmentTargetVariables -AstNode $element -Sink $Sink
+            }
+        } elseif ($target -is [System.Management.Automation.Language.ParenExpressionAst]) {
+            $inner = Get-BRAVOAstSoleExpression -PipelineNode $target.Pipeline
+            if ($inner) { Add-BRAVOAstAssignmentTargetVariables -AstNode $inner -Sink $Sink }
+        } elseif ($target -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            [void]$Sink.Add($target)
+        }
+    }
+
     function Get-BRAVOAstAssignmentsToVariable {
         param($ScopeAst, [string]$VariableName)
         $found = New-Object System.Collections.Generic.List[object]
@@ -764,14 +792,12 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
             $true
         )
         foreach ($assignment in $allAssignments) {
-            $target = $assignment.Left
-            while ($target -is [System.Management.Automation.Language.AttributedExpressionAst] -or
-                   $target -is [System.Management.Automation.Language.ConvertExpressionAst]) {
-                $target = $target.Child
+            $targetVariables = New-Object System.Collections.Generic.List[object]
+            Add-BRAVOAstAssignmentTargetVariables -AstNode $assignment.Left -Sink $targetVariables
+            foreach ($targetVariable in $targetVariables) {
+                $targetName = Get-BRAVOAstNormalizedVariableName -UserPath $targetVariable.VariablePath.UserPath
+                if ($targetName -ieq $VariableName) { [void]$found.Add($assignment) }
             }
-            if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
-            $targetName = Get-BRAVOAstNormalizedVariableName -UserPath $target.VariablePath.UserPath
-            if ($targetName -ieq $VariableName) { [void]$found.Add($assignment) }
         }
         return ,$found
     }
@@ -787,6 +813,13 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
         $only = $assignments[0]
         if ($only.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
             return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName не простим '='" }
+        }
+        $onlyTarget = Resolve-BRAVOAstAssignmentTarget -AstNode $only.Left
+        if (($onlyTarget -isnot [System.Management.Automation.Language.VariableExpressionAst])) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName багатоцільове (не одиночна змінна)" }
+        }
+        if (-not $onlyTarget.VariablePath.IsUnqualified) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName з кваліфікатором scope" }
         }
         if (($only.Parent -isnot [System.Management.Automation.Language.NamedBlockAst]) -or
             -not [object]::ReferenceEquals($only.Parent.Parent, $FunctionAst.Body)) {

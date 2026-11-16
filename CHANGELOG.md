@@ -8,7 +8,7 @@
   `Import-BravoLegacyPrimaryConfiguration` лише в `if ($legacyConfigFileExists)`, незмінні присвоєння
   `$legacyConfigFileExists` і `$legacyPrimaryAutoDetectBlocked` та параметр `-DisallowLegacyPrimaryAutoDetect`
   (switch, без перепризначень). Це не control-flow/dataflow-аналіз; рефакторинг цієї форми навмисно провалює
-  гейт (fail closed). Матриця `docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md` тепер має 148 рядків
+  гейт (fail closed). Матриця `docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md` тепер має 151 рядок
   (раніше 122). Поведінка runtime не змінюється; прогалини 1, 4, 6, 7 лишаються відомими лімітами.
 
 - **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy

@@ -75,7 +75,7 @@ code review, а гейт — лише автоматичний страхува�
 - `FALSE-POSITIVE` — гейт провалюється на безпечному коді.
 - `CLEAN` — коректно дозволена конструкція, гейт проходить.
 
-Кожен рядок матриці (148 рядків: DETECTED 98, CLEAN 30, MISSED 19, FALSE-POSITIVE 1; було 122) має тест
+Кожен рядок матриці (151 рядок: DETECTED 101, CLEAN 30, MISSED 19, FALSE-POSITIVE 1; було 122) має тест
 `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у `selftest\BRAVO_SELF_TEST.Governance.ps1`. Додатково є
 один проба-тест `ReleaseGate/LegacyReaderMatrix/LoaderVariantsDifferFromCanonicalAndEachOther` (не рядок
 матриці): кожен варіант завантажувача відрізняється від канонічного шаблону й від інших. Невиконуваних рядків немає: X2 (`& 'iex' '...'`)
@@ -134,10 +134,13 @@ code review, а гейт — лише автоматичний страхува�
   на шляху вгору мусить бути тілом функції. Відхиляються `else`, `elseif`, інша умова, виклик поза `if`,
   усередині умови чи у вкладеному scriptblock. Вкладені `if`/цикли всередині тіла guard'а допустимі.
 - **R3.** У функції рівно одне присвоєння `$legacyConfigFileExists` (оператор `=`, верхній рівень тіла
-  функції, текстово раніше за guard `if`); його права частина — ланцюг `-and`, де один з операндів —
-  `-not`/`!` від `$legacyPrimaryAutoDetectBlocked`. Додаткові операнди дозволені.
-- **R4.** Те саме для правої частини R3: лише `-and` без розгортання дужок; операнд з запереченням
-  мусить бути незакваліфікованою змінною `$legacyPrimaryAutoDetectBlocked`.
+  функції, текстово раніше за guard `if`, ціль — незакваліфікована змінна). Багатоцільове присвоєння
+  (`$null, $legacyConfigFileExists = ...`) теж рахується як присвоєння цієї змінної, тож дає 2 і провалює
+  R3/R5/R6; присвоєння з кваліфікатором scope (`$global:`/`$script:`) не приймається як pin
+  (причина «з кваліфікатором scope»).
+- **R4.** Права частина присвоєння R3 — ланцюг `-and` (лише `-and`, дужки не розгортаються), де один з
+  операндів — `-not`/`!` від незакваліфікованої змінної `$legacyPrimaryAutoDetectBlocked`. Додаткові
+  операнди дозволені.
 - **R5.** У функції рівно одне присвоєння `$legacyPrimaryAutoDetectBlocked` (теж `=`, верхній рівень,
   текстово раніше за присвоєння R3); його права частина — ланцюг `-and` рівно з трьох операндів у будь-якому
   порядку: `[bool]$DisallowLegacyPrimaryAutoDetect` (або без касту), `$legacyConfigFileExistsOnDisk`,
@@ -194,6 +197,9 @@ loader).
 | G2q | `$legacyPrimaryAutoDetectBlocked` без операнда `$DisallowLegacyPrimaryAutoDetect` | DETECTED | виправлено |
 | G2r | `$DisallowLegacyPrimaryAutoDetect = $false` у тілі функції | DETECTED | виправлено |
 | G2s | параметр `-DisallowLegacyPrimaryAutoDetect` прибрано з `param()` | DETECTED | виправлено |
+| G2t | багатоцільове присвоєння `$null, $legacyConfigFileExists = $null, $true` після канонічного | DETECTED | виправлено |
+| G2u | багатоцільове присвоєння `$null, $DisallowLegacyPrimaryAutoDetect = $null, $false` | DETECTED | виправлено |
+| G2v | `$global:legacyConfigFileExists = ...` замість канонічного присвоєння | DETECTED | виправлено |
 | G5 | санкціонований виклик видалено цілком (Count = 0) | DETECTED | виправлено (R0) |
 | G5a | видалено виклик `Import-BravoLegacyPrimaryConfiguration` | DETECTED | виправлено (R0) |
 | G5b | видалено виклик `Read-BRAVOLegacyPrimaryRawOverrides` | DETECTED | виправлено (R0) |
@@ -204,7 +210,9 @@ loader).
   `Set-Item variable:`, `[ref]`, `-OutVariable` тощо, змінна циклу `foreach` — гейт не бачить. Точкове
   розширення не додавалося, бо власник у #239 радив не нарощувати точкові патчі; додати його можна лише
   окремим рішенням власника.
-- Значення `$legacyConfigFileExistsOnDisk` і `$configPathWasExplicit` не пінуються.
+- Значення `$legacyConfigFileExistsOnDisk` і `$configPathWasExplicit` не пінуються. Наслідок: наприклад,
+  `$configPathWasExplicit = $true` (за збереження канонічної форми решти) повністю вимикає блокування й усе
+  одно проходить pin; так само довільне значення `$legacyConfigFileExistsOnDisk`.
 - Приховані виклики всередині loader (X1-X8, G8, G9, A17-A20) лишаються `MISSED`.
 - Pin прив'язаний до кореневого `BRAVO_CONFIG_LOADER.ps1`: якщо файлу в дереві немає, R0 не
   застосовується (відсутній loader не провалює гейт).
@@ -345,7 +353,7 @@ drive визначається для форм `${function:<ім'я рідера
   в дужках/касті (рев'ю PR #497), а також 2 і 5 (структурний pin guard'а завантажувача, R0-R6).
 - Свідомо не чіпано (потребують control-flow/dataflow, рішення власника в #239):
   1, 4, 6, 7.
-- Усі 148 рядків матриці зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
+- Усі 151 рядок матриці зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
   навмисне оновлення відповідного `KnownLimit`-тесту та цього документа.
 - Якщо інвестувати далі, рекомендація власника лишається чинною: не точковими
   патчами, а окремим санкціонованим дизайном обмеженого dataflow-проходу.

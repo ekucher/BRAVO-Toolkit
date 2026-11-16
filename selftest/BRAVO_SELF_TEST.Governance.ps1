@@ -3677,7 +3677,8 @@ function Import-BravoConfiguration {
         Test-BRAVOCondition `
             -Condition (
                 -not $legacyReaderLoaderUnsanctionedFixtureResult.Passed -and
-                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1 (Read-BRAVOLegacyPrimaryRawOverrides)') -and -not $_.Contains('структура guard') -and -not $_.Contains('знайдено') }).Count -eq 1
+                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1 (Read-BRAVOLegacyPrimaryRawOverrides)') -and -not $_.Contains('структура guard') -and -not $_.Contains('знайдено') }).Count -eq 1 -and
+                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('BRAVO_CONFIG_LOADER.ps1') -and ($_.Contains('структура guard') -or $_.Contains('знайдено')) }).Count -eq 0
             ) `
             -Name "ReleaseGate/CutoverGateDetectsUnsanctionedCallSiteInsideCanonicalLoader" `
             -Failure "не санкціонований третій виклик Read-BRAVOLegacyPrimaryRawOverrides з довільної функції всередині самого BRAVO_CONFIG_LOADER.ps1 мусить провалювати гейт LEGACY_READER_ISOLATION"
@@ -3761,7 +3762,8 @@ function Import-BravoConfiguration {
         Test-BRAVOCondition `
             -Condition (
                 -not $legacyReaderSecondCallFixtureResult.Passed -and
-                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') -and $_.Contains('(Import-BravoLegacyPrimaryConfiguration: знайдено 2 виклик') -and -not $_.Contains('структура guard') }).Count -eq 1
+                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') -and $_.Contains('(Import-BravoLegacyPrimaryConfiguration: знайдено 2 виклик') -and -not $_.Contains('структура guard') }).Count -eq 1 -and
+                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('BRAVO_CONFIG_LOADER.ps1') -and ($_.Contains('структура guard') -or $_.Contains('знайдено 0')) }).Count -eq 0
             ) `
             -Name "ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller" `
             -Failure "другий виклик Import-BravoLegacyPrimaryConfiguration з Import-BravoConfiguration (поза відомим guard'ом) мусить провалювати гейт LEGACY_READER_ISOLATION, навіть коли перший виклик санкціонований"
@@ -3943,6 +3945,9 @@ function Import-BravoConfiguration {
     $matrixG2qText = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, '$legacyPrimaryAutoDetectBlocked = $legacyConfigFileExistsOnDisk -and -not $configPathWasExplicit')
     $matrixG2rText = $legacyReaderCanonicalLoaderText.Replace($lcExplicit, $lcExplicit + "`n    `$DisallowLegacyPrimaryAutoDetect = `$false")
     $matrixG2sText = $legacyReaderCanonicalLoaderText.Replace($lcParam, 'param($ConfigRoot, [switch]$ConfigPathWasExplicit)')
+    $matrixG2tText = $legacyReaderCanonicalLoaderText.Replace($lcExists, $lcExists + "`n    `$null, `$legacyConfigFileExists = `$null, `$true")
+    $matrixG2uText = $legacyReaderCanonicalLoaderText.Replace($lcExplicit, $lcExplicit + "`n    `$null, `$DisallowLegacyPrimaryAutoDetect = `$null, `$false")
+    $matrixG2vText = $legacyReaderCanonicalLoaderText.Replace($lcExists, '$global:legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked')
     $matrixG5aText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'Import-BravoSyntheticConfiguration')
     $matrixG5bText = $legacyReaderCanonicalLoaderText.Replace($lcReadCall, '')
     $matrixRows = @(
@@ -4088,6 +4093,9 @@ function Import-BravoConfiguration {
         @{ Id = 'G2q.BlockedWithoutDisallowOperand'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2qText },
         @{ Id = 'G2r.DisallowParameterReassigned'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2rText },
         @{ Id = 'G2s.DisallowParameterMissing'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2sText },
+        @{ Id = 'G2t.MultiTargetReassignmentOfExistsVariable'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2tText },
+        @{ Id = 'G2u.MultiTargetAssignmentOfDisallowParameter'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2uText },
+        @{ Id = 'G2v.ScopeQualifiedPinnedAssignment'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2vText },
         @{ Id = 'G4.MutuallyExclusiveIfElse'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { param(`$u); if (`$u) { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides' } else { `$cmd = 'Get-ChildItem' }; & `$cmd }" },
         @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
         @{ Id = 'G5a.ImportCallDeletedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG5aText },
@@ -4120,14 +4128,14 @@ function Import-BravoConfiguration {
     # #239: кожен варіант канонічного завантажувача (C06-C08, G2*, G5*) мусить
     # справді відрізнятися від шаблону і від решти варіантів - інакше рядок
     # перевіряв би не те, що заявлено в Id.
-    $matrixVariantRows = @($matrixRows | Where-Object { $_.Path -eq $matrixLoader -and $_.Id -match '^(C0[678]|G2[a-s]?|G5[ab]?)\.' })
+    $matrixVariantRows = @($matrixRows | Where-Object { $_.Path -eq $matrixLoader -and $_.Id -match '^(C0[678]|G2[a-v]?|G5[ab]?)\.' })
     $matrixVariantTexts = @($matrixVariantRows | ForEach-Object { $_.Text })
     $matrixVariantsEqualToCanonical = @($matrixVariantTexts | Where-Object { $_ -ceq $legacyReaderCanonicalLoaderText })
     $matrixVariantsDistinctCount = @($matrixVariantTexts | Sort-Object -Unique).Count
     Test-BRAVOCondition `
-        -Condition ($matrixVariantRows.Count -eq 26 -and $matrixVariantsEqualToCanonical.Count -eq 0 -and $matrixVariantsDistinctCount -eq $matrixVariantRows.Count) `
+        -Condition ($matrixVariantRows.Count -eq 29 -and $matrixVariantsEqualToCanonical.Count -eq 0 -and $matrixVariantsDistinctCount -eq $matrixVariantRows.Count) `
         -Name "ReleaseGate/LegacyReaderMatrix/LoaderVariantsDifferFromCanonicalAndEachOther" `
-        -Failure ("варіанти канонічного завантажувача мусять відрізнятися від шаблону й один від одного; рядків=" + $matrixVariantRows.Count + " (очікувано 26), збігаються з шаблоном=" + $matrixVariantsEqualToCanonical.Count + ", унікальних=" + $matrixVariantsDistinctCount)
+        -Failure ("варіанти канонічного завантажувача мусять відрізнятися від шаблону й один від одного; рядків=" + $matrixVariantRows.Count + " (очікувано 29), збігаються з шаблоном=" + $matrixVariantsEqualToCanonical.Count + ", унікальних=" + $matrixVariantsDistinctCount)
 
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
