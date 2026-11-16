@@ -3235,6 +3235,285 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # #498 regression tests (added after the implementation, not TDD):
+    # Get-BRAVOFileHash hashes via FileStream (1 MiB buffer) instead of Get-FileHash.
+    # Module-qualified calls (#219): the global export may be cleared in -Suite runs.
+    $fileHashTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_FILEHASH_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($fileHashTestRoot)
+        $fileHashAlgorithms = @("MD5", "SHA1", "SHA256", "SHA384", "SHA512")
+        $fileHashHexLengths = @{ MD5 = 32; SHA1 = 40; SHA256 = 64; SHA384 = 96; SHA512 = 128 }
+        $fileHashNoBom = New-Object Text.UTF8Encoding($false)
+
+        # 1. Oracle comparison across sizes and algorithms.
+        $fileHashOracleMismatch = ""
+        try {
+            $fileHashRandom = New-Object System.Random(498)
+            $fileHashGetFileHash = Get-Command -Name "Get-FileHash" -CommandType Cmdlet, Function -ErrorAction SilentlyContinue
+            foreach ($fileHashSize in @(0, 1, 4095, 4096, 4097, 1048575, 1048576, 1048577, 3158073)) {
+                $fileHashBytes = New-Object byte[] $fileHashSize
+                $fileHashRandom.NextBytes($fileHashBytes)
+                $fileHashOraclePath = Join-Path $fileHashTestRoot ("oracle_{0}.bin" -f $fileHashSize)
+                [IO.File]::WriteAllBytes($fileHashOraclePath, $fileHashBytes)
+                foreach ($fileHashAlg in $fileHashAlgorithms) {
+                    $fileHashOracleHasher = New-Object -TypeName ("System.Security.Cryptography.{0}CryptoServiceProvider" -f $fileHashAlg)
+                    try {
+                        $fileHashExpected = ([BitConverter]::ToString($fileHashOracleHasher.ComputeHash([IO.File]::ReadAllBytes($fileHashOraclePath)))).Replace("-", "")
+                    } finally {
+                        $fileHashOracleHasher.Dispose()
+                    }
+                    $fileHashActual = [string](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashOraclePath -Algorithm $fileHashAlg).Hash
+                    if ($fileHashActual -cne $fileHashExpected) {
+                        $fileHashOracleMismatch = "size=$fileHashSize alg=$fileHashAlg actual=$fileHashActual expected=$fileHashExpected"
+                        break
+                    }
+                    if ($null -ne $fileHashGetFileHash) {
+                        $fileHashBuiltin = [string](& $fileHashGetFileHash -LiteralPath $fileHashOraclePath -Algorithm $fileHashAlg).Hash
+                        if ($fileHashActual -cne $fileHashBuiltin) {
+                            $fileHashOracleMismatch = "size=$fileHashSize alg=$fileHashAlg actual=$fileHashActual Get-FileHash=$fileHashBuiltin"
+                            break
+                        }
+                    }
+                }
+                if ($fileHashOracleMismatch -ne "") { break }
+            }
+        } catch {
+            $fileHashOracleMismatch = "exception: $($_.Exception.Message)"
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashOracleMismatch -eq "") `
+            -Name "Compatibility/FileHashMatchesOracleAllAlgorithms" `
+            -Failure "Get-BRAVOFileHash differs from the CryptoServiceProvider/Get-FileHash oracle: $fileHashOracleMismatch"
+
+        # 2. Known-answer SHA512.
+        $fileHashKatEmpty = Join-Path $fileHashTestRoot "kat_empty.bin"
+        $fileHashKatAbc = Join-Path $fileHashTestRoot "kat_abc.bin"
+        [IO.File]::WriteAllBytes($fileHashKatEmpty, (New-Object byte[] 0))
+        [IO.File]::WriteAllText($fileHashKatAbc, "abc", $fileHashNoBom)
+        $fileHashKatEmptyActual = [string](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashKatEmpty -Algorithm SHA512).Hash
+        $fileHashKatAbcActual = [string](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashKatAbc -Algorithm SHA512).Hash
+        Test-BRAVOCondition `
+            -Condition (
+                $fileHashKatEmptyActual -ceq "CF83E1357EEFB8BDF1542850D66D8007D620E4050B5715DC83F4A921D36CE9CE47D0D13C5D85F2B0FF8318D2877EEC2F63B931BD47417A81A538327AF927DA3E" -and
+                $fileHashKatAbcActual -ceq "DDAF35A193617ABACC417349AE20413112E6FA4E89A97EA20A9EEEE64B55D39A2192992A274FC1A836BA3C23A3FEEBBD454D4423643CE80E2A9AC94FA54CA49F"
+            ) `
+            -Name "Compatibility/FileHashKnownAnswerSha512" `
+            -Failure "SHA512 known answers differ: empty=$fileHashKatEmptyActual abc=$fileHashKatAbcActual"
+
+        # 3. Literal bracket path.
+        $fileHashBracketDir = Join-Path $fileHashTestRoot "[x]"
+        [void][IO.Directory]::CreateDirectory($fileHashBracketDir)
+        $fileHashBracketPath = Join-Path $fileHashBracketDir "a[1].bin"
+        [IO.File]::WriteAllText($fileHashBracketPath, "abc", $fileHashNoBom)
+        $fileHashBracketActual = ""
+        try {
+            $fileHashBracketActual = [string](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashBracketPath -Algorithm SHA512).Hash
+        } catch {
+            $fileHashBracketActual = "exception: $($_.Exception.Message)"
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashBracketActual -ceq $fileHashKatAbcActual -and $fileHashBracketActual.Length -eq 128) `
+            -Name "Compatibility/FileHashLiteralBracketPath" `
+            -Failure "a path with [ ] must be treated literally; got: $fileHashBracketActual"
+
+        # 4. Missing file throws.
+        $fileHashMissingThrew = $false
+        try {
+            [void](BRAVO.Compatibility\Get-BRAVOFileHash -Path (Join-Path $fileHashTestRoot "missing.bin") -Algorithm SHA256)
+        } catch {
+            $fileHashMissingThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition $fileHashMissingThrew `
+            -Name "Compatibility/FileHashMissingFileThrows" `
+            -Failure "a missing file must throw, as Get-FileHash does"
+
+        # 5. Directory returns nothing, without an exception.
+        $fileHashDirThrew = $false
+        $fileHashDirResult = "unset"
+        try {
+            $fileHashDirResult = BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashBracketDir -Algorithm SHA256
+        } catch {
+            $fileHashDirThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (-not $fileHashDirThrew -and $null -eq $fileHashDirResult) `
+            -Name "Compatibility/FileHashDirectoryReturnsNothing" `
+            -Failure "a directory must produce no output and no exception (threw=$fileHashDirThrew)"
+
+        # 6/7/8. Sharing behaviour and handle release.
+        $fileHashShareRaw = New-Object byte[] 70000
+        (New-Object System.Random(7)).NextBytes($fileHashShareRaw)
+        $fileHashSharePath = Join-Path $fileHashTestRoot "share.bin"
+        [IO.File]::WriteAllBytes($fileHashSharePath, $fileHashShareRaw)
+        $fileHashShareExpected = ""
+        $fileHashShareHasher = New-Object -TypeName System.Security.Cryptography.SHA256CryptoServiceProvider
+        try {
+            $fileHashShareExpected = ([BitConverter]::ToString($fileHashShareHasher.ComputeHash($fileHashShareRaw))).Replace("-", "")
+        } finally {
+            $fileHashShareHasher.Dispose()
+        }
+
+        $fileHashLockThrew = $false
+        $fileHashLockReleaseOpened = $false
+        $fileHashLockStream = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            try {
+                [void](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm SHA256)
+            } catch {
+                $fileHashLockThrew = $true
+            }
+        } finally {
+            $fileHashLockStream.Dispose()
+        }
+        Test-BRAVOCondition `
+            -Condition $fileHashLockThrew `
+            -Name "Compatibility/FileHashExclusiveLockThrows" `
+            -Failure "a file exclusively locked (FileShare.None) by another handle must make hashing throw"
+
+        $fileHashReaderOk = $false
+        $fileHashReaderHash = ""
+        $fileHashReaderStream = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            try {
+                $fileHashReaderHash = [string](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm SHA256).Hash
+                $fileHashReaderOk = ($fileHashReaderHash -ceq $fileHashShareExpected)
+            } catch {
+                $fileHashReaderHash = "exception: $($_.Exception.Message)"
+            }
+        } finally {
+            $fileHashReaderStream.Dispose()
+        }
+        Test-BRAVOCondition `
+            -Condition $fileHashReaderOk `
+            -Name "Compatibility/FileHashConcurrentReaderSucceeds" `
+            -Failure "hashing must succeed while another reader (Read/Share.Read) holds the file; got: $fileHashReaderHash"
+
+        $fileHashReleaseAfterSuccess = $false
+        $fileHashReleaseAfterFailure = $false
+        try {
+            [void](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm SHA256)
+            $fileHashProbe = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $fileHashProbe.Dispose()
+            $fileHashReleaseAfterSuccess = $true
+        } catch {
+            $fileHashReleaseAfterSuccess = $false
+        }
+        $fileHashFailLock = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            try {
+                [void](BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm SHA256)
+            } catch {
+                $null = $_
+            }
+        } finally {
+            $fileHashFailLock.Dispose()
+        }
+        try {
+            $fileHashProbe2 = New-Object System.IO.FileStream($fileHashSharePath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            $fileHashProbe2.Dispose()
+            $fileHashReleaseAfterFailure = $true
+        } catch {
+            $fileHashReleaseAfterFailure = $false
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashReleaseAfterSuccess -and $fileHashReleaseAfterFailure) `
+            -Name "Compatibility/FileHashReleasesHandle" `
+            -Failure "the file handle must be released after a successful call (ok=$fileHashReleaseAfterSuccess) and after a failed call (ok=$fileHashReleaseAfterFailure)"
+
+        # 9. Result shape.
+        $fileHashShapeProblem = ""
+        foreach ($fileHashAlg in $fileHashAlgorithms) {
+            $fileHashShape = BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm $fileHashAlg
+            $fileHashShapeNames = @($fileHashShape.PSObject.Properties | ForEach-Object { $_.Name })
+            foreach ($fileHashShapeProp in @("Algorithm", "Hash", "Path")) {
+                if ($fileHashShapeNames -notcontains $fileHashShapeProp) {
+                    $fileHashShapeProblem = "$fileHashAlg missing property $fileHashShapeProp"
+                }
+            }
+            if ($fileHashShapeProblem -eq "") {
+                if ([string]$fileHashShape.Algorithm -cne $fileHashAlg) {
+                    $fileHashShapeProblem = "$fileHashAlg Algorithm=$($fileHashShape.Algorithm)"
+                } elseif ([string]$fileHashShape.Hash -cnotmatch '^[0-9A-F]+$') {
+                    $fileHashShapeProblem = "$fileHashAlg Hash not uppercase hex: $($fileHashShape.Hash)"
+                } elseif (([string]$fileHashShape.Hash).Length -ne $fileHashHexLengths[$fileHashAlg]) {
+                    $fileHashShapeProblem = "$fileHashAlg Hash length $(([string]$fileHashShape.Hash).Length)"
+                } elseif ([string]$fileHashShape.Path -cne [IO.Path]::GetFullPath($fileHashSharePath)) {
+                    $fileHashShapeProblem = "$fileHashAlg Path=$($fileHashShape.Path)"
+                }
+            }
+            if ($fileHashShapeProblem -ne "") { break }
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashShapeProblem -eq "") `
+            -Name "Compatibility/FileHashResultShape" `
+            -Failure "unexpected result shape: $fileHashShapeProblem"
+
+        # 10. Static contract over the function body.
+        $fileHashStaticProblem = ""
+        try {
+            $fileHashParseTokens = $null
+            $fileHashParseErrors = $null
+            $fileHashModuleAst = [System.Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
+                [ref]$fileHashParseTokens,
+                [ref]$fileHashParseErrors)
+            $fileHashFunctionAst = @($fileHashModuleAst.FindAll({
+                        param($node)
+                        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                        $node.Name -eq "Get-BRAVOFileHash"
+                    }, $true)) | Select-Object -First 1
+            if ($null -eq $fileHashFunctionAst) {
+                $fileHashStaticProblem = "function Get-BRAVOFileHash not found"
+            } else {
+                $fileHashBodyText = $fileHashFunctionAst.Body.Extent.Text
+                $fileHashCommandNames = @($fileHashFunctionAst.Body.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.CommandAst]
+                        }, $true) | ForEach-Object { $_.GetCommandName() })
+                $fileHashBufferAssignment = @($fileHashFunctionAst.Body.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                            $node.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                            $node.Left.VariablePath.UserPath -eq "bufferSize"
+                        }, $true)) | Select-Object -First 1
+                $fileHashBufferValue = 0
+                if ($null -ne $fileHashBufferAssignment -and
+                    $fileHashBufferAssignment.Right -is [System.Management.Automation.Language.CommandExpressionAst] -and
+                    $fileHashBufferAssignment.Right.Expression -is [System.Management.Automation.Language.ConstantExpressionAst]) {
+                    $fileHashBufferValue = [long]$fileHashBufferAssignment.Right.Expression.Value
+                }
+                if ($fileHashCommandNames -contains "Get-FileHash") {
+                    $fileHashStaticProblem = "calls Get-FileHash"
+                } elseif (-not $fileHashBodyText.Contains("System.IO.FileStream")) {
+                    $fileHashStaticProblem = "no System.IO.FileStream"
+                } elseif (-not $fileHashBodyText.Contains("SequentialScan")) {
+                    $fileHashStaticProblem = "no SequentialScan"
+                } elseif (-not $fileHashBodyText.Contains("FileShare]::Read")) {
+                    $fileHashStaticProblem = "no FileShare]::Read"
+                } elseif ($fileHashBodyText.Contains("ReadWrite")) {
+                    $fileHashStaticProblem = "contains ReadWrite"
+                } elseif (-not $fileHashBodyText.Contains("CryptoServiceProvider")) {
+                    $fileHashStaticProblem = "no CryptoServiceProvider"
+                } elseif ($fileHashBufferValue -lt 1048576) {
+                    $fileHashStaticProblem = "bufferSize literal is $fileHashBufferValue (< 1048576 or not an integer literal)"
+                }
+            }
+        } catch {
+            $fileHashStaticProblem = "exception: $($_.Exception.Message)"
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashStaticProblem -eq "") `
+            -Name "Compatibility/FileHashStaticContract" `
+            -Failure "Get-BRAVOFileHash static contract violated: $fileHashStaticProblem"
+    } finally {
+        if (Test-Path -LiteralPath $fileHashTestRoot -PathType Container) {
+            [IO.Directory]::Delete($fileHashTestRoot, $true)
+        }
+    }
+
     # Аудит P1 (найнебезпечніший сценарій): підмінений 7za.exe/WinSCP.com
     # запускається від NT AUTHORITY\SYSTEM. Version-controlled
     # TOOLS_MANIFEST.json має БЛОКУВАТИ запуск, а не лише попереджати, і
