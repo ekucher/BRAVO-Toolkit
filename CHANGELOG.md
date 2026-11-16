@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Test/CI: гейт `LEGACY_READER_ISOLATION` фіксує форму guard'а канонічного завантажувача (#239, прогалини 2 і 5).**
+  У `ci/BRAVOConfigV2CutoverGates.ps1` для кореневого `BRAVO_CONFIG_LOADER.ps1` додано структурний pin (правила
+  R0-R6): рівно один санкціонований виклик кожної пари (зникнення виклику тепер провалює гейт), виклик
+  `Import-BravoLegacyPrimaryConfiguration` лише в `if ($legacyConfigFileExists)`, незмінні присвоєння
+  `$legacyConfigFileExists` і `$legacyPrimaryAutoDetectBlocked` та параметр `-DisallowLegacyPrimaryAutoDetect`
+  (switch, без перепризначень). Це не control-flow/dataflow-аналіз; рефакторинг цієї форми навмисно провалює
+  гейт (fail closed). Матриця `docs/design/BRAVO_LEGACY_READER_GATE_THREAT_MATRIX.md` тепер має 148 рядків
+  (раніше 122). Поведінка runtime не змінюється; прогалини 1, 4, 6, 7 лишаються відомими лімітами.
+
 - **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy
   `BRAVO.config` (#281, доказ B5 для #154; лише читання).** Новий розділ
   `=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO ===` обходить дерево Планувальника, читає XML завдань з

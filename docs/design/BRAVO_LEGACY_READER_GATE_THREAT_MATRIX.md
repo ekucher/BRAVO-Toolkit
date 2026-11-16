@@ -5,6 +5,10 @@
 повний dataflow-аналіз не впроваджується. Цей документ фіксує, що гейт ловить, що
 ні, чим це компенсується і де саме проходить межа.
 
+Наступний приріст (#239, прогалини 2 і 5) рішення власника теж не змінює: це **фіксований
+структурний pin** канонічної форми guard'а завантажувача `BRAVO_CONFIG_LOADER.ps1`, а не
+control-flow/dataflow-аналіз (див. розділ «Виправлено: структурний pin guard'а завантажувача»).
+
 ## Що охороняє гейт
 
 Гейт 3 функції `Test-BRAVOConfigV2CutoverGates`
@@ -71,8 +75,10 @@ code review, а гейт — лише автоматичний страхува�
 - `FALSE-POSITIVE` — гейт провалюється на безпечному коді.
 - `CLEAN` — коректно дозволена конструкція, гейт проходить.
 
-Кожен рядок матриці (122 виконуваних рядки) має тест `ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у
-`selftest\BRAVO_SELF_TEST.Governance.ps1`. Невиконуваних рядків немає: X2 (`& 'iex' '...'`)
+Кожен рядок матриці (148 рядків: DETECTED 98, CLEAN 30, MISSED 19, FALSE-POSITIVE 1; було 122) має тест
+`ReleaseGate/LegacyReaderMatrix/<Id>.<стан>` у `selftest\BRAVO_SELF_TEST.Governance.ps1`. Додатково є
+один проба-тест `ReleaseGate/LegacyReaderMatrix/LoaderVariantsDifferFromCanonicalAndEachOther` (не рядок
+матриці): кожен варіант завантажувача відрізняється від канонічного шаблону й від інших. Невиконуваних рядків немає: X2 (`& 'iex' '...'`)
 виконується як `MISSED` і **не** закритий `ci/Test-BRAVOForbiddenPattern.ps1`. Рядки `MISSED` і `FALSE-POSITIVE`
 явно позначені `KnownLimit` у назві тесту. Покращення гейта, яке змінює такий
 результат, мусить **свідомо** оновити і тест, і цей документ.
@@ -105,13 +111,105 @@ code review, а гейт — лише автоматичний страхува�
 | Id | № у #239 | Клас | Приклад | Гейт | Компенсація | Залишковий ризик | Рішення |
 |---|---|---|---|---|---|---|---|
 | G1 | 1 | Порядок виконання проти текстового offset | `function F { & $cmd }` текстово ПЕРЕД `$cmd = 'Read-...'` | MISSED | K4 (лише поза файлами, що вже підключають loader) | низький поза файлами з loader; у файлах із loader — лише review, ризик середній: потрібна навмисна перестановка | відомий ліміт (#239) |
-| G2 | 2 | Немає перевірки control-flow guard'а | виклик `Import-BravoLegacyPrimaryConfiguration` в loader поза `if (-not $Disallow...)`, рівно один раз | MISSED | K1 (лише шлях Configurator; не інші споживачі loader), K4 застосовний: loader — єдиний файл із цією парою (на сам loader dot-source не потрібен) | середній для loader, але зміна loader проходить review | відомий ліміт (#239) |
+| G2 | 2 | Немає перевірки guard'а | виклик `Import-BravoLegacyPrimaryConfiguration` в `Import-BravoConfiguration` (`BRAVO_CONFIG_LOADER.ps1`) поза `if ($legacyConfigFileExists)`, рівно один раз | **DETECTED (виправлено)** | | див. нижче (R2-R6) | **виправлено** (структурний pin, не dataflow) |
 | A* | 3 | Alias | `Set-Alias rdr Read-BRAVO...; rdr` | **DETECTED (виправлено)** | | див. нижче | **виправлено в цьому PR** |
 | G4 | 4 | Взаємовиключні `if`/`else` | `if ($u) { $c='Read-...' } else { $c='Get-ChildItem' }; & $c` | MISSED | K4 (лише поза файлами з loader) | низький поза файлами з loader; у файлах із loader — лише review (середній) | відомий ліміт (#239) |
-| G5 | 5 | «Рівно один» не діє при Count=0 | у loader видалено санкціонований виклик | MISSED | K1 (лише шлях Configurator): поведінкові тести loader | не обхід ізоляції; інший клас (власник) | відомий ліміт (#239) |
+| G5 | 5 | «Рівно один» не діє при Count=0 | у loader видалено санкціонований виклик | **DETECTED (виправлено, R0)** | | див. нижче (R0) | **виправлено** |
 | G6 | 6 | Нелітеральне перепризначення не затіняє | `$c='Read-...'; $c = Get-SafeCommand; & $c` | FALSE-POSITIVE | автор рефакторить код або виносить у санкціонований шлях | хибний FAIL, не прогалина безпеки | відомий ліміт (#239) |
 | G7a, G7b | 7 | `$script:` на стороні присвоєння | `function Set-It { $script:r='Read-...' }`, виклик `& $script:r` деінде | MISSED | K4 (лише поза файлами з loader) | низький поза файлами з loader; у файлах із loader — лише review (середній) | відомий ліміт (#239) |
 | T* | 8 | Типізована змінна | `[string]$r = 'Read-...'; & $r` | **DETECTED (виправлено)** | | див. нижче | **виправлено в цьому PR** |
+
+### Виправлено: структурний pin guard'а завантажувача (прогалини 2 і 5)
+
+Це не control-flow/dataflow-аналіз, а **фіксований структурний pin** канонічної форми
+`Import-BravoConfiguration` у кореневому `BRAVO_CONFIG_LOADER.ps1`. Правила діють лише для цього
+файлу (`$legacyReaderIsCanonicalLoaderFile`) і лише для санкціонованих пар «викликана -> викликач»:
+
+- **R0.** Для кожної санкціонованої пари знайдено рівно один виклик; 0 викликів — порушення
+  (канонічний виклик зник або перенесений, інваріанту не можна довести; прогалина 5). Спрацьовує навіть
+  коли `Import-BravoConfiguration` у файлі немає.
+- **R1.** Більше одного виклику пари — порушення (наявне повідомлення не змінено).
+- **R2.** Єдиний виклик `Import-BravoLegacyPrimaryConfiguration` стоїть у тілі `if` з умовою, що є
+  рівно змінною `$legacyConfigFileExists` (без операторів, редиректів, `-not`); перша ж обгортка-scriptblock
+  на шляху вгору мусить бути тілом функції. Відхиляються `else`, `elseif`, інша умова, виклик поза `if`,
+  усередині умови чи у вкладеному scriptblock. Вкладені `if`/цикли всередині тіла guard'а допустимі.
+- **R3.** У функції рівно одне присвоєння `$legacyConfigFileExists` (оператор `=`, верхній рівень тіла
+  функції, текстово раніше за guard `if`); його права частина — ланцюг `-and`, де один з операндів —
+  `-not`/`!` від `$legacyPrimaryAutoDetectBlocked`. Додаткові операнди дозволені.
+- **R4.** Те саме для правої частини R3: лише `-and` без розгортання дужок; операнд з запереченням
+  мусить бути незакваліфікованою змінною `$legacyPrimaryAutoDetectBlocked`.
+- **R5.** У функції рівно одне присвоєння `$legacyPrimaryAutoDetectBlocked` (теж `=`, верхній рівень,
+  текстово раніше за присвоєння R3); його права частина — ланцюг `-and` рівно з трьох операндів у будь-якому
+  порядку: `[bool]$DisallowLegacyPrimaryAutoDetect` (або без касту), `$legacyConfigFileExistsOnDisk`,
+  `-not`/`!` `$configPathWasExplicit`.
+- **R6.** Параметр `DisallowLegacyPrimaryAutoDetect` оголошено в `param()` функції з типом
+  `SwitchParameter`, і в тілі функції немає жодного присвоєння йому.
+
+Пара `Read-BRAVOLegacyPrimaryRawOverrides` -> `Import-BravoLegacyPrimaryConfiguration` guard'а не
+пінить (транзитивно через `Import-BravoLegacyPrimaryConfiguration`): для неї діють лише R0 і R1.
+Кожне з R2-R6 повідомляє власну причину; загальний заголовок повідомлення не змінено.
+
+Канонічна форма (скорочено):
+
+```powershell
+function Import-BravoConfiguration {
+    param($ConfigRoot, [switch]$ConfigPathWasExplicit, [switch]$DisallowLegacyPrimaryAutoDetect)
+    $configPathWasExplicit = [bool]$ConfigPathWasExplicit
+    $legacyConfigFileExistsOnDisk = Test-Path -LiteralPath X -PathType Leaf
+    $legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and $legacyConfigFileExistsOnDisk -and -not $configPathWasExplicit
+    $legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked
+    if ($legacyConfigFileExists) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } else { Import-BravoSyntheticConfiguration }
+}
+```
+
+**Fail closed за задумом:** будь-який рефакторинг цієї форми в реальному `BRAVO_CONFIG_LOADER.ps1`
+(перейменування змінної, зміна порядку присвоєнь, виніс умови) провалює гейт. Це свідомо: такий рефакторинг
+потребує одночасного й навмисного оновлення гейта, цієї матриці та тестів (рядок C05 перевіряє реальний
+loader).
+
+| Id | Варіант | Гейт | Рішення |
+|---|---|---|---|
+| C04 | канонічний шаблон завантажувача | CLEAN | захищено від хибних FAIL |
+| C05 | текст реального `BRAVO_CONFIG_LOADER.ps1` з кореня репозиторію | CLEAN | захищено від хибних FAIL |
+| C06 | вкладений `if` усередині тіла guard'а | CLEAN | захищено від хибних FAIL |
+| C07 | цикл `foreach` усередині тіла guard'а | CLEAN | захищено від хибних FAIL |
+| C08 | заперечення `!` замість `-not` в операндах R3 і R5 | CLEAN | захищено від хибних FAIL |
+| G2 | виклик `Import-BravoLegacyPrimaryConfiguration` без `if` (безумовно) | DETECTED | виправлено |
+| G2a | виклик у гілці `else` guard'а | DETECTED | виправлено |
+| G2b | виклик після `if`, поза ним | DETECTED | виправлено |
+| G2c | умова `if ($true)` | DETECTED | виправлено |
+| G2d | умова `if ($legacyConfigFileExistsOnDisk)` | DETECTED | виправлено |
+| G2e | умова `if (-not $legacyConfigFileExists)` | DETECTED | виправлено |
+| G2f | умова `$legacyConfigFileExists -or $true` | DETECTED | виправлено |
+| G2g | виклик у `elseif ($true)` | DETECTED | виправлено |
+| G2h | виклик усередині умови `if` | DETECTED | виправлено |
+| G2i | виклик у збереженому scriptblock `$sb = { ... }` | DETECTED | виправлено |
+| G2j | `$legacyConfigFileExists = $true` після канонічного присвоєння | DETECTED | виправлено |
+| G2k | те саме перепризначення у вкладеному `if` | DETECTED | виправлено |
+| G2l | канонічне присвоєння загорнуте в `if ($true) { ... }` (не верхній рівень) | DETECTED | виправлено |
+| G2m | з правої частини прибрано `-not $legacyPrimaryAutoDetectBlocked` | DETECTED | виправлено |
+| G2n | `... -and -not $blocked -or $true` | DETECTED | виправлено |
+| G2o | `$legacyPrimaryAutoDetectBlocked = $false` після канонічного присвоєння | DETECTED | виправлено |
+| G2p | `$legacyPrimaryAutoDetectBlocked` з додатковим `-and $false` | DETECTED | виправлено |
+| G2q | `$legacyPrimaryAutoDetectBlocked` без операнда `$DisallowLegacyPrimaryAutoDetect` | DETECTED | виправлено |
+| G2r | `$DisallowLegacyPrimaryAutoDetect = $false` у тілі функції | DETECTED | виправлено |
+| G2s | параметр `-DisallowLegacyPrimaryAutoDetect` прибрано з `param()` | DETECTED | виправлено |
+| G5 | санкціонований виклик видалено цілком (Count = 0) | DETECTED | виправлено (R0) |
+| G5a | видалено виклик `Import-BravoLegacyPrimaryConfiguration` | DETECTED | виправлено (R0) |
+| G5b | видалено виклик `Read-BRAVOLegacyPrimaryRawOverrides` | DETECTED | виправлено (R0) |
+
+Залишкові ліміти цього pin'а:
+
+- Мутація змінних guard'а не через `=`: `Set-Variable`/`New-Variable`/`Remove-Variable`/`Clear-Variable`,
+  `Set-Item variable:`, `[ref]`, `-OutVariable` тощо, змінна циклу `foreach` — гейт не бачить. Точкове
+  розширення не додавалося, бо власник у #239 радив не нарощувати точкові патчі; додати його можна лише
+  окремим рішенням власника.
+- Значення `$legacyConfigFileExistsOnDisk` і `$configPathWasExplicit` не пінуються.
+- Приховані виклики всередині loader (X1-X8, G8, G9, A17-A20) лишаються `MISSED`.
+- Pin прив'язаний до кореневого `BRAVO_CONFIG_LOADER.ps1`: якщо файлу в дереві немає, R0 не
+  застосовується (відсутній loader не провалює гейт).
+- Порядок виконання не аналізується (прогалини 1, 4, 6, 7 без змін).
+- R6 не перевіряє, що entrypoint-и передають прапорець; це робить гейт 2 `LEGACY_CONFIG_AUTOEXEC`.
 
 ### Виправлено: alias (прогалина 3)
 
@@ -243,11 +341,11 @@ drive визначається для форм `${function:<ім'я рідера
 
 ## Підсумок
 
-- Виправлено в цьому PR: прогалини 3 (alias) і 8 (типізована змінна), включно з обгортками значення
-  в дужках/касті (рев'ю PR #497).
+- Виправлено: прогалини 3 (alias) і 8 (типізована змінна), включно з обгортками значення
+  в дужках/касті (рев'ю PR #497), а також 2 і 5 (структурний pin guard'а завантажувача, R0-R6).
 - Свідомо не чіпано (потребують control-flow/dataflow, рішення власника в #239):
-  1, 2, 4; також 5, 6, 7.
-- Усі 122 виконуваних рядків зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
+  1, 4, 6, 7.
+- Усі 148 рядків матриці зафіксовані тестами (X2 — як відомий ліміт: `ci/Test-BRAVOForbiddenPattern.ps1` його не закриває): майбутнє покращення гейта проявиться як
   навмисне оновлення відповідного `KnownLimit`-тесту та цього документа.
 - Якщо інвестувати далі, рекомендація власника лишається чинною: не точковими
   патчами, а окремим санкціонованим дизайном обмеженого dataflow-проходу.
