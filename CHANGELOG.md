@@ -23,6 +23,24 @@
   `ConvertTo-BRAVOWinSCPExclusionMask` (`BRAVO.Compatibility`). Контракт авторизації 284→289 листів
   (`ALLOW_WITH_VALIDATOR` 28→33). Self-test: `Authorization/ExclusionPattern*`, `Archive/Exclusion*`, `BazaSync/Exclusion*`.
   Поза обсягом: `BRAVO_BAZA_RECONCILE.ps1` (звіт мутацій і реконсиляція) списків виключень не враховує.
+- **Security: розкатка більше не розпаковує комплект у `C:\Temp` (#545, AUD-AG14-001, P0).**
+  `deploy\Update-BRAVOServer.ps1` і `deploy\Install-BRAVOServer.ps1` створювали staging у
+  `C:\Temp\BRAVO_UPDATE` / `C:\Temp\BRAVO_INSTALL` звичайним `New-Item`. Каталог `C:\Temp` може створити й
+  контролювати будь-який локальний користувач, тож архів між `Get-FileHash` і `Expand-Archive` чи staged-файли
+  перед robocopy можна було підмінити, і цей код далі виконувався від SYSTEM. Тепер staging — щоразу новий
+  каталог у `$env:SystemRoot\Temp`, створений одразу з DACL «лише Administrators і SYSTEM, без успадкування»
+  (власник Administrators; наявний каталог чи інший DACL — відмова до розпакування). Архів копіюється туди до
+  звірки SHA-256 і розпаковується з тієї самої копії. Перед першою зміною runtime staged-дерево звіряється з
+  усіма записами перевіреної копії архіву (кожен файл будь-якого розширення за SHA-256; зайвий, відсутній файл
+  чи reparse point — відмова), а потім із `RUNTIME_MANIFEST.json` комплекту: файл, змінений після хешування,
+  зупиняє розкатку. Обидва скрипти беруть звірку з нового `deploy\BRAVO.Deploy.Staging.ps1` (fail-closed без
+  нього). Приватний каталог оновлювач створює helper-ом звідти, інсталятор — наявним
+  `New-BRAVOInstallPrivateDirectory` (#434). `-StagingRoot` ігнорується з попередженням. Self-test:
+  `Deploy/StagingNotInUserCreatableTemp`, `Deploy/UpdaterStagingPrivateBeforeFirstWrite`,
+  `Deploy/InstallerStagingPrivateBeforeFirstWrite`, `Deploy/StagedTreeVerifiedBeforeFirstRuntimeChange`,
+  `Deploy/StagedTreeMatchesArchiveCoversEveryFile`, `Deploy/StagedFileChangedAfterHashIsRefused`,
+  `Deploy/PrivateStagingDirectoryProtectedOrRefused`.
+  `deploy\Update-BRAVO52.ps1` (#530) у цю гілку не входить, і для нього виправлення не перевірено.
 
 - **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy
   `BRAVO.config` (#281, доказ B5 для #154; лише читання).** Новий розділ
