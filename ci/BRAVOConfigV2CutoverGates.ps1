@@ -708,6 +708,205 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
         }
         return $chain
     }
+
+    # #239 (прогалини 2 і 5): фіксована структурна перевірка (pin) форми
+    # канонічного guard'а в BRAVO_CONFIG_LOADER.ps1 — правила R2-R6 нижче.
+    # Це НЕ аналіз control-flow/dataflow: лише точний візерунок AST, який
+    # має мати канонічний завантажувач; будь-який рефакторинг форми провалює
+    # гейт (fail closed).
+    function Get-BRAVOAstSoleExpression {
+        param($PipelineNode)
+        # Права частина присвоєння на PS 5.1 може бути як PipelineAst з одним
+        # CommandExpressionAst, так і самим CommandExpressionAst.
+        $soleElement = $PipelineNode
+        if ($PipelineNode -is [System.Management.Automation.Language.PipelineAst]) {
+            if ($PipelineNode.PipelineElements.Count -ne 1) { return $null }
+            $soleElement = $PipelineNode.PipelineElements[0]
+        }
+        if ($soleElement -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $null }
+        if ($soleElement.Redirections.Count -ne 0) { return $null }
+        return $soleElement.Expression
+    }
+
+    function Test-BRAVOAstUnqualifiedVariable {
+        param($AstNode, [string]$Name)
+        return (($AstNode -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+            $AstNode.VariablePath.IsUnqualified -and
+            ($AstNode.VariablePath.UserPath -ieq $Name))
+    }
+
+    function Test-BRAVOAstNotOfUnqualifiedVariable {
+        param($AstNode, [string]$Name)
+        if ($AstNode -isnot [System.Management.Automation.Language.UnaryExpressionAst]) { return $false }
+        if ($AstNode.TokenKind -ne [System.Management.Automation.Language.TokenKind]::Not -and
+            $AstNode.TokenKind -ne [System.Management.Automation.Language.TokenKind]::Exclaim) { return $false }
+        return (Test-BRAVOAstUnqualifiedVariable -AstNode $AstNode.Child -Name $Name)
+    }
+
+    # Плаский список операндів ланцюга -and (лише BinaryExpressionAst з
+    # TokenKind.And; дужки не розгортаються).
+    function Add-BRAVOAstAndOperands {
+        param($AstNode, $Operands)
+        if (($AstNode -is [System.Management.Automation.Language.BinaryExpressionAst]) -and
+            $AstNode.Operator -eq [System.Management.Automation.Language.TokenKind]::And) {
+            Add-BRAVOAstAndOperands -AstNode $AstNode.Left -Operands $Operands
+            Add-BRAVOAstAndOperands -AstNode $AstNode.Right -Operands $Operands
+        } else {
+            [void]$Operands.Add($AstNode)
+        }
+    }
+
+    function Get-BRAVOAstAssignmentsToVariable {
+        param($ScopeAst, [string]$VariableName)
+        $found = New-Object System.Collections.Generic.List[object]
+        $allAssignments = $ScopeAst.FindAll(
+            { param($astNode) $astNode -is [System.Management.Automation.Language.AssignmentStatementAst] },
+            $true
+        )
+        foreach ($assignment in $allAssignments) {
+            $target = $assignment.Left
+            while ($target -is [System.Management.Automation.Language.AttributedExpressionAst] -or
+                   $target -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+                $target = $target.Child
+            }
+            if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $targetName = Get-BRAVOAstNormalizedVariableName -UserPath $target.VariablePath.UserPath
+            if ($targetName -ieq $VariableName) { [void]$found.Add($assignment) }
+        }
+        return ,$found
+    }
+
+    # Єдине присвоєння верхнього рівня тіла функції простим `=`; повертає
+    # @{ Assignment; Reason } (Assignment = $null, якщо перевірка не пройшла).
+    function Get-BRAVOAstSoleTopLevelAssignment {
+        param($FunctionAst, [string]$VariableName)
+        $assignments = Get-BRAVOAstAssignmentsToVariable -ScopeAst $FunctionAst -VariableName $VariableName
+        if ($assignments.Count -ne 1) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєнь `$$VariableName у функції $($assignments.Count), очікується рівно 1" }
+        }
+        $only = $assignments[0]
+        if ($only.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName не простим '='" }
+        }
+        if (($only.Parent -isnot [System.Management.Automation.Language.NamedBlockAst]) -or
+            -not [object]::ReferenceEquals($only.Parent.Parent, $FunctionAst.Body)) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName не на верхньому рівні тіла функції" }
+        }
+        return [pscustomobject]@{ Assignment = $only; Reason = $null }
+    }
+
+    # R2-R6: структурний pin виклику Import-BravoLegacyPrimaryConfiguration
+    # у Import-BravoConfiguration. Повертає список причин (порожній = чисто).
+    function Get-BRAVOLegacyPrimaryGuardPinReasons {
+        param($CallAst)
+        $reasons = New-Object System.Collections.Generic.List[string]
+        $guardIf = $null
+        $child = $CallAst
+        $walk = $CallAst.Parent
+        while ($walk -and $walk -isnot [System.Management.Automation.Language.ScriptBlockAst]) {
+            if ($walk -is [System.Management.Automation.Language.IfStatementAst]) {
+                foreach ($clause in $walk.Clauses) {
+                    if (-not [object]::ReferenceEquals($clause.Item2, $child)) { continue }
+                    $conditionExpression = Get-BRAVOAstSoleExpression -PipelineNode $clause.Item1
+                    if (Test-BRAVOAstUnqualifiedVariable -AstNode $conditionExpression -Name 'legacyConfigFileExists') {
+                        if (-not $guardIf) { $guardIf = $walk }
+                    }
+                }
+            }
+            $child = $walk
+            $walk = $walk.Parent
+        }
+        $functionAst = $null
+        if ($walk -and ($walk.Parent -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+            $functionAst = $walk.Parent
+        } else {
+            $functionAst = $CallAst.Parent
+            while ($functionAst -and $functionAst -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                $functionAst = $functionAst.Parent
+            }
+            $guardIf = $null
+        }
+        if (-not $guardIf) {
+            [void]$reasons.Add('R2: виклик Import-BravoLegacyPrimaryConfiguration не стоїть безпосередньо в гілці if ($legacyConfigFileExists) { ... } (else/elseif/інша умова/поза if/в умові/у вкладеному scriptblock) — guard не доведено')
+        }
+        if (-not $functionAst) {
+            [void]$reasons.Add('R2: не знайдено охоплюючу функцію виклику — pin R3-R6 неможливий')
+            return ,$reasons
+        }
+
+        # R3: $legacyConfigFileExists.
+        $existsPin = Get-BRAVOAstSoleTopLevelAssignment -FunctionAst $functionAst -VariableName 'legacyConfigFileExists'
+        $existsAssignment = $existsPin.Assignment
+        if (-not $existsAssignment) {
+            [void]$reasons.Add("R3: $($existsPin.Reason)")
+        } elseif ($guardIf -and $existsAssignment.Extent.StartOffset -ge $guardIf.Extent.StartOffset) {
+            [void]$reasons.Add('R3: присвоєння $legacyConfigFileExists стоїть не перед guard-if')
+        }
+
+        # R4: RHS містить -not $legacyPrimaryAutoDetectBlocked серед операндів -and.
+        if ($existsAssignment) {
+            $existsOperands = New-Object System.Collections.Generic.List[object]
+            $existsExpression = Get-BRAVOAstSoleExpression -PipelineNode $existsAssignment.Right
+            if ($existsExpression) { Add-BRAVOAstAndOperands -AstNode $existsExpression -Operands $existsOperands }
+            $hasBlockedNegation = $false
+            foreach ($existsOperand in $existsOperands) {
+                if (Test-BRAVOAstNotOfUnqualifiedVariable -AstNode $existsOperand -Name 'legacyPrimaryAutoDetectBlocked') { $hasBlockedNegation = $true }
+            }
+            if (-not $hasBlockedNegation) {
+                [void]$reasons.Add('R4: значення $legacyConfigFileExists не містить -not $legacyPrimaryAutoDetectBlocked серед операндів ланцюга -and')
+            }
+        }
+
+        # R5: $legacyPrimaryAutoDetectBlocked.
+        $blockedPin = Get-BRAVOAstSoleTopLevelAssignment -FunctionAst $functionAst -VariableName 'legacyPrimaryAutoDetectBlocked'
+        $blockedAssignment = $blockedPin.Assignment
+        if (-not $blockedAssignment) {
+            [void]$reasons.Add("R5: $($blockedPin.Reason)")
+        } else {
+            if ($existsAssignment -and $blockedAssignment.Extent.StartOffset -ge $existsAssignment.Extent.StartOffset) {
+                [void]$reasons.Add('R5: присвоєння $legacyPrimaryAutoDetectBlocked стоїть не перед присвоєнням $legacyConfigFileExists')
+            }
+            $blockedOperands = New-Object System.Collections.Generic.List[object]
+            $blockedExpression = Get-BRAVOAstSoleExpression -PipelineNode $blockedAssignment.Right
+            if ($blockedExpression) { Add-BRAVOAstAndOperands -AstNode $blockedExpression -Operands $blockedOperands }
+            $seenDisallow = 0
+            $seenOnDisk = 0
+            $seenNotExplicit = 0
+            $seenOther = 0
+            foreach ($blockedOperand in $blockedOperands) {
+                $disallowCandidate = $blockedOperand
+                if ($blockedOperand -is [System.Management.Automation.Language.ConvertExpressionAst] -and
+                    ($blockedOperand.Type.TypeName.FullName -ieq 'bool' -or $blockedOperand.Type.TypeName.FullName -ieq 'System.Boolean')) {
+                    $disallowCandidate = $blockedOperand.Child
+                }
+                if (Test-BRAVOAstUnqualifiedVariable -AstNode $disallowCandidate -Name 'DisallowLegacyPrimaryAutoDetect') { $seenDisallow++ }
+                elseif (Test-BRAVOAstUnqualifiedVariable -AstNode $blockedOperand -Name 'legacyConfigFileExistsOnDisk') { $seenOnDisk++ }
+                elseif (Test-BRAVOAstNotOfUnqualifiedVariable -AstNode $blockedOperand -Name 'configPathWasExplicit') { $seenNotExplicit++ }
+                else { $seenOther++ }
+            }
+            if ($blockedOperands.Count -ne 3 -or $seenDisallow -ne 1 -or $seenOnDisk -ne 1 -or $seenNotExplicit -ne 1 -or $seenOther -ne 0) {
+                [void]$reasons.Add('R5: значення $legacyPrimaryAutoDetectBlocked має бути рівно трьома операндами -and: [bool]$DisallowLegacyPrimaryAutoDetect, $legacyConfigFileExistsOnDisk, -not $configPathWasExplicit')
+            }
+        }
+
+        # R6: параметр -DisallowLegacyPrimaryAutoDetect — [switch] без присвоєнь.
+        $disallowParameter = $null
+        if ($functionAst.Body.ParamBlock) {
+            foreach ($parameterAst in $functionAst.Body.ParamBlock.Parameters) {
+                if ($parameterAst.Name.VariablePath.UserPath -ieq 'DisallowLegacyPrimaryAutoDetect') { $disallowParameter = $parameterAst }
+            }
+        }
+        if (-not $disallowParameter) {
+            [void]$reasons.Add('R6: у param-блоці функції немає параметра DisallowLegacyPrimaryAutoDetect')
+        } elseif ($disallowParameter.StaticType -ne [System.Management.Automation.SwitchParameter]) {
+            [void]$reasons.Add('R6: параметр DisallowLegacyPrimaryAutoDetect не має типу [switch]')
+        }
+        $disallowAssignments = Get-BRAVOAstAssignmentsToVariable -ScopeAst $functionAst -VariableName 'DisallowLegacyPrimaryAutoDetect'
+        if ($disallowAssignments.Count -ne 0) {
+            [void]$reasons.Add('R6: параметр DisallowLegacyPrimaryAutoDetect перепризначається у функції')
+        }
+        return ,$reasons
+    }
     # R2 (issue #216, gate-review): попередня версія обмежувалась modules\ і
     # лише 14 AUTOEXEC-цілями (Get-BRAVOProductionEntryPointRelativePath), що
     # пропускало кореневі тонкі entrypoint-обгортки поза цим списком (напр.
@@ -859,6 +1058,14 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
             # пари має бути РІВНО ОДИН виклик з відповідного викликача в
             # усьому файлі. Другий (і будь-який подальший) виклик того самого
             # callee з того самого санкціонованого викликача провалює гейт.
+            # #239 (прогалини 2 і 5): додатково для канонічного завантажувача
+            # діє ФІКСОВАНИЙ структурний pin його форми (R0: нуль викликів
+            # провалює гейт; R2-R6: виклик Import-BravoLegacyPrimaryConfiguration
+            # стоїть у гілці if ($legacyConfigFileExists), а присвоєння
+            # $legacyConfigFileExists/$legacyPrimaryAutoDetectBlocked і
+            # параметр -DisallowLegacyPrimaryAutoDetect мають точну форму).
+            # Це все ще НЕ control-flow/dataflow-аналіз: зміна форми
+            # завантажувача провалює гейт (fail closed), а не доводиться.
             $legacyReaderSanctionedCallSiteHits = New-Object System.Collections.Generic.List[object]
 
             $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
@@ -967,7 +1174,7 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
                         if ($legacyReaderIsCanonicalLoaderFile -and
                             $legacyReaderSanctionedCallSitePairs.ContainsKey($legacyReaderFunctionName) -and
                             [string]::Equals($legacyReaderSanctionedCallSitePairs[$legacyReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
-                            [void]$legacyReaderSanctionedCallSiteHits.Add($legacyReaderFunctionName)
+                            [void]$legacyReaderSanctionedCallSiteHits.Add([pscustomobject]@{ Name = $legacyReaderFunctionName; CommandAst = $legacyReaderCommandAst })
                             continue
                         }
                         [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
@@ -1060,21 +1267,35 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
                 if ($legacyReaderIsCanonicalLoaderFile -and
                     $legacyReaderSanctionedCallSitePairs.ContainsKey($nearestPrecedingAssignment.ReaderFunctionName) -and
                     [string]::Equals($legacyReaderSanctionedCallSitePairs[$nearestPrecedingAssignment.ReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
-                    [void]$legacyReaderSanctionedCallSiteHits.Add($nearestPrecedingAssignment.ReaderFunctionName)
+                    [void]$legacyReaderSanctionedCallSiteHits.Add([pscustomobject]@{ Name = $nearestPrecedingAssignment.ReaderFunctionName; CommandAst = $legacyReaderCommandAst })
                     continue
                 }
                 [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
             }
 
             if ($legacyReaderIsCanonicalLoaderFile) {
-                $legacyReaderSanctionedCallSiteHits |
-                    Group-Object |
-                    Where-Object { $_.Count -gt 1 } |
-                    ForEach-Object {
+                # #239 (прогалина 5): R0 - канонічний виклик мусить існувати
+                # (Count=0 більше не проходить мовчки); R1 - не більше одного.
+                foreach ($sanctionedCallee in @($legacyReaderSanctionedCallSitePairs.Keys | Sort-Object)) {
+                    $sanctionedCalleeHits = @($legacyReaderSanctionedCallSiteHits |
+                        Where-Object { [string]::Equals($_.Name, $sanctionedCallee, [StringComparison]::OrdinalIgnoreCase) })
+                    $sanctionedCaller = $legacyReaderSanctionedCallSitePairs[$sanctionedCallee]
+                    if ($sanctionedCalleeHits.Count -eq 0) {
                         [void]$legacyReaderViolations.Add(
-                            "$fileRelativePath ($($_.Name): знайдено $($_.Count) виклик(ів) із санкціонованого викликача — очікується рівно 1; додатковий виклик поза відомим guard'ом підозрілий)"
+                            "$fileRelativePath ($($sanctionedCallee): знайдено 0 викликів із санкціонованого викликача $($sanctionedCaller) — очікується рівно 1; канонічний виклик зник або перенесений, інваріанту не можна довести)"
                         )
+                    } elseif ($sanctionedCalleeHits.Count -gt 1) {
+                        [void]$legacyReaderViolations.Add(
+                            "$fileRelativePath ($($sanctionedCallee): знайдено $($sanctionedCalleeHits.Count) виклик(ів) із санкціонованого викликача — очікується рівно 1; додатковий виклик поза відомим guard'ом підозрілий)"
+                        )
+                    } elseif ($sanctionedCallee -ieq 'Import-BravoLegacyPrimaryConfiguration') {
+                        # #239 (прогалина 2): R2-R6 - структурний pin guard'а.
+                        $guardPinReasons = Get-BRAVOLegacyPrimaryGuardPinReasons -CallAst $sanctionedCalleeHits[0].CommandAst
+                        foreach ($guardPinReason in $guardPinReasons) {
+                            [void]$legacyReaderViolations.Add("$fileRelativePath ($($sanctionedCallee): структура guard'а — $guardPinReason)")
+                        }
                     }
+                }
             }
         }
     }
