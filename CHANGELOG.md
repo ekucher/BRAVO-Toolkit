@@ -81,8 +81,10 @@
   кількість викликів ReadFile на файл під час перевірки SHA512 N найновіших generation у retention зменшується
   приблизно в 256 разів. Зміна стосується всіх викликачів (створення архіву, retention, Maintenance, Health,
   перевірки інструментів DataRestore). Контракт не змінено: ті самі значення хешу; семантика `-LiteralPath` через
-  `Resolve-Path` (ProviderPath); відсутній файл кидає виняток; для каталогу результату немає (як у
-  `Get-FileHash`); `FileShare.Read`; фабрика хешера в тому ж порядку, що й у `Get-FileHash`
+  `Resolve-Path` (ProviderPath); будь-який збій (відсутній, заблокований або нечитабельний файл) завершується
+  terminating-винятком навіть без зовнішнього try/catch (до виправлення помилка конструктора `FileStream` без
+  зовнішнього try дала б тихий порожній результат, 855e3998); для каталогу результату немає і помилки теж немає
+  (як у `Get-FileHash`); `FileShare.Read`; фабрика хешера в тому ж порядку, що й у `Get-FileHash`
   (`<Alg>CryptoServiceProvider` першим, сумісність із FIPS); результат `Algorithm`/`Hash` (верхній
   регістр)/`Path`. Рішення retention і гарантії безпеки #335 без змін, нових ключів конфігурації немає,
   контракт журналу не змінено (поле `FileHashProvider` у стартовому записі лишається як є). Не перевірено:
@@ -92,7 +94,8 @@
   Self-test: `Compatibility/FileHashMatchesOracleAllAlgorithms`, `FileHashKnownAnswerSha512`,
   `FileHashLiteralBracketPath`, `FileHashMissingFileThrows`, `FileHashDirectoryReturnsNothing`,
   `FileHashExclusiveLockThrows`, `FileHashConcurrentReaderSucceeds`, `FileHashReleasesHandle`,
-  `FileHashResultShape`, `FileHashStaticContract`.
+  `FileHashResultShape`, `FileHashStaticContract`, `FileHashFailureIsTerminatingWithoutOuterTry`. Oracle-порівняння
+  пропускає MD5 на хості лише з FIPS.
 
 - **Fix: retention backup generation fail-closed для недоступного каталогу компонента і чужого імені за записаним
   шляхом.** `Resolve-BRAVORetentionGenerationManifest` мав дві прогалини (присутні й у 5.2.6):
