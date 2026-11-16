@@ -3948,6 +3948,8 @@ function Import-BravoConfiguration {
     $matrixG2tText = $legacyReaderCanonicalLoaderText.Replace($lcExists, $lcExists + "`n    `$null, `$legacyConfigFileExists = `$null, `$true")
     $matrixG2uText = $legacyReaderCanonicalLoaderText.Replace($lcExplicit, $lcExplicit + "`n    `$null, `$DisallowLegacyPrimaryAutoDetect = `$null, `$false")
     $matrixG2vText = $legacyReaderCanonicalLoaderText.Replace($lcExists, '$global:legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked')
+    $matrixG2wText = $legacyReaderCanonicalLoaderText.Replace($lcExists, '[string]' + $lcExists)
+    $matrixG2xText = $legacyReaderCanonicalLoaderText.Replace($lcBlocked, '[string]' + $lcBlocked)
     $matrixG5aText = $legacyReaderCanonicalLoaderText.Replace($lcIf, 'Import-BravoSyntheticConfiguration')
     $matrixG5bText = $legacyReaderCanonicalLoaderText.Replace($lcReadCall, '')
     $matrixRows = @(
@@ -4096,6 +4098,8 @@ function Import-BravoConfiguration {
         @{ Id = 'G2t.MultiTargetReassignmentOfExistsVariable'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2tText },
         @{ Id = 'G2u.MultiTargetAssignmentOfDisallowParameter'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2uText },
         @{ Id = 'G2v.ScopeQualifiedPinnedAssignment'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2vText },
+        @{ Id = 'G2w.TypeConstrainedExistsAssignment'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2wText },
+        @{ Id = 'G2x.TypeConstrainedBlockedAssignment'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG2xText },
         @{ Id = 'G4.MutuallyExclusiveIfElse'; Kind = 'MISSED'; Path = $matrixModule; Text = "function F { param(`$u); if (`$u) { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides' } else { `$cmd = 'Get-ChildItem' }; & `$cmd }" },
         @{ Id = 'G5.SanctionedCallRemovedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`nfunction Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath) }`nfunction Import-BravoConfiguration { param(`$ConfigRoot) }" },
         @{ Id = 'G5a.ImportCallDeletedCountZero'; Kind = 'DETECTED'; Path = $matrixLoader; Text = $matrixG5aText },
@@ -4128,14 +4132,14 @@ function Import-BravoConfiguration {
     # #239: кожен варіант канонічного завантажувача (C06-C08, G2*, G5*) мусить
     # справді відрізнятися від шаблону і від решти варіантів - інакше рядок
     # перевіряв би не те, що заявлено в Id.
-    $matrixVariantRows = @($matrixRows | Where-Object { $_.Path -eq $matrixLoader -and $_.Id -match '^(C0[678]|G2[a-v]?|G5[ab]?)\.' })
+    $matrixVariantRows = @($matrixRows | Where-Object { $_.Path -eq $matrixLoader -and $_.Id -match '^(C0[678]|G2[a-x]?|G5[ab]?)\.' })
     $matrixVariantTexts = @($matrixVariantRows | ForEach-Object { $_.Text })
     $matrixVariantsEqualToCanonical = @($matrixVariantTexts | Where-Object { $_ -ceq $legacyReaderCanonicalLoaderText })
     $matrixVariantsDistinctCount = @($matrixVariantTexts | Sort-Object -Unique).Count
     Test-BRAVOCondition `
-        -Condition ($matrixVariantRows.Count -eq 29 -and $matrixVariantsEqualToCanonical.Count -eq 0 -and $matrixVariantsDistinctCount -eq $matrixVariantRows.Count) `
+        -Condition ($matrixVariantRows.Count -eq 31 -and $matrixVariantsEqualToCanonical.Count -eq 0 -and $matrixVariantsDistinctCount -eq $matrixVariantRows.Count) `
         -Name "ReleaseGate/LegacyReaderMatrix/LoaderVariantsDifferFromCanonicalAndEachOther" `
-        -Failure ("варіанти канонічного завантажувача мусять відрізнятися від шаблону й один від одного; рядків=" + $matrixVariantRows.Count + " (очікувано 29), збігаються з шаблоном=" + $matrixVariantsEqualToCanonical.Count + ", унікальних=" + $matrixVariantsDistinctCount)
+        -Failure ("варіанти канонічного завантажувача мусять відрізнятися від шаблону й один від одного; рядків=" + $matrixVariantRows.Count + " (очікувано 31), збігаються з шаблоном=" + $matrixVariantsEqualToCanonical.Count + ", унікальних=" + $matrixVariantsDistinctCount)
 
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml

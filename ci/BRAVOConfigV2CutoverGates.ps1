@@ -821,6 +821,13 @@ function Invoke-BRAVOConfigV2CutoverGatesCore {
         if (-not $onlyTarget.VariablePath.IsUnqualified) {
             return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName з кваліфікатором scope" }
         }
+        # Ціль мусить бути голою змінною: обмеження типу чи атрибут на цілі
+        # (`[string]$x = ...`) змінює семантику значення (рядок 'False' у
+        # `if` істинний), тому будь-яке ConvertExpressionAst/AttributedExpressionAst
+        # на цілі провалює pin (fail closed, включно з [bool]).
+        if ($only.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+            return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName з обмеженням типу чи атрибутом на цілі" }
+        }
         if (($only.Parent -isnot [System.Management.Automation.Language.NamedBlockAst]) -or
             -not [object]::ReferenceEquals($only.Parent.Parent, $FunctionAst.Body)) {
             return [pscustomobject]@{ Assignment = $null; Reason = "присвоєння `$$VariableName не на верхньому рівні тіла функції" }
