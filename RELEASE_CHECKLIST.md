@@ -32,7 +32,9 @@
 - [ ] `README.md`/`SECURITY.md` оновлені, якщо змінилась поведінка,
       конфігурація, модель безпеки чи підтримувані версії ОС.
 - [ ] `BRAVO_SELF_TEST.ps1` пройдено повністю на Windows PowerShell 5.1
-      (`SELF-TEST PASSED`, без жодного `[FAIL]`).
+      (`SELF-TEST PASSED`, без жодного `[FAIL]`, 0 рядків `[НЕДОСТУПНО]` і 0
+      перерваних секцій; дві останні умови перевіряються вручну за логом:
+      `SELF-TEST PASSED` і код 0 друкуються й з `[НЕДОСТУПНО]`).
 - [ ] `BRAVO_DRY_RUN.ps1 -TestAccess` пройдено під production task account
       (`SYSTEM`): source enumerate/metadata read, VSS capability та real
       create/write/read/delete probes для RuntimeRoot\LOGS, SystemLogRoot,
@@ -50,8 +52,8 @@
 - [ ] GitHub Actions CI (`.github/workflows/ci.yml`) зелений на коміті
       релізу — перевірте вкладку Actions перед тегуванням. Цей пункт —
       обов'язкова ручна звірка, а не формальність: за live-перевіркою
-      через GitHub REST API 2026-09-30 `master` захищено шістьма
-      required checks, а `developer` **не захищено взагалі** — merge у
+      через GitHub REST API 2026-11-16 `master` захищено шістьма
+      required checks (`strict` і `enforce_admins` увімкнено), а `developer` **не захищено взагалі** — merge у
       `developer` з червоним CI технічно нічим не заблоковано. Перед
       рішенням стан перечитати заново; бажана політика, live-стан і
       дія власника — `RELEASE_POLICY.md`, розділи 13.3 і 13.4.
@@ -122,12 +124,12 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
 - CI (аудит AUD-001) — тепер існує: `.github/workflows/ci.yml`
   (`windows-latest`, парсинг, BOM, JSON, `PSScriptAnalyzer`, повний
   `BRAVO_SELF_TEST.ps1`, `gitleaks`), запускається на кожен push/PR.
-  Branch protection (перевірено через GitHub REST API 2026-09-30,
+  Branch protection (перевірено через GitHub REST API 2026-11-16,
   мусить бути перечитано перед рішенням): `master` — protected, шість
-  required checks з канону `RELEASE_POLICY.md` §13.3; його `strict`,
-  `enforce_admins`, вимогу PR і заборону force push/видалення токеном
-  без admin-прав не перевірено (HTTP 403). `developer` — **не
-  protected** (ні правила, ні ruleset); бажана політика і процедура
+  required checks з канону `RELEASE_POLICY.md` §13.3; `strict` і
+  `enforce_admins` увімкнено, вимога PR є (0 обов'язкових схвалень),
+  force push і видалення заборонені. `developer` — **не
+  protected** (`GET .../protection` → HTTP 404) (ні правила, ні ruleset); бажана політика і процедура
   власника — `RELEASE_POLICY.md` §13.4 (OWNER ACTION REQUIRED).
 - Tools hashes (`TOOLS_INTEGRITY.json`) — TOFU, не еталонний release
   manifest; оновлюються самі при першому запуску на кожному сервері, а

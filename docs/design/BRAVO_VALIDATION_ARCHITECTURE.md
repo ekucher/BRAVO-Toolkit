@@ -97,7 +97,7 @@ C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json
 - тематичні скрипти у `selftest/`;
 - спеціалізовані test entrypoints, зокрема для configuration і data restore;
 - стандартна GitHub Actions validation: `.github/workflows/ci.yml` (Full на кожен PR без `paths:`) і `.github/workflows/config-parity.yml` (required check створюється завжди, рішення про релевантність приймається всередині job);
-- HOST-11 workflow для Full Self-Test acceptance;
+- HOST-11 workflow для Full Self-Test acceptance: файл `.github/workflows/host-11-selftest.yml` є на `developer`, але станом на 2026-11-16 не зареєстрований у GitHub Actions (відсутній у `GET /actions/workflows`; `GET .../workflows/host-11-selftest.yml` → 404), запусків немає; ACC-03 недоступний до реєстрації workflow (рішення власника);
 - вибірковий developer-прогін `-Suite` у `BRAVO_SELF_TEST.ps1` (не acceptance; друкує `SELF-TEST PARTIAL` замість `SELF-TEST PASSED`; невідоме ім'я suite завершується помилкою; Full лишається типовим режимом).
 
 Наявні guard-и CI: `Framework/CiWorkflowNeverNarrowsSelfTest` (ci.yml не звужує Self-Test) і `Governance/RequiredChecksListCoversCiWorkflowJobs` (pull_request-job-и ci.yml відповідають переліку required checks у `RELEASE_POLICY.md`).
@@ -687,6 +687,8 @@ Evidence має містити фактичну команду, exit code та k
 
 Full валідний лише якщо: exit 0, маркер `SELF-TEST PASSED`, 0 рядків `[НЕДОСТУПНО]`, 0 перерваних/пропущених секцій і всі required checks зелені на exact SHA: увесь канонічний перелік із `RELEASE_POLICY.md` §13.3 (`Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Secret scanning (gitleaks)`, `GitGuardian Security Checks`) плюс умовні перевірки, коли вони запускаються (наприклад `Config parity (BRAVO_CONFIG_LOADER)`). Перелік читається з канонічної політики, а не копіюється сюди як окреме джерело; відсутня чи не запущена required-перевірка інвалідує acceptance. Exit 0 і маркер недостатні: `[НЕДОСТУПНО]` не входить у failures, тож за обмежень хоста Self-Test друкує `SELF-TEST PASSED` з exit 0, але такий прогін не є повним прийманням. Наявність `[НЕДОСТУПНО]` на required checks інвалідує Full acceptance.
 
+**Це вимога ACC-01, яку код не enforce-ить:** крок «Запуск повного self-test» у `ci.yml` перевіряє лише `$LASTEXITCODE`, `ci.yml` не шукає маркер чи `[НЕДОСТУПНО]`, а `[НЕДОСТУПНО]` не потрапляє у failures `BRAVO_SELF_TEST.ps1`. Тому 0 рядків `[НЕДОСТУПНО]` і 0 перерваних/пропущених секцій перевіряє рецензент за логом до появи автоматичної перевірки.
+
 Оцінка: приблизно 0,5 робочого дня.
 
 ### ACC-02 — Незалежне рев'ю
@@ -789,7 +791,7 @@ VAL-08 -> VAL-09 -> VAL-10
 6. Test fixtures/state ізольовані від real BRAVO production state.
 7. Runtime integrity і pre-trust guard boundary не послаблюються.
 8. Post-Install Verify безпечний для production, відокремлений від Self-Test репозиторію й виконує перевірки під ідентичністю запланованих завдань.
-9. Evidence звітується лише для commands/checks, які фактично виконувалися; `[НЕДОСТУПНО]` на required checks інвалідує Full acceptance.
+9. Evidence звітується лише для commands/checks, які фактично виконувалися; `[НЕДОСТУПНО]` на required checks інвалідує Full acceptance (перевіряється вручну: CI цього не enforce-ить, див. ACC-01).
 10. Поведінкові/високоризикові зміни проходять свіже незалежне рев'ю перед acceptance; будь-яка зміна після ACC-01 повертає цикл до Targeted/Affected + Full на фінальному SHA.
 
 ## 16. Наступна дія

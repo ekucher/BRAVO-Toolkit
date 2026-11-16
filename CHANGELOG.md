@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Perf/docs: пришвидшення SELF_TEST OPT-01…12 (PR #534, злито в `developer` 2026-10-30) і виправлення застарілих чисел (#555).**
+  Додано baseline (OPT-01) та opt-in профіль секцій `BRAVO_SELFTEST_PROFILE=1` (OPT-02); окремі перевірки
+  пришвидшено без видалення тестових ID (OPT-03/06/07: parse-memo, AST-перевірки без scriptblock на вузол,
+  розбір Markdown; OPT-08: health- і maintenance-проби в одному child-процесі); OPT-11 — лише аналіз
+  паралелізму (`docs/engineering/selftest-performance/parallelism-inventory.md`). Результат OPT-12 за
+  `results.md`: медіана повного прогону −7,8 % (−81,8 с; 17:25,5 → 16:03,7; 3 пари на гілці
+  `perf/selftest-optimization`, база `1c45476c`, не вимір на поточному `developer`); ціль плану −20–30 % не
+  досягнута; вибірка мала, P95 не оцінювався. **Виправлення:** запис нижче про «961 з 2107 перевірок і 188.6 с
+  із 477.5 с» застарів; такі числа більше не фіксуються в `README.md`, коментарі `BRAVO_SELF_TEST.ps1` і
+  `parallelism-inventory.md` — актуальний вимір дає Timing summary (або профіль) на потрібному SHA. Також
+  уточнено документацію: умова приймання Full (0 `[НЕДОСТУПНО]`, 0 перерваних секцій) перевіряється вручну, CI
+  enforce-ить лише код завершення 0; Credential Manager `BRAVO_SELF_TEST_SECURESTRING` у корені self-test
+  реальний, а не заглушка; станом на 2026-11-16 workflow `host-11-selftest.yml` не зареєстрований у GitHub
+  Actions; live-стан branch protection перевірено 2026-11-16 (`master`: 6 required checks, `strict` і
+  `enforce_admins` увімкнено; `developer` не захищено); P1.5 у `ROADMAP.md` позначено частково виконаним.
+
 - **Feat: `BRAVO_TASKS_DIAGNOSE.ps1` показує, які завдання BRAVO досі передають `-ConfigPath` на legacy
   `BRAVO.config` (#281, доказ B5 для #154; лише читання).** Новий розділ
   `=== LEGACY -ConfigPath У ЗАВДАННЯХ BRAVO ===` обходить дерево Планувальника, читає XML завдань з
