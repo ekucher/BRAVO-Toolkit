@@ -3249,10 +3249,19 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
 
         # 1. Oracle comparison across sizes and algorithms.
         $fileHashOracleMismatch = ""
-        $fileHashOracleAlgorithms = $fileHashAlgorithms
+        # One FIPS-aware algorithm list, used by every algorithm loop below
+        # (MD5CryptoServiceProvider throws on FIPS-enforcing hosts).
+        $fileHashSelectAlgorithms = {
+            param([bool]$FipsOnly)
+            if ($FipsOnly) {
+                return @($fileHashAlgorithms | Where-Object { $_ -ne "MD5" })
+            }
+            return @($fileHashAlgorithms)
+        }
+        $fileHashFipsOnly = [bool][System.Security.Cryptography.CryptoConfig]::AllowOnlyFipsAlgorithms
+        $fileHashSupportedAlgorithms = @(& $fileHashSelectAlgorithms $fileHashFipsOnly)
         $fileHashOracleNote = ""
-        if ([System.Security.Cryptography.CryptoConfig]::AllowOnlyFipsAlgorithms) {
-            $fileHashOracleAlgorithms = @($fileHashAlgorithms | Where-Object { $_ -ne "MD5" })
+        if ($fileHashFipsOnly) {
             $fileHashOracleNote = " (MD5 skipped: FIPS-only host)"
         }
         try {
@@ -3263,7 +3272,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 $fileHashRandom.NextBytes($fileHashBytes)
                 $fileHashOraclePath = Join-Path $fileHashTestRoot ("oracle_{0}.bin" -f $fileHashSize)
                 [IO.File]::WriteAllBytes($fileHashOraclePath, $fileHashBytes)
-                foreach ($fileHashAlg in $fileHashOracleAlgorithms) {
+                foreach ($fileHashAlg in $fileHashSupportedAlgorithms) {
                     $fileHashOracleHasher = New-Object -TypeName ("System.Security.Cryptography.{0}CryptoServiceProvider" -f $fileHashAlg)
                     try {
                         $fileHashExpected = ([BitConverter]::ToString($fileHashOracleHasher.ComputeHash([IO.File]::ReadAllBytes($fileHashOraclePath)))).Replace("-", "")
@@ -3431,7 +3440,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
 
         # 9. Result shape.
         $fileHashShapeProblem = ""
-        foreach ($fileHashAlg in $fileHashAlgorithms) {
+        foreach ($fileHashAlg in $fileHashSupportedAlgorithms) {
             $fileHashShape = BRAVO.Compatibility\Get-BRAVOFileHash -Path $fileHashSharePath -Algorithm $fileHashAlg
             $fileHashShapeNames = @($fileHashShape.PSObject.Properties | ForEach-Object { $_.Name })
             foreach ($fileHashShapeProp in @("Algorithm", "Hash", "Path")) {
@@ -3455,7 +3464,31 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Test-BRAVOCondition `
             -Condition ($fileHashShapeProblem -eq "") `
             -Name "Compatibility/FileHashResultShape" `
-            -Failure "unexpected result shape: $fileHashShapeProblem"
+            -Failure "unexpected result shape: $fileHashShapeProblem$fileHashOracleNote"
+
+        # 9a. FIPS-aware algorithm selection (FIPS cannot be enabled on the test host).
+        $fileHashFipsSelected = @(& $fileHashSelectAlgorithms $true)
+        $fileHashNonFipsSelected = @(& $fileHashSelectAlgorithms $false)
+        Test-BRAVOCondition `
+            -Condition ((($fileHashFipsSelected -join ",") -ceq "SHA1,SHA256,SHA384,SHA512") -and (($fileHashNonFipsSelected -join ",") -ceq "MD5,SHA1,SHA256,SHA384,SHA512")) `
+            -Name "Compatibility/FileHashFipsAlgorithmSelection" `
+            -Failure "FIPS selection must drop only MD5 (fips=$($fileHashFipsSelected -join ',') non-fips=$($fileHashNonFipsSelected -join ','))"
+
+        # 9b. No algorithm loop may iterate the unfiltered list.
+        $fileHashFipsLoopProblem = ""
+        try {
+            $fileHashSelfText = [IO.File]::ReadAllText((Join-Path $root "BRAVO_SELF_TEST.ps1"))
+            $fileHashUnfilteredLoops = [regex]::Matches($fileHashSelfText, ('foreach\s*\(\s*\$\w+\s+in\s+' + '\$fileHash' + 'Algorithms\s*\)'))
+            if ($fileHashUnfilteredLoops.Count -gt 0) {
+                $fileHashFipsLoopProblem = "$($fileHashUnfilteredLoops.Count) unfiltered loop(s), first: $($fileHashUnfilteredLoops[0].Value)"
+            }
+        } catch {
+            $fileHashFipsLoopProblem = "exception: $($_.Exception.Message)"
+        }
+        Test-BRAVOCondition `
+            -Condition ($fileHashFipsLoopProblem -eq "") `
+            -Name "Compatibility/FileHashFipsFilterAppliedToAllLoops" `
+            -Failure "every Get-BRAVOFileHash algorithm loop must use the FIPS-filtered list: $fileHashFipsLoopProblem"
 
         # 11. Failures are terminating even with no outer try (separate runspace).
         $fileHashTermProblem = ""
