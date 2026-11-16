@@ -3406,7 +3406,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     & {
         $exclAccepted = @('*.tmp', 'desktop.ini', '~$*', '#recycle', '?eaDir', 'sub\*.bak', 'a/b/c.txt', 'Дані', 'звіт*.docx', 'SynologyDrive', '.SynologyWorkingDirectory')
         $exclRejected = @('', ' a', 'a ', 'C:\x', 'x:y', '\x', '/x', '..\x', 'a\..\b', 'a\.\b', 'a\', 'a/', 'a\\b', '-x!*', '-p123', '@list', '!x',
-            'a"b', "a'b", 'a`b', 'a%b%', 'a|b', 'a;b', 'a,b', 'a<b', 'a>b', 'a[b]', 'a=b', ("a" + [char]9 + "b"), ("a" + [char]0 + "b"), ('x' * 201))
+            'a"b', "a'b", 'a`b', 'a%b%', '*.*', 'report.*', 'sub\*.*', 'a|b', 'a;b', 'a,b', 'a<b', 'a>b', 'a[b]', 'a=b', ("a" + [char]9 + "b"), ("a" + [char]0 + "b"), ('x' * 201))
         $exclWrongAccepted = @($exclAccepted | Where-Object { $null -ne (Test-BRAVOExclusionPattern -Pattern $_) })
         $exclWrongRejected = @($exclRejected | Where-Object { $null -eq (Test-BRAVOExclusionPattern -Pattern $_) } | ForEach-Object { '[' + ($_ -replace '[\x00-\x1F]', '?') + ']' })
         $exclNonString = Test-BRAVOExclusionPattern -Pattern 123

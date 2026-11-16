@@ -1311,6 +1311,11 @@ function Test-BRAVOExclusionPattern {
         if ($segment.Length -eq 0) { return 'порожній сегмент шляху' }
         if ($segment -eq '..' -or $segment -eq '.') { return "сегмент '.' чи '..'" }
         if ($segment -ne $segment.Trim()) { return 'пробіл на краю сегмента' }
+        # '*.*' / 'name.*': WinSCP і 7-Zip трактують таку маску як «будь-який
+        # файл», зокрема без розширення, а -like — лише імена з крапкою. Щоб
+        # знімок BAZA і віддалене порівняння не розходилися (рев'ю бота PR #564),
+        # таку форму відхиляємо: пишіть '*' або 'name*'.
+        if ($segment.EndsWith('.*')) { return "сегмент на '.*' інструменти трактують по-різному — використайте '*' або 'ім''я*'" }
     }
     return $null
 }
