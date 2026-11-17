@@ -3,10 +3,16 @@
 Статус: **чернетка gap list, очікує затвердження власником.** До
 затвердження робота над #487 (VETOFFICE-COMPAT) не починається.
 
+**Обов'язкові пункти приймання #486 лишаються ВІДКРИТИМИ:**
+`BRAVO_SETUP.ps1 -ValidateOnly` на фікстурі, read-only перевірки на DEV-сервері
+Сайту A, перевірка ServiceCycle із залежною `Apache2.4` і затвердження gap list
+власником. #486 не завершено, доки власник не надасть результати чи середовище
+або явно не затвердить зміну обсягу приймання #486.
+
 Документ фіксує чинну поведінку комплекту на знеособлених
 characterization-фікстурах VetOffice. Runtime-код, служби, Scheduled Tasks і
 Credential Manager на цьому етапі не змінювались. Перевірки на реальних
-DEV-серверах не виконувались — це окремий крок (розділ «Що не перевірено»).
+DEV-серверах не виконувались — це відкритий пункт приймання #486 (розділи 5 і 8).
 
 Усі імена, шляхи, хости й адреси в документі та фікстурах вигадані.
 Реальні інсталяції далі називаються «Сайт A» (VetOffice на `D:`) і
@@ -40,7 +46,7 @@ DEV-серверах не виконувались — це окремий кр�
 
 | Файл | Призначення |
 | --- | --- |
-| `selftest/fixtures/vetoffice/scenarios.json` | сценарії «D:» і «C:», розклад каталогів, синтетичні служби `BRAVO` і `Apache2.4` (`DependsOn: BRAVO`), відсутній `exchangAPI`, legacy-архіви |
+| `selftest/fixtures/vetoffice/scenarios.json` | сценарії «D:» і «C:», розклад каталогів, синтетичні служби `BRAVO` і `Apache2.4` (`DependsOn: BRAVO` — лише вхідні метадані, у Discovery не передається), відсутній `exchangAPI`, legacy-архіви |
 | `selftest/fixtures/vetoffice/templates/bravo.ini.template` | знеособлений `bravo.ini` (`[model] MODEL`/`BLOG`, без `BEXCH`; `[Debug] FILE=TraceSRV.out`) |
 | `selftest/fixtures/vetoffice/templates/httpd.conf.template` | `ServerRoot`/`DocumentRoot` для Discovery BAZA_WWW |
 | `selftest/fixtures/vetoffice/trace/TraceSRV.sample.utf8.txt` | текст trace; harness кодує його в CP1251 під час матеріалізації |
@@ -114,10 +120,12 @@ DEV-серверах не виконувались — це окремий кр�
 - Очікування (#486/#487): ServiceCycle коректний для залежної `Apache2.4`.
 - Факт [C]: залежності служб (`DependentServices`/`ServicesDependedOn`) у
   runtime не використовуються: `git grep -i` за цими назвами не дає жодного
-  збігу в `.ps1`/`.psm1` комплекту (крім нового harness-а). Harness [F]
-  показує те саме:
-  результат Discovery не містить поля залежностей
-  (`DiscoveryExposesServiceDependencies = false`).
+  збігу в `.ps1`/`.psm1` комплекту (крім нового harness-а). Висновок G4 спирається лише на читання коду [C].
+  Harness несе фікстурну залежність (`Apache2.4` `DependsOn` `BRAVO`) тільки як
+  вхідні метадані (`FixtureServiceDependencies`, `ServiceDependenciesEvidence =
+  fixture-input-only`) і жодної перевірки залежностей не виконує: контракт
+  `-Services` у Discovery (`Name`/`DisplayName`/`State`/`StartMode`/`PathName`,
+  як у `Win32_Service`) поля залежностей не має.
 - Чинний порядок зупинки: BRAVO Web → exchangAPI → BRAVO
   (`modules/BRAVO.Maintenance/BRAVO.Maintenance.ServiceCycle.ps1:280-395`).
   BRAVO зупиняється через `Stop-Service -Force`
@@ -202,8 +210,11 @@ DEV-серверах не виконувались — це окремий кр�
 
 ### G10. Диск C: проти D:
 
-- Факт [F]: на фікстурах результати Discovery для «C:» і «D:» ідентичні з
-  точністю до кореня. Discovery від літери диска не залежить.
+- Факт [F]: обидва сценарії матеріалізовано на одному томі
+  (`AllScenariosOnSameVolume = true`, `DriveLetterCoverage = directory-name-only`).
+  `drive-C`/`drive-D` — лише імена каталогів, тому результати для різних
+  каталогів одного тому ідентичні з точністю до кореня. Поведінку на справжніх
+  томах C: і D: **не перевірено**.
 - Від диска залежать [C], але не перевірено: дефолт `BravoWebDirectory = C:\Br-a-vo.web`
   (G5), набір томів VSS, виключення дисків для вільного місця.
 
@@ -213,8 +224,14 @@ DEV-серверах не виконувались — це окремий кр�
 | --- | --- | --- |
 | Discovery на фікстурах (harness) | PASS (exit 0; 2 сценарії) | `characterization.json`, `characterization.console.txt` у каталозі доказів завдання |
 | `BRAVO_DRY_RUN.ps1`, ізольовано | виконано; 67 рядків: PASS 39, PLAN 19, WARN 7, FAIL 2 (VSS — середовище; BAZA_APP — G1) | `dryrun-result.json`, `dryrun-stubbed.console.txt` |
-| `BRAVO_SETUP.ps1 -ValidateOnly` | **NOT RUN** | причина нижче |
-| Реальні DEV-сервери | **NOT VERIFIED — очікує власника** | окреме завдання |
+| `BRAVO_SETUP.ps1 -ValidateOnly` | **NOT RUN** (обов'язковий пункт #486, відкритий) | причина нижче |
+| ServiceCycle із залежною `Apache2.4` | **NOT RUN** — потрібні справжні служби (G4) | розділ 8 |
+| Реальні DEV-сервери | **NOT VERIFIED — очікує власника** (обов'язковий пункт #486, відкритий) | розділ 8 |
+
+На цій dev-VM обліковий запис не може відкрити SCM (`Win32_Service`: доступ
+заборонено). Тому Discovery усередині SETUP завершився б fail closed, а
+дочірній DRY_RUN обірвався б на `Get-Service` (O2): результат SETUP на цій VM не
+характеризував би VetOffice.
 
 Ізоляція DRY_RUN (перевірено читанням коду перед запуском):
 
@@ -294,8 +311,13 @@ DEV-серверах не виконувались — це окремий кр�
 
 - Затвердити або скоригувати gap list (G1–G10, O1–O2).
 - Надати ТЗ v1.1 або підтвердити, що вимоги беруться з issue.
-- Доручити окреме завдання на read-only перевірки (`-ValidateOnly`,
-  DRY_RUN) на DEV-сервері Сайту A з правами, які дозволяють читати SCM, і
-  перевірку залежності `Apache2.4` на справжніх службах. Журнали — без
-  секретів і реальних ідентифікаторів у репозиторії.
+- Відкриті обов'язкові пункти приймання #486 (не перенесені):
+  1. `BRAVO_SETUP.ps1 -ValidateOnly` на фікстурі;
+  2. read-only перевірки (`-ValidateOnly`, DRY_RUN) на DEV-сервері Сайту A;
+  3. ServiceCycle із залежною `Apache2.4` на справжніх службах;
+  4. затвердження gap list власником.
+
+  Варіанти для власника: (а) надати середовище з правом читання SCM та/або
+  доступ до DEV-сервера; (б) явно затвердити звуження обсягу приймання #486.
+  Журнали — без секретів і реальних ідентифікаторів у репозиторії.
 - Заповнити невідомі дані розділу 6.
