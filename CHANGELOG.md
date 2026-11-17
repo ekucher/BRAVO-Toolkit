@@ -13,6 +13,30 @@
   Guard-и self-test не змінено. Зміну ще не перевірено прогоном workflow: `workflow_dispatch` потребує
   окремого дозволу власника, а на `developer` крок збирання падає з `PROVENANCE_STALE`, якщо HEAD не є
   комітом-штампом, тож повний конвеєр перевіряється лише на ref підготовки релізу.
+- **Feat: виявлення віртуальних файлів Windows Cloud Files у джерелах бекапу й класифікація збоїв 7-Zip (#560,
+  CF-01, фаза 1).** Клієнти синхронізації на Cloud Files API (Synology Drive, OneDrive, Google Drive, Dropbox) у
+  режимі On-demand лишають у джерелі віртуальні файли («лише онлайн»: `RECALL_ON_DATA_ACCESS` 0x400000 /
+  `RECALL_ON_OPEN` 0x40000). 7-Zip від SYSTEM із VSS-знімка не може прочитати їх без запущеного
+  клієнта й завершувався кодом 2 без зрозумілої причини. BRAVO_ARCHIV тепер до VSS і 7-Zip обходить джерело
+  MODEL/BLOG/BRAVOEXCH явно через .NET (вміст не читається, гідратація не запускається; віртуальний каталог, зокрема сам корінь джерела, не відкривається; заповнений каталог Cloud Files — reparse point без `RECALL_ON_*` — обходиться всередині зареєстрованого кореня синхронізації, junction/symlink — ні, зокрема всередині кореня, щоб посилання на предка не дало циклу; межа глибини — 256 рівнів). Віртуальний корінь джерела визначається за атрибутами ще до перевірки шляхів і SYSTEM read probe, які перелічували б його вміст. `OFFLINE` + reparse без `RECALL_ON_*` (HSM, storage tiering, dedup) віртуальним файлом не вважається. Нове site-налаштування
+  `backupConsistency.CloudPlaceholderPolicy` (`ALLOW_WITH_VALIDATOR`, `Fail` | `Warn`, дефолт `Fail`): `Fail` — компонент
+  не архівується (етап `CLOUDFILES`, причина `CloudPlaceholdersInSource`, кількість і перші 20 файлів у журналі,
+  рядок причини в консолі й «РЕЗУЛЬТАТ», `ReasonCode` у manifest generation, решта компонентів архівується —
+  generation INCOMPLETE); `Warn` — WARNING і архівація. Корінь синхронізації з
+  `HKLM\...\Explorer\SyncRootManager`, що перетинається з джерелом, — WARNING. Відомий stderr 7-Zip класифікується в код
+  причини з підказкою замість голого «код 2»: `CloudFilesProviderUnavailable` (`The cloud file provider is not running`),
+  `SourceAccessDenied`, `SourceFileLocked`, `SourcePathTooLong` (з російськими/українськими формами системних
+  текстів); код потрапляє в журнал, «РЕЗУЛЬТАТ», manifest і фінальну подію Operations (`componentReasons`, а також `details` кроку архівації). Health показує код причини поруч з етапом збою generation
+  (`BRAVOEXCH/CLOUDFILES (CloudPlaceholdersInSource)`) і попереджає про корінь On-demand у джерелі бекапу;
+  `BRAVO_TASKS_DIAGNOSE.ps1` має розділ `=== CLOUD FILES У ДЖЕРЕЛАХ БЕКАПУ ===` (лише читання). На Windows без Cloud Files
+  API (до Windows 10 1709, зокрема Windows 7 / Server 2016) перевірка пропускається з INFO. Нові функції — у
+  `BRAVO.Compatibility` (`Get-BRAVOCloudFilesSupport`, `Test-BRAVOCloudFilesPlaceholderAttributes`,
+  `Get-BRAVOCloudFilesSyncRoots`, `Get-BRAVOCloudFilesSourceState`, `Get-BRAVOSevenZipFailureReason`). Self-test:
+  `Archive/CloudFiles*`, `Archive/CloudPlaceholderPreflightPolicies`, `Archive/SevenZipStderrClassifiedToReasonCode`,
+  `Health/ManifestFailedStageShowsReasonCode`; контракт авторизації 284→285 листів (`ALLOW_WITH_VALIDATOR` 28→29);
+  guard `SevenZipClassifier/SingleCanonicalClassifierUsedByBothCallers` явно дозволяє другого власника літерала
+  «зайнятий файл» (класифікатор причин створення архіву). Поза обсягом (наступні фази): політика `Skip` зі списком
+  виключень, ті самі перевірки для SFTP BAZA, NAS/SMB і ротації журналів.
 - **Security: розкатка більше не розпаковує комплект у `C:\Temp` (#545, AUD-AG14-001, P0).**
   `deploy\Update-BRAVOServer.ps1` і `deploy\Install-BRAVOServer.ps1` створювали staging у
   `C:\Temp\BRAVO_UPDATE` / `C:\Temp\BRAVO_INSTALL` звичайним `New-Item`. Каталог `C:\Temp` може створити й
