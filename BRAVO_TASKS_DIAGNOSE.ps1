@@ -673,6 +673,43 @@ try {
         Write-Host "[WARN] LegacyConfigPath: перевірку не виконано: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
+    # #560: віртуальні файли Cloud Files (On-demand sync) у джерелах
+    # MODEL/BLOG/BRAVOEXCH. Лише читання (атрибути й реєстр, вміст файлів не
+    # відкривається, гідратація не запускається); код виходу не змінює.
+    Write-Host ""
+    Write-Host "=== CLOUD FILES У ДЖЕРЕЛАХ БЕКАПУ (#560, лише читання) ===" -ForegroundColor Cyan
+    try {
+        $cloudFilesSupport = Get-BRAVOCloudFilesSupport
+        if (-not $cloudFilesSupport.Supported) {
+            Write-Host "[INFO] CloudFiles: $($cloudFilesSupport.Reason)" -ForegroundColor Gray
+        } else {
+            $cloudSyncRoots = @(Get-BRAVOCloudFilesSyncRoots)
+            Write-Host "[INFO] CloudFiles: зареєстровано коренів синхронізації: $($cloudSyncRoots.Count)" -ForegroundColor Gray
+            $cloudPolicy = [string]$backupConsistency.CloudPlaceholderPolicy
+            foreach ($cloudDefinition in @($archiveDefinitions | Where-Object { [bool]$_.Enabled -and -not [string]::IsNullOrWhiteSpace([string]$_.Source) })) {
+                $cloudState = Get-BRAVOCloudFilesSourceState -Path ([string]$cloudDefinition.Source) -MaxListed 5 -SyncRoots $cloudSyncRoots
+                foreach ($cloudRoot in @($cloudState.SyncRootsInSource)) {
+                    Write-Host ("[WARN] CloudFiles: {0}: корінь синхронізації {1} ({2}, On-demand={3}) перетинається з джерелом {4}" -f
+                        $cloudDefinition.Type, $cloudRoot.Provider, $cloudRoot.Path, $cloudRoot.OnDemand, $cloudState.Path) -ForegroundColor Yellow
+                }
+                if ($cloudState.PlaceholderCount -gt 0) {
+                    Write-Host ("[WARN] CloudFiles: {0}: {1} віртуальних файлів у {2} (політика {3}); перші: {4}" -f
+                        $cloudDefinition.Type, $cloudState.PlaceholderCount, $cloudState.Path,
+                        $(if ([string]::IsNullOrWhiteSpace($cloudPolicy)) { 'Fail' } else { $cloudPolicy }),
+                        ((@($cloudState.Placeholders) -join '; ') + $(if ($cloudState.Truncated) { '; ...' } else { '' }))) -ForegroundColor Yellow
+                    Write-Host "       Без запущеного клієнта синхронізації 7-Zip від SYSTEM їх не прочитає. Вимкніть On-demand для каталогу або зробіть файли «завжди на цьому пристрої»." -ForegroundColor Yellow
+                } elseif (@($cloudState.SyncRootsInSource).Count -eq 0) {
+                    Write-Host ("[PASS] CloudFiles: {0}: віртуальних файлів і коренів синхронізації в джерелі немає" -f $cloudDefinition.Type) -ForegroundColor Green
+                }
+                if ($cloudState.InaccessibleCount -gt 0) {
+                    Write-Host ("[WARN] CloudFiles: {0}: не перевірено недоступних каталогів: {1}" -f $cloudDefinition.Type, $cloudState.InaccessibleCount) -ForegroundColor Yellow
+                }
+            }
+        }
+    } catch {
+        Write-Host "[WARN] CloudFiles: перевірку не виконано: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     if ($InspectOnly) {
         if ($registrationFailed) {
             Complete-BRAVOHelperLog -ExitCode 1
