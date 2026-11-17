@@ -268,6 +268,14 @@
     # BAZA_WWW_SFTP вмикайте свідомо (див. коментар у BRAVO.config):
     # 'componentSettings.Synchronization.BAZA_WWW_SFTP' = $true
     # 'componentSettings.Synchronization.BAZA_WWW_LOCAL' = $false
+    # Виключення (#561): лише імена або відносні шаблони з * і ?; без абсолютних
+    # шляхів, .., лапок, коми й префіксів - @ ! (для @eaDir пишіть ?eaDir).
+    # Порожній список (дефолт) не змінює аргументів 7-Zip і WinSCP.
+    # 'componentSettings.Archive.Exclusions.MODEL' = @('*.tmp', '~$*')
+    # 'componentSettings.Archive.Exclusions.BLOG' = @()
+    # 'componentSettings.Archive.Exclusions.BRAVOEXCH' = @('SynologyDrive', '.SynologyWorkingDirectory', '?eaDir', '#recycle', 'desktop.ini')
+    # 'componentSettings.Synchronization.Exclusions.BAZA_APP' = @()
+    # 'componentSettings.Synchronization.Exclusions.BAZA_WWW' = @()
     # 'componentSettings.SFTP.ArchiveUpload' = $true
     # Opt-in вивантаження ВЛАСНИХ операційних логів BRAVO наприкінці
     # прогону (PR #136, log-lifecycle P1). $false (типово) — нова вихідна

@@ -2,6 +2,27 @@
 
 ## Не випущено (developer)
 
+- **Feat: налаштовувані виключення файлів з архівації 7-Zip і SFTP-синхронізації BAZA (#561, EXCL-01).** Нові
+  site-налаштування (клас `ALLOW_WITH_VALIDATOR`, валідатор `ExclusionPatternList`, дефолт `@()` — поведінка не
+  змінюється): `componentSettings.Archive.Exclusions.MODEL` / `.BLOG` / `.BRAVOEXCH` і
+  `componentSettings.Synchronization.Exclusions.BAZA_APP` / `.BAZA_WWW`. Елемент — лише ім'я або відносний шаблон із `*`
+  і `?`; відхиляються абсолютні шляхи, `..`, порожні сегменти, кінцевий роздільник, керівні символи, пробіли на краях,
+  лапки й `` ` ``, `| ; , < > [ ] : = %`, префікси `-`, `@`, `!` (для `@eaDir` — `?eaDir`) і сегменти на `.*` (`*.*`,
+  `name.*`: WinSCP і 7-Zip трактують їх як «будь-який файл», зокрема без розширення — пишіть `*` або `name*`); повідомлення не повторює
+  значення. Ті самі правила повторно перевіряються в runtime (`Test-BRAVOExclusionPattern`) перед передачею в
+  інструмент — fail closed. 7-Zip отримує виключення лише через list-файл (`-scsUTF-8 "-xr@<файл>"`, UTF-8 без BOM,
+  поруч із тимчасовим архівом у `.work`, прибирається після 7-Zip): шаблон без роздільника — ім'я файла чи каталогу на
+  будь-якому рівні. Порожній список — рядок аргументів 7-Zip байт-у-байт попередній. Журнал показує застосовані
+  виключення й кількість збігів у джерелі (файли/каталоги). SFTP-синхронізація BAZA: legacy `synchronize` отримує
+  окремий токен `-filemask="|..."`, лише коли список непорожній (`sftpSynchronizationOptions` не змінюється);
+  `CompareDirectories` до/після й у Health — `TransferOptions.FileMask`; incremental-режим фільтрує виключене на рівні
+  знімка, плану й повного аудиту (не завантажується, не видаляється, не рахується «несинхронізованим» чи «новим після
+  cutoff»); перевірка сумісності імен і `RequireNonEmptyBAZASource` ігнорують виключене. Списки BAZA резолвить один
+  спільний `Get-BRAVOBazaSettingsEffective`. Нові функції: `Test-BRAVOExclusionPattern`
+  (`BRAVO.Configuration.Schema`), `Test-BRAVOExclusionMatch`, `Get-BRAVOExclusionMatchCount`,
+  `ConvertTo-BRAVOWinSCPExclusionMask` (`BRAVO.Compatibility`). Контракт авторизації 284→289 листів
+  (`ALLOW_WITH_VALIDATOR` 28→33). Self-test: `Authorization/ExclusionPattern*`, `Archive/Exclusion*`, `BazaSync/Exclusion*`.
+  Поза обсягом: `BRAVO_BAZA_RECONCILE.ps1` (звіт мутацій і реконсиляція) списків виключень не враховує.
 - **Feat: виявлення віртуальних файлів Windows Cloud Files у джерелах бекапу й класифікація збоїв 7-Zip (#560,
   CF-01, фаза 1).** Клієнти синхронізації на Cloud Files API (Synology Drive, OneDrive, Google Drive, Dropbox) у
   режимі On-demand лишають у джерелі віртуальні файли («лише онлайн»: `RECALL_ON_DATA_ACCESS` 0x400000 /

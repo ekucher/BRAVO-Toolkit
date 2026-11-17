@@ -11,6 +11,13 @@ Import-Module -Name $compatibilityManifest -ErrorAction Stop
 $loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\BRAVO.Logging.psd1'
 Import-Module -Name $loggingManifest -ErrorAction Stop
 
+# #561: Get-BRAVOBazaSettingsEffective повторно перевіряє шаблони виключень
+# (Test-BRAVOExclusionPattern зі схеми конфігурації) — fail closed, якщо
+# значення потрапило в рантайм повз валідатор завантаження конфігурації.
+# Схема — нижчий модуль без імпортів ArchiveRuntime, циклу немає.
+$configurationSchemaManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+Import-Module -Name $configurationSchemaManifest -ErrorAction Stop
+
 function Get-BRAVOBazaSyncModeEffective {
     # Одна canonical точка інтерпретації (safety-review ТЗ п.20: "не
     # дублювати business rules у Archive/Health/DryRun/Diagnose — один
@@ -144,6 +151,38 @@ function Get-BRAVOBazaSettingsEffective {
         )
     }
 
+    # #561: виключення SFTP-синхронізації BAZA окремо для BAZA_APP і BAZA_WWW
+    # (componentSettings.Synchronization.Exclusions.*). Читаємо через
+    # Get-Variable, а не $componentSettings напряму: під Set-StrictMode
+    # відсутня змінна (старий seed, тест) інакше кидала б виняток. Вузол
+    # може бути hashtable або pscustomobject. Невалідний шаблон — виняток
+    # (fail closed): до WinSCP він не дійде.
+    $exclusionsEffective = [pscustomobject]@{ BAZA_APP = @(); BAZA_WWW = @() }
+    $componentSettingsVariable = Get-Variable -Name 'componentSettings' -ErrorAction SilentlyContinue
+    foreach ($exclusionComponent in @('BAZA_APP', 'BAZA_WWW')) {
+        $exclusionNode = if ($null -ne $componentSettingsVariable) { $componentSettingsVariable.Value } else { $null }
+        foreach ($exclusionSegment in @('Synchronization', 'Exclusions', $exclusionComponent)) {
+            if ($null -eq $exclusionNode) { break }
+            if ($exclusionNode -is [System.Collections.IDictionary]) {
+                $exclusionNode = if ($exclusionNode.Contains($exclusionSegment)) { $exclusionNode[$exclusionSegment] } else { $null }
+            } else {
+                $exclusionProperty = $exclusionNode.PSObject.Properties[$exclusionSegment]
+                $exclusionNode = if ($null -ne $exclusionProperty) { $exclusionProperty.Value } else { $null }
+            }
+        }
+        $exclusionList = @(@($exclusionNode) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        foreach ($exclusionPattern in $exclusionList) {
+            $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+            if ($null -ne $exclusionProblem) {
+                throw (
+                    "componentSettings.Synchronization.Exclusions.$exclusionComponent містить недопустимий шаблон " +
+                    "'$exclusionPattern': $exclusionProblem. SFTP-синхронізація зупинена (fail closed), шаблон не передано до WinSCP."
+                )
+            }
+        }
+        $exclusionsEffective.$exclusionComponent = $exclusionList
+    }
+
     return [pscustomobject]@{
         Mode = $mode
         StateRoot = $stateRootEffective
@@ -153,6 +192,7 @@ function Get-BRAVOBazaSettingsEffective {
         SynchronizeBeforeHealth = $synchronizeBeforeHealthEffective
         FastHealthEnabled = $fastHealthEnabledEffective
         AutoArchiveMutationThreshold = $autoArchiveMutationThresholdEffective
+        Exclusions = $exclusionsEffective
     }
 }
 

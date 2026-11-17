@@ -238,12 +238,26 @@ function Get-BRAVODefaultConfiguration {
                 MODEL = $true
                 BLOG = $true
                 BRAVOEXCH = $true
+                # #561: виключення з архівації 7-Zip по компонентах — імена або
+                # відносні шаблони з * і ? (валідатор ExclusionPatternList).
+                # Порожній список — аргументи 7-Zip не змінюються.
+                Exclusions = @{
+                    MODEL = @()
+                    BLOG = @()
+                    BRAVOEXCH = @()
+                }
             }
             Synchronization = @{
                 BAZA_APP_LOCAL = $false
                 BAZA_APP_SFTP = $true
                 BAZA_WWW_SFTP = $false
                 BAZA_WWW_LOCAL = $false
+                # #561: виключення з SFTP-синхронізації BAZA (WinSCP). Порожній
+                # список — скрипт і опції WinSCP не змінюються.
+                Exclusions = @{
+                    BAZA_APP = @()
+                    BAZA_WWW = @()
+                }
             }
             SFTP = @{
                 Enabled = $true

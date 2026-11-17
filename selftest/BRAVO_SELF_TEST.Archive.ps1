@@ -1889,7 +1889,7 @@ function Get-SanitizedWinSCPDiagnostic { param($Text) return [string]$Text }
 function Show-RunningProgress { param($Id, $Activity, $Status, [switch]$Completed) }
 function Show-ScriptProgress { param($Status, $PercentComplete, [switch]$Completed) }
 function Format-BRAVORunningDetail { param($ElapsedSeconds) return '' }
-function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes) return [pscustomobject]@{ Success = $true; Issues = @() } }
+function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes, [string[]]$Exclusions = @()) return [pscustomobject]@{ Success = $true; Issues = @() } }
 function Write-BAZARemoteNameCompatibilityAudit { param($CompatibilityResult, $ComponentName) }
 function Get-BRAVOBazaSyncModeEffective { return 'Legacy' }
 function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return (Test-Path -LiteralPath $Path) }
@@ -1899,7 +1899,7 @@ function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositoryS
 # Фейк read-only CompareDirectories(Remote, removeFiles=$false): усе локальне,
 # чого немає в хмарі, — UploadNew; інший розмір — UploadUpdate.
 function Get-BAZASFTPComparison {
-    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null, [object[]]$PreAuditPending = @(), [switch]$SnapshotUnavailable)
+    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null, [object[]]$PreAuditPending = @(), [switch]$SnapshotUnavailable, [string[]]$Exclusions = @())
     $script:late501ComparisonCalls++
     $script:late501ComponentComparisons++
     if ($script:late501AfterAuditFails -and $script:late501ComparisonCalls -ge 2) {
@@ -2021,8 +2021,8 @@ function Complete-BRAVOProcessOutputCapture { param($Capture) return [pscustomob
 # Справжній знімок; дії стадії 'Snapshot' — об'єкти, що з'явилися/зникли вже
 # після обходу свого каталогу, але до старту WinSCP (неатомарний обхід).
 function Get-BRAVOBazaLocalSnapshot {
-    param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories)
-    $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories
+    param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories, [string[]]$Exclusions = @())
+    $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories -Exclusions $Exclusions
     Invoke-Late501Ops -Stage 'Snapshot'
     # Збій обходу (напр., об'єкт зник під час читання метаданих): та сама
     # форма результату, що й у catch production-функції.
@@ -2070,7 +2070,9 @@ $late501Module = New-BRAVOSelfTestRuntimeModule `
         'Add-BAZASnapshotConsistencyEvidence', 'Add-BAZASnapshotUnavailableEvidence', 'Test-BAZAPathHasReparsePoint', 'New-Late501FakeSession',
         'Get-BAZAPendingFileCycleClassification', 'Get-BAZASynchronizationOutcome', 'Sync-FolderToSFTP',
         'Invoke-BRAVOBazaCanonicalSync', 'New-BRAVOTransferOperationResult', 'Invoke-ManualBAZASFTPSynchronization',
-        'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader'
+        'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader',
+        # #561: Sync-FolderToSFTP і диспетчер читають виключення компонента й журналюють їх.
+        'Get-BAZAComponentExclusionsFromSettings', 'Write-BAZAExclusionsApplied', 'Test-BAZAPathExcludedByPatterns'
     )
 
 # Один прогін -SyncBAZA (або лише Sync-FolderToSFTP): повертає результат,
@@ -3495,6 +3497,110 @@ Test-BRAVOCondition -Condition (
     $vssDiskshadowFunctionText.Contains('^[\x20-\x7E]*$')
 ) -Name 'Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory' `
   -Failure 'New-BRAVOVSSDiskshadowSnapshotSet має брати каталог з Get-BRAVOVSSDiskshadowWorkDirectory (без прямого GetTempPath), перевіряти ASCII-чистоту сценарію і писати його ASCII-кодуванням'
+
+# ============================================================
+# #561 (EXCL-01): виключення з архівації 7-Zip по компонентах — list-файл
+# (-xr@<файл> -scsUTF-8) замість конкатенації шаблонів у командний рядок;
+# порожній список не змінює аргументів. Блок — у власній області.
+# ============================================================
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -Force -ErrorAction Stop
+    $exAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $exFunctionText = @(@('Get-BRAVOArchiveExclusionListPath', 'Get-BRAVOArchiveComponentExclusions', 'Write-BRAVOArchiveExclusionList') | ForEach-Object {
+        $exName = $_
+        @($exAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $exName }, $true)) |
+            ForEach-Object { $_.Extent.Text }
+    }) -join "`r`n"
+    $exSandbox = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_EXCL561_' + [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($exSandbox)
+        $exResults = & {
+            param([string]$FunctionText, [string]$Sandbox)
+            . ([scriptblock]::Create($FunctionText))
+            $out = [ordered]@{}
+            $listPath = Get-BRAVOArchiveExclusionListPath -TemporaryArchivePath (Join-Path $Sandbox 'a.1234.partial.mdz')
+            $out.ListPath = $listPath
+            Write-BRAVOArchiveExclusionList -Path $listPath -Patterns @('*.tmp', 'звіт*.tmp', '?eaDir')
+            $out.Bytes = [IO.File]::ReadAllBytes($listPath)
+            $out.Text = [IO.File]::ReadAllText($listPath, (New-Object System.Text.UTF8Encoding($false)))
+            $badPath = Join-Path $Sandbox 'bad.exclude.txt'
+            try { Write-BRAVOArchiveExclusionList -Path $badPath -Patterns @('*.tmp', '-xr!*'); $out.BadThrew = $false } catch { $out.BadThrew = $true; $out.BadMessage = $_.Exception.Message }
+            $out.BadWritten = [IO.File]::Exists($badPath)
+            $out.Hashtable = @(Get-BRAVOArchiveComponentExclusions -Component 'MODEL' -ComponentSettings @{ Archive = @{ MODEL = $true; Exclusions = @{ MODEL = @('*.tmp', 'desktop.ini'); BLOG = @() } } })
+            $out.MissingNode = @(Get-BRAVOArchiveComponentExclusions -Component 'MODEL' -ComponentSettings @{ Archive = @{ MODEL = $true } })
+            $strictObject = [pscustomobject]@{ Archive = [pscustomobject]@{ MODEL = $true } }
+            # @(& {...}): порожній вивід скриптблока інакше став би $null (а @($null).Count = 1).
+            $out.StrictObject = @(& { Set-StrictMode -Version Latest; Get-BRAVOArchiveComponentExclusions -Component 'BLOG' -ComponentSettings $strictObject })
+            $out.NullSettings = @(Get-BRAVOArchiveComponentExclusions -Component 'BLOG' -ComponentSettings $null)
+            return [pscustomobject]$out
+        } $exFunctionText $exSandbox
+        $exExpectedText = "*.tmp`r`nзвіт*.tmp`r`n?eaDir`r`n"
+        Test-BRAVOCondition -Condition (
+            $exResults.ListPath -like '*.partial.mdz.exclude.txt' -and
+            -not ($exResults.Bytes.Length -ge 3 -and $exResults.Bytes[0] -eq 0xEF) -and $exResults.Text -eq $exExpectedText -and
+            $exResults.BadThrew -and -not $exResults.BadWritten -and $exResults.BadMessage -notlike '*-xr!*'
+        ) -Name 'Archive/ExclusionListFileUtf8WithoutBomAndFailClosed' `
+          -Failure ("list-файл виключень: поруч із тимчасовим архівом (ім'я з .partial для зачистки), UTF-8 без BOM, один шаблон на рядок; недопустимий шаблон — виняток без запису файла й без повторення значення (#561). path=$($exResults.ListPath) threw=$($exResults.BadThrew) written=$($exResults.BadWritten)")
+        Test-BRAVOCondition -Condition (
+            ($exResults.Hashtable -join '|') -eq '*.tmp|desktop.ini' -and @($exResults.MissingNode).Count -eq 0 -and
+            @($exResults.StrictObject).Count -eq 0 -and @($exResults.NullSettings).Count -eq 0
+        ) -Name 'Archive/ExclusionComponentListReadSafely' `
+          -Failure ("componentSettings.Archive.Exclusions.<Компонент> читається з hashtable і pscustomobject; відсутній вузол чи \$null під StrictMode — порожній список, без винятку (#561). hashtable=[$($exResults.Hashtable -join '|')]")
+
+        # Справжній 7za комплекту: -xr@ виключає на будь-якому рівні, юнікод — UTF-8.
+        $exSevenZip = Join-Path $root 'Tools\7za.exe'
+        $exSource = Join-Path $exSandbox 'src'
+        foreach ($exDir in @('SynologyDrive\x', 'Дані', 'sub\#recycle', '@eaDir')) { [void][IO.Directory]::CreateDirectory((Join-Path $exSource $exDir)) }
+        foreach ($exFile in @('a.txt', 'b.tmp', 'desktop.ini', 'SynologyDrive\x\s.txt', 'Дані\звіт.tmp', 'Дані\звіт.docx', 'sub\#recycle\r.txt', 'sub\keep.txt', '@eaDir\e.txt')) {
+            [IO.File]::WriteAllText((Join-Path $exSource $exFile), 'x')
+        }
+        $exList = Join-Path $exSandbox 'list.exclude.txt'
+        [IO.File]::WriteAllText($exList, "*.tmp`r`ndesktop.ini`r`nSynologyDrive`r`n#recycle`r`n?eaDir`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        $exArchive = Join-Path $exSandbox 'out.7z'
+        $exEntries = @()
+        if ([IO.File]::Exists($exSevenZip)) {
+            $exProcess = Start-Process -FilePath $exSevenZip -ArgumentList @('a', '-t7z', "`"$exArchive`"", '-scsUTF-8', "`"-xr@$exList`"", "`"$exSource\*`"") -Wait -PassThru -WindowStyle Hidden
+            $exListing = Join-Path $exSandbox 'listing.txt'
+            $exListProcess = Start-Process -FilePath $exSevenZip -ArgumentList @('l', '-ba', '-slt', '-sccUTF-8', "`"$exArchive`"") -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $exListing
+            $exEntries = @([IO.File]::ReadAllLines($exListing, [Text.Encoding]::UTF8) | Where-Object { $_ -like 'Path = *' } | ForEach-Object { $_.Substring(7) })
+        }
+        $exExpected = @('a.txt', 'sub', 'sub\keep.txt', 'Дані', 'Дані\звіт.docx')
+        Test-BRAVOCondition -Condition (
+            [IO.File]::Exists($exSevenZip) -and $exProcess.ExitCode -eq 0 -and
+            ((@($exEntries | Sort-Object) -join '|') -eq (@($exExpected | Sort-Object) -join '|'))
+        ) -Name 'Archive/ExclusionListAppliedBySevenZipRecursivelyWithUnicode' `
+          -Failure ("7-Zip з -scsUTF-8 -xr@<list> має виключати шаблони на будь-якому рівні (файли й каталоги) і коректно читати юнікодні імена (#561). entries=[$($exEntries -join '|')]")
+
+        # Помічники BRAVO.Compatibility: підрахунок збігів для журналу й маска WinSCP.
+        $exCount = Get-BRAVOExclusionMatchCount -Path ($exSource + '\*') -Patterns @('*.tmp', 'desktop.ini', 'SynologyDrive', '#recycle', '?eaDir')
+        $exEmptyCount = Get-BRAVOExclusionMatchCount -Path $exSource -Patterns @()
+        $exMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.tmp', 'SynologyDrive', 'sub\*.bak')
+        $exEmptyMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @()
+        Test-BRAVOCondition -Condition (
+            $exCount.Files -eq 3 -and $exCount.Directories -eq 3 -and $exEmptyCount.Files -eq 0 -and $exEmptyCount.Directories -eq 0 -and
+            $exMask -eq '|*.tmp;*.tmp/;SynologyDrive;SynologyDrive/;*/sub/*.bak;*/sub/*.bak/' -and $null -eq $exEmptyMask -and
+            (Test-BRAVOExclusionMatch -RelativePath 'a\b\x.TMP' -Patterns @('*.tmp')) -and
+            (Test-BRAVOExclusionMatch -RelativePath 'deep\sub\y.bak' -Patterns @('sub\*.bak')) -and
+            -not (Test-BRAVOExclusionMatch -RelativePath 'keep.txt' -Patterns @('*.tmp'))
+        ) -Name 'Archive/ExclusionMatchCountAndWinSCPMask' `
+          -Failure ("підрахунок збігів (файли/каталоги, збіглий каталог цілком) і маска WinSCP ('|p;p/;...', шлях — '*/p'; порожньо — \$null) (#561). files=$($exCount.Files) dirs=$($exCount.Directories) mask='$exMask'")
+    } finally {
+        if (Test-Path -LiteralPath $exSandbox) { Remove-Item -LiteralPath $exSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Порожній список — аргументи 7-Zip байт-у-байт попередні; непорожній —
+    # лише шлях до list-файлу. Invoke-BRAVOComponentBackup прибирає list-файл,
+    # Main передає список компонента.
+    Test-BRAVOCondition -Condition (
+        $archiveScriptText.Contains('$arguments = "$effectiveArcParams -p `"$fullArchivePath`" `"$SourcePath`""') -and
+        $archiveScriptText.Contains('if (-not [string]::IsNullOrWhiteSpace($ExclusionListPath)) {') -and
+        $archiveScriptText.Contains('$arguments = "$effectiveArcParams -scsUTF-8 `"-xr@$ExclusionListPath`" -p `"$fullArchivePath`" `"$SourcePath`""') -and
+        $archiveScriptText.Contains('-ExclusionListPath $exclusionListPath') -and
+        $archiveScriptText.Contains('Remove-Item -LiteralPath $exclusionListPath -Force -ErrorAction SilentlyContinue') -and
+        $archiveScriptText.Contains('-Exclusions @(Get-BRAVOArchiveComponentExclusions -Component ([string]$archive.Type) -ComponentSettings $componentSettings)')
+    ) -Name 'Archive/ExclusionsReachSevenZipOnlyViaListFile' `
+      -Failure 'New-Archive: без виключень — попередній рядок аргументів; з виключеннями — лише -scsUTF-8 "-xr@<list>"; list-файл прибирається після 7-Zip; Main передає componentSettings.Archive.Exclusions.<Компонент> (#561)'
+}
 
 # ============================================================
 # #560 (CF-01): Windows Cloud Files (On-demand sync) у джерелах бекапу —

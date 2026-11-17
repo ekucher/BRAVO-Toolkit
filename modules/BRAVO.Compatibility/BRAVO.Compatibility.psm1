@@ -2765,6 +2765,92 @@ function Get-BRAVOTaskStateName {
     }
 }
 
+# --- Виключення з архівації й SFTP-синхронізації (#561) ---
+#
+# Шаблони вже перевірено валідатором ExclusionPatternList (лише ім'я або
+# відносний шаблон із * і ?). Семантика збігу та сама, що в 7-Zip -xr@:
+# шаблон без роздільника — ім'я файла чи каталогу на будь-якому рівні;
+# шаблон із роздільником — відносний шлях, що закінчується на будь-якому рівні.
+# Збіглий каталог виключається цілком (усередину не заходимо).
+
+function Test-BRAVOExclusionMatch {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [AllowEmptyCollection()][string[]]$Patterns
+    )
+    $normalized = $RelativePath.Replace('/', '\').Trim('\')
+    $name = @($normalized -split '\\')[-1]
+    foreach ($pattern in @($Patterns)) {
+        if ([string]::IsNullOrEmpty($pattern)) { continue }
+        $normalizedPattern = $pattern.Replace('/', '\')
+        if ($normalizedPattern.IndexOf('\') -lt 0) {
+            if ($name -like $normalizedPattern) { return $true }
+        } elseif ($normalized -like $normalizedPattern -or $normalized -like ('*\' + $normalizedPattern)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-BRAVOExclusionMatchCount {
+    # Скільки файлів і каталогів джерела підпадає під виключення — для журналу.
+    # Обхід через .NET, reparse-каталоги не проходяться; недоступний каталог
+    # не зупиняє підрахунок (рахується окремо).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowEmptyCollection()][string[]]$Patterns
+    )
+    $rootPath = $Path.TrimEnd('*').TrimEnd('\')
+    $result = [pscustomobject]@{ Files = 0; Directories = 0; Inaccessible = 0 }
+    if (@($Patterns).Count -eq 0 -or -not [System.IO.Directory]::Exists($rootPath)) { return $result }
+    $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+    $pending.Push((New-Object System.IO.DirectoryInfo($rootPath)))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            $entries = $directory.GetFileSystemInfos()
+        } catch {
+            $result.Inaccessible++
+            continue
+        }
+        foreach ($entry in $entries) {
+            $relative = $entry.FullName.Substring($rootPath.Length).TrimStart('\')
+            $isDirectory = (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
+            if (Test-BRAVOExclusionMatch -RelativePath $relative -Patterns $Patterns) {
+                if ($isDirectory) { $result.Directories++ } else { $result.Files++ }
+                continue
+            }
+            if ($isDirectory -and ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                $pending.Push([System.IO.DirectoryInfo]$entry)
+            }
+        }
+    }
+    return $result
+}
+
+function ConvertTo-BRAVOWinSCPExclusionMask {
+    # Маска виключень WinSCP для synchronize / CompareDirectories / PutFiles:
+    # '|' + умови через ';'. Для кожного шаблону — і файл ('p'), і каталог
+    # ('p/'); шаблон із роздільником — шлях на будь-якому рівні ('*/p').
+    # Порожній список — $null (маска не задається, поведінка не змінюється).
+    # Метасимволи масок (| ; , < > [ ] : =) і лапки валідатор уже відхилив.
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Patterns)
+    $conditions = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in @($Patterns)) {
+        if ([string]::IsNullOrEmpty($pattern)) { continue }
+        $maskPattern = $pattern.Replace('\', '/')
+        if ($maskPattern.IndexOf('/') -ge 0) { $maskPattern = '*/' + $maskPattern }
+        $conditions.Add($maskPattern)
+        $conditions.Add($maskPattern + '/')
+    }
+    if ($conditions.Count -eq 0) { return $null }
+    return ('|' + ($conditions.ToArray() -join ';'))
+}
+
 # --- Windows Cloud Files (On-demand sync) у джерелах бекапу (#560, фаза 1) ---
 #
 # Клієнти синхронізації на основі Cloud Files API (Synology Drive, OneDrive,

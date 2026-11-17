@@ -506,6 +506,10 @@ $knownIntentionalDiffPrefixes = @(
     # каталог призначення, обидва адитивні ключі; у BEFORE (42cf9ad) не існує.
     'componentSettings.SFTP.RuntimeLogSyncEnabled',
     'sftpDirectories.RuntimeLogs',
+    # #561 (виключення) — нові вкладені вузли зі списками-масивами (дефолт
+    # @(), поведінка не змінюється); у BEFORE (42cf9ad) не існує.
+    'componentSettings.Archive.Exclusions',
+    'componentSettings.Synchronization.Exclusions',
     # #560 (Cloud Files) — політика щодо віртуальних файлів On-demand sync
     # у джерелі MODEL/BLOG/BRAVOEXCH (Fail | Warn); адитивний ключ із
     # дефолтом Fail; у BEFORE (42cf9ad) не існує.
