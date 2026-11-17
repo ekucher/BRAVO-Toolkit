@@ -42,6 +42,17 @@
       overwrite попереднього valid generation.
 - [ ] Restore drill виконано з explicit `-GenerationId`; MODEL/BLOG/
       BRAVOEXCH взяті з одного `COMPLETE` manifest, а не independently newest.
+- [ ] Приймання T1–T5 (`RELEASE_POLICY.md` §9.5) виконано на **фінальному
+      zip з DRAFT Release після тега, до публікації**, на Windows Server 2022
+      + PS 5.1 і на окремому Windows 11 + PS 5.1 (повний T1–T5 на обох).
+      T2 — реальне оновлення шляхом лінії релізу (`deploy\Update-BRAVOServer.ps1`
+      для developer/5.3 — з винятком, поки відкриті P0 за MD-10; ручна
+      процедура runbook для master/5.2.x), а не лише `-PreflightOnly`. Кожен
+      статус, відмінний від `PASS`, закрито винятком (`RELEASE_POLICY.md`
+      §9.6). Інструмент цього не перевіряє — звірте вручну.
+- [ ] Evidence-документ `docs/BRAVO_<ver>_ACCEPTANCE_EVIDENCE_<date>.md`
+      (`RELEASE_POLICY.md` §9.7) закомічено, у ньому SHA-256 zip і `sourceCommit`; release
+      notes посилаються на нього.
 - [ ] Кожен новий self-test підтверджено регресійно: тимчасово зламати
       відповідну логіку, переконатися що самотест червоніє саме на новому
       тесті, відновити, переконатися що знову зелено. (Практика цієї
@@ -143,9 +154,11 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
   прикріплює їх до DRAFT Release лише після integrity-маніфестів,
   `BRAVO_RUNTIME_GUARD.ps1` і повного `BRAVO_SELF_TEST.ps1` (деталі —
   `BRAVO_SETUP.md`). Архів і маніфест не підписані (див. пункт вище).
-- Перевірка clean installation / update installation / rollback на
-  реальному сервері перед релізом — не формалізована як обов'язковий
-  крок; `BRAVO_SETUP.ps1 -ValidateOnly` і `BRAVO_DRY_RUN.ps1` дають
+- Перевірка update installation / rollback на реальному сервері перед
+  stable- і hotfix-релізом формалізована як ручний крок T2 у
+  `RELEASE_POLICY.md` §9.5 (розділ 1 цього чек-листа); інструмент її не
+  перевіряє. Clean installation як окремий обов'язковий крок не
+  формалізована; `BRAVO_SETUP.ps1 -ValidateOnly` і `BRAVO_DRY_RUN.ps1` дають
   часткову впевненість, але не замінюють реальний прогін.
 - Restore drill (`BRAVO_RESTORE_TEST.ps1`, аудит AUD-004/P0.4) — існує
   (розділ 6.1 README.md) і з 5.3.0 входить до типового набору завдань
