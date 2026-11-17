@@ -33,9 +33,9 @@ param(
 # тому SHA-256 файлів збігаються з RUNTIME_MANIFEST.json / TOOLS_MANIFEST.json.
 #
 # Скрипт сам перевіряє розпакований комплект (обидва integrity-манифести
-# та BRAVO_RUNTIME_GUARD.ps1) і залишає staging-каталог для подальшого
-# повного self-test (його запускає release-artifact workflow окремим кроком,
-# щоб падіння self-test було видно як окремий крок CI).
+# та BRAVO_RUNTIME_GUARD.ps1) і залишає staging-каталог для release-manifest
+# і ручного огляду; повний self-test workflow запускає на checkout того самого
+# коміта (OD-36), а не в staging (там немає .git).
 #
 # Повний self-test НЕ запускається тут навмисно: локальний виклик цього
 # скрипта має бути швидким способом зібрати той самий артефакт вручну.
@@ -317,5 +317,5 @@ Write-Host ("  Провенанс:     sourceCommit={0}; buildId={1}" -f $source
 Write-Host ("  Zip:           {0} ({1:N0} байт)" -f $zipPath, $zipItem.Length)
 Write-Host ("  SHA-256:       {0}" -f $zipHash)
 Write-Host ("  Manifest:      {0} (файлів: {1})" -f $manifestPath, $fileEntries.Count)
-Write-Host ("  Staging:       {0} (для повного self-test)" -f $stagingDir)
+Write-Host ("  Staging:       {0}" -f $stagingDir)
 exit 0

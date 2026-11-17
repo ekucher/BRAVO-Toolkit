@@ -141,7 +141,8 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
   на push тега `v*` збирає через `ci/New-BRAVOReleaseArtifact.ps1`
   `BRAVO-Toolkit-X.Y.Z.zip`, `.zip.sha256` і `release-manifest.json` та
   прикріплює їх до DRAFT Release лише після integrity-маніфестів,
-  `BRAVO_RUNTIME_GUARD.ps1` і повного `BRAVO_SELF_TEST.ps1` (деталі —
+  `BRAVO_RUNTIME_GUARD.ps1` і повного `BRAVO_SELF_TEST.ps1` (self-test — на
+  checkout того самого коміта, OD-36) (деталі —
   `BRAVO_SETUP.md`). Архів і маніфест не підписані (див. пункт вище).
 - Перевірка clean installation / update installation / rollback на
   реальному сервері перед релізом — не формалізована як обов'язковий

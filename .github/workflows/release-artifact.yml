@@ -9,9 +9,19 @@ name: Release artifact
 #     BRAVO-Toolkit-X.Y.Z.zip.sha256
 #     release-manifest.json
 #
-# і прикріплює його до GitHub Release ЛИШЕ після того, як розпакований
-# комплект пройшов обидва integrity-манифести, BRAVO_RUNTIME_GUARD і
-# повний BRAVO_SELF_TEST. Якщо Release для тега ще не існує, створюється
+# і прикріплює його до GitHub Release ЛИШЕ після того, як:
+#   - повний BRAVO_SELF_TEST пройшов на checkout ТОГО САМОГО коміта;
+#   - розпакований комплект (staging) пройшов обидва integrity-манифести
+#     і BRAVO_RUNTIME_GUARD (ci\New-BRAVOReleaseArtifact.ps1);
+#   - коміт архіву (release-manifest.json archiveCommit) дорівнює коміту,
+#     на якому пройшов self-test.
+# Self-test НЕ запускається в staging (рішення OD-36, issue #556): staging -
+# розпакований git archive без .git, а guard-и
+# Framework/AffectedChangedPath.RealScenariosRunOnCi і
+# Framework/AffectedRunner.RealScenariosRunOnCi на GitHub Actions вимагають
+# .git у корені. Checkout того самого коміта має те саме дерево, що й zip
+# (git archive того ж коміта, без export-ignore), плюс .git.
+# Якщо Release для тега ще не існує, створюється
 # DRAFT — публікація Release лишається рішенням людини (RELEASE_POLICY.md:
 # acceptance-вердикт не є авторизацією публікації).
 #
@@ -44,7 +54,45 @@ jobs:
           # в репозиторії немає і звірку неможливо виконати.
           fetch-depth: 0
 
-      - name: Збирання артефакту (git archive + інтегріті-перевірки)
+      # OD-36: повний self-test на checkout (.git є), а не в staging.
+      # Крок стоїть ДО збирання: після нього в корені з'явився б
+      # artifacts\release\staging (повна копія комплекту), а частина
+      # проб self-test обходить корінь рекурсивно без виключення artifacts\.
+      # Виклик той самий, що в ci.yml (задача self-test): без -Suite.
+      - name: Повний self-test на checkout того самого коміта
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -notmatch '^[0-9a-f]{40}$') {
+              Write-Host "::error::cannot resolve checkout HEAD to a commit"
+              exit 1
+          }
+          $dirty = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0 -or $dirty.Count -gt 0) {
+              Write-Host "::error::checkout is not clean before self-test: $($dirty -join '; ')"
+              exit 1
+          }
+          if (Test-Path -LiteralPath 'artifacts') {
+              Write-Host "::error::artifacts already exists in the checkout before self-test"
+              exit 1
+          }
+          ("BRAVO_SELFTEST_HEAD={0}" -f $head) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          .\BRAVO_SELF_TEST.ps1 -NoPause
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::BRAVO_SELF_TEST.ps1 (checkout $head) exited with code $LASTEXITCODE"
+              exit 1
+          }
+
+      - name: Лог self-test (артефакт завжди)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-self-test-log
+          path: LOGS/HELPERS/BRAVO_SELF_TEST_*.log
+          if-no-files-found: ignore
+
+      - name: Збирання артефакту (git archive + integrity/guard на staging)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -60,20 +108,12 @@ jobs:
               .\ci\New-BRAVOReleaseArtifact.ps1 -Ref $env:GITHUB_SHA
           }
           if ($LASTEXITCODE -ne 0) { exit 1 }
-
-      - name: Повний self-test з розпакованого артефакту
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Push-Location artifacts\release\staging
-          try {
-              .\BRAVO_SELF_TEST.ps1 -NoPause
-              if ($LASTEXITCODE -ne 0) {
-                  Write-Host "::error::BRAVO_SELF_TEST.ps1 (artifact staging) exited with code $LASTEXITCODE"
-                  exit 1
-              }
-          } finally {
-              Pop-Location
+          # OD-36: the zip must be the archive of exactly the commit that passed
+          # the full self-test in the previous step.
+          $manifest = Get-Content -LiteralPath 'artifacts\release\release-manifest.json' -Raw -Encoding UTF8 | ConvertFrom-Json
+          if ([string]::IsNullOrWhiteSpace($env:BRAVO_SELFTEST_HEAD) -or [string]$manifest.archiveCommit -ne $env:BRAVO_SELFTEST_HEAD) {
+              Write-Host "::error::archiveCommit '$($manifest.archiveCommit)' is not the self-tested checkout '$($env:BRAVO_SELFTEST_HEAD)'"
+              exit 1
           }
 
       - name: Артефакти workflow (zip + sha256 + manifest)
@@ -136,8 +176,9 @@ jobs:
                   # --clobber: on any re-run the assets already exist under the
                   # same names and plain upload aborts. Replacing them is safe
                   # because this step is reached only after the artifact passed
-                  # both integrity manifests, BRAVO_RUNTIME_GUARD and the full
-                  # self-test.
+                  # both integrity manifests and BRAVO_RUNTIME_GUARD (staging)
+                  # and the full self-test passed on the checkout of the same
+                  # commit (OD-36).
                   gh release upload $tag --clobber @files
                   if ($LASTEXITCODE -ne 0) { exit 1 }
               } else {

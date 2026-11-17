@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **CI: `release-artifact.yml` запускає повний `BRAVO_SELF_TEST.ps1` на checkout того самого коміта, а не в
+  `artifacts\release\staging` (OD-36, #556).** Staging — розпакований `git archive` без `.git`, а guard-и
+  `Framework/AffectedChangedPath.RealScenariosRunOnCi` і `Framework/AffectedRunner.RealScenariosRunOnCi` на
+  GitHub Actions вимагають `.git`. Порядок: checkout, перевірки (HEAD — 40-символьний SHA, чисте дерево
+  разом з untracked, немає `artifacts`), повний self-test (виклик як у `ci.yml`), лог self-test (завжди),
+  збирання, звірка `archiveCommit` у `release-manifest.json` з комітом, що пройшов self-test (порожнє
+  значення — помилка), upload-artifact, attach (умова без змін). Integrity-маніфести,
+  `BRAVO_RUNTIME_GUARD.ps1`, `AGENT_FILES_IN_ARTIFACT` і cutover-гейти лишаються на staging у builder-і.
+  Guard-и self-test не змінено. Зміну ще не перевірено прогоном workflow: `workflow_dispatch` потребує
+  окремого дозволу власника, а на `developer` крок збирання падає з `PROVENANCE_STALE`, якщо HEAD не є
+  комітом-штампом, тож повний конвеєр перевіряється лише на ref підготовки релізу.
 - **Feat: виявлення віртуальних файлів Windows Cloud Files у джерелах бекапу й класифікація збоїв 7-Zip (#560,
   CF-01, фаза 1).** Клієнти синхронізації на Cloud Files API (Synology Drive, OneDrive, Google Drive, Dropbox) у
   режимі On-demand лишають у джерелі віртуальні файли («лише онлайн»: `RECALL_ON_DATA_ACCESS` 0x400000 /

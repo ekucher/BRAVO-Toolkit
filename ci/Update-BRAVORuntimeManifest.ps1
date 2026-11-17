@@ -47,7 +47,7 @@ $includedExtraFiles = @('VERSION.json', 'Tools\TOOLS_MANIFEST.json')
 # CI-checkout (де його немає) і зламав би "Integrity manifests are current".
 # artifacts — вихід ci\New-BRAVOReleaseArtifact.ps1 (git-ignored):
 # збірник НАВМИСНО лишає artifacts\release\staging (повну розпаковану
-# копію комплекту для self-test), і без виключення `-Apply` після
+# копію комплекту), і без виключення `-Apply` після
 # локальної збірки артефакту вносив у маніфест ~85 дублікатів
 # staging\*.ps1, яких немає на розгорнутому сервері -> RUNTIME_GUARD
 # блокував запуск з кодом 33 (двічі спіймано в циклі 5.2.0-rc).

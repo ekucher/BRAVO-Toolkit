@@ -458,6 +458,19 @@ squash-merge**: squash знищує ідентичність коміту, на 
 `sourceCommit` — це **батько** коміта-штампа, а тег вішається на штамп,
 тому при shallow-checkout потрібного коміта в репозиторії немає.
 
+Повний `BRAVO_SELF_TEST.ps1` у `release-artifact.yml` виконується на
+checkout того самого коміта, а не в розпакованому staging (рішення OD-36,
+#556): staging не має `.git`, а guard-и
+`Framework/AffectedChangedPath.RealScenariosRunOnCi` і
+`Framework/AffectedRunner.RealScenariosRunOnCi` на GitHub Actions його
+вимагають. Workflow звіряє `archiveCommit` з `release-manifest.json` з
+комітом, на якому пройшов self-test. На staging лишаються обидва
+integrity-маніфести, `BRAVO_RUNTIME_GUARD.ps1`, `AGENT_FILES_IN_ARTIFACT` і
+cutover-гейти. Крок збирання артефакту на ref, HEAD якого не є комітом-штампом
+(наприклад, `workflow_dispatch` на `developer`), падає з `PROVENANCE_STALE`
+(див. вище): повний конвеєр перевіряється лише на ref підготовки релізу з
+комітом-штампом. Ця зміна ще не перевірена прогоном workflow на GitHub.
+
 **Чому три копії правила `buildId == short(sourceCommit)` лишаються.**
 `deploy\BRAVO.Deploy.ReleaseGate.ps1` виконується на сервері установи, де
 немає ані репозиторію, ані `ci\`; self-test мусить лишатись git-незалежним
