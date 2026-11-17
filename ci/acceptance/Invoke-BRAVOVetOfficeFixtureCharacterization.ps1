@@ -108,9 +108,9 @@ function Get-VetOfficeRelativeName {
 $results = New-Object System.Collections.Generic.List[object]
 foreach ($scenario in @($scenarioDocument.scenarios)) {
     $scenarioRoot = Join-Path $runRoot ([string]$scenario.id)
-    # Літера диска моделюється каталогом drive-<X>: фікстура не пише на
-    # справжній диск C:/D:, а Discovery працює з абсолютними шляхами без
-    # прив'язки до літери.
+    # Літера диска моделюється лише назвою каталогу drive-<X>: фікстура не пише
+    # на справжній диск C:/D:. Обидва сценарії лежать на тому самому томі, що й
+    # -OutputRoot, тож прогін перевіряє різні каталоги, а не різні томи.
     $installationRoot = Join-Path $scenarioRoot ('drive-' + [string]$scenario.driveLetter + '\VetOffice')
     $systemRoot = Join-Path $scenarioRoot 'Windows'
     [void][IO.Directory]::CreateDirectory($installationRoot)
@@ -148,6 +148,10 @@ foreach ($scenario in @($scenarioDocument.scenarios)) {
     $httpdTemplate = [IO.File]::ReadAllText((Join-Path $FixtureRoot ([string]$scenario.httpdConfTemplate)), [Text.Encoding]::UTF8)
     [IO.File]::WriteAllText((Join-Path $installationRoot 'apache\conf\httpd.conf'), (ConvertTo-VetOfficeFixtureText -Text $httpdTemplate -InstallationRoot $installationRoot), $utf8NoBom)
 
+    # DependsOn навмисно не передається: контракт -Services (Win32_Service-подібні
+    # Name/DisplayName/State/StartMode/PathName) не має поля залежностей, а
+    # Discovery повертає вхідні об'єкти як є, тож перевірка була б тавтологічною.
+    # Висновок G4 спирається на читання коду [C], а не на цей прогін.
     $services = @($scenarioDocument.services | ForEach-Object {
             [pscustomobject]@{
                 Name = [string]$_.Name
@@ -194,6 +198,7 @@ foreach ($scenario in @($scenarioDocument.scenarios)) {
             Label = [string]$scenario.label
             LogicalRoot = [string]$scenario.logicalRoot
             MaterializedRoot = $installationRoot
+            MaterializedVolume = [IO.Path]::GetPathRoot($installationRoot)
             Discovery = [ordered]@{
                 BRAVO_ROOT = $(if ($discovery.BRAVO_ROOT) { Get-VetOfficeRelativeName -Path ([string]$discovery.BRAVO_ROOT) -Root $installationRoot } else { $null })
                 BravoRootIsInstallationRoot = ([string]$discovery.BRAVO_ROOT -ieq $installationRoot)
@@ -213,10 +218,13 @@ foreach ($scenario in @($scenarioDocument.scenarios)) {
                 LegacyArchivTrace = @($legacyTraceBacklog | ForEach-Object { [ordered]@{ ArchiveName = [string]$_.ArchiveName; Files = @($_.Files | ForEach-Object { [string]$_.Name }) } })
             }
             Cp1251Trace = $traceEvidence.ToArray()
-            ServiceDependencies = @($scenarioDocument.services | ForEach-Object { [ordered]@{ Name = [string]$_.Name; DependsOn = @($_.DependsOn) } })
-            DiscoveryExposesServiceDependencies = (@($discovery.Services | Where-Object { $_.PSObject.Properties.Name -contains 'DependsOn' -or $_.PSObject.Properties.Name -contains 'ServicesDependedOn' }).Count -gt 0)
+            FixtureServiceDependencies = @($scenarioDocument.services | ForEach-Object { [ordered]@{ Name = [string]$_.Name; DependsOn = @($_.DependsOn) } })
+            ServiceDependenciesEvidence = 'fixture-input-only: Discovery -Services contract (Win32_Service-like Name/DisplayName/State/StartMode/PathName) carries no dependency field; not an executable check of dependency handling'
         })
 }
+
+$distinctVolumes = @($results | ForEach-Object { ([string]$_.MaterializedVolume).ToUpperInvariant() } | Select-Object -Unique)
+$allOnSameVolume = ($distinctVolumes.Count -eq 1)
 
 $document = [ordered]@{
     Harness = 'Invoke-BRAVOVetOfficeFixtureCharacterization'
@@ -225,6 +233,8 @@ $document = [ordered]@{
     PowerShellVersion = $PSVersionTable.PSVersion.ToString()
     RuntimeRoot = $RuntimeRoot
     RunRoot = $runRoot
+    AllScenariosOnSameVolume = $allOnSameVolume
+    DriveLetterCoverage = $(if ($allOnSameVolume) { 'directory-name-only' } else { 'distinct-volumes' })
     Scenarios = $results.ToArray()
 }
 $resultPath = Join-Path $runRoot 'characterization.json'
@@ -238,5 +248,6 @@ foreach ($result in $results) {
     }
     Write-Output ("  BackupScope: " + (@($result.BackupScope.Keys | ForEach-Object { "$_=$($result.BackupScope[$_])" }) -join ', '))
 }
+Write-Output "AllScenariosOnSameVolume=$allOnSameVolume"
 Write-Output "Результат: $resultPath"
 exit 0
