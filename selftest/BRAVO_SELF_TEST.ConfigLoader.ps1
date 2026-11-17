@@ -2343,7 +2343,10 @@ try {
         # #364: runtime-синхронізація логів через SFTP — тумблер і каталог
         # призначення, обидва нові канонічні листи після заморожування фікстури.
         'componentSettings.SFTP.RuntimeLogSyncEnabled',
-        'sftpDirectories.RuntimeLogs'
+        'sftpDirectories.RuntimeLogs',
+        # #560: політика щодо віртуальних файлів Cloud Files у джерелі
+        # бекапу — новий канонічний лист після заморожування фікстури.
+        'backupConsistency.CloudPlaceholderPolicy'
     )
     $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
     $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {
