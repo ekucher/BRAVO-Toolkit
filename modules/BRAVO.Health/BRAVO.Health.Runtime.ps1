@@ -1577,6 +1577,12 @@ function Get-BRAVOHealthManifestFailedStage {
         # пріоритет; прапорці CreateSuccess/… — лише fallback для старіших manifest.
         $errorStageProperty = $component.Value.PSObject.Properties['ErrorStage']
         if ($null -ne $errorStageProperty -and -not [string]::IsNullOrWhiteSpace([string]$errorStageProperty.Value)) {
+            # #560: класифікований код причини (CloudPlaceholdersInSource,
+            # CloudFilesProviderUnavailable, ...) — поруч з етапом.
+            $reasonCodeProperty = $component.Value.PSObject.Properties['ReasonCode']
+            if ($null -ne $reasonCodeProperty -and -not [string]::IsNullOrWhiteSpace([string]$reasonCodeProperty.Value)) {
+                return "$($component.Name)/$([string]$errorStageProperty.Value) ($([string]$reasonCodeProperty.Value))"
+            }
             return "$($component.Name)/$([string]$errorStageProperty.Value)"
         }
         $stageNames = @{ CreateSuccess = 'archive'; IntegritySuccess = 'integrity'; HashSuccess = 'SHA512' }
@@ -6308,6 +6314,52 @@ if ($script:BRAVOHealthRestoreVerifyStepEnabled) {
         -Details (Get-BRAVOHealthStepDetails -IssueCount $restoreVerifyHealthIssues.Count)
 } else {
     Write-HealthLog "Перевірку відновлюваності пропущено: schedulerSettings.RestoreVerify.Enabled = `$false"
+}
+
+function Write-BRAVOHealthCloudFilesWarnings {
+    # #560: корінь синхронізації Cloud Files (On-demand sync), що перетинається
+    # з джерелом MODEL/BLOG/BRAVOEXCH, — попередження оператору (не змінює
+    # код виходу): віртуальні файли в ньому зупинять або зламають нічну
+    # архівацію. Дешева перевірка за реєстром, без обходу файлів; самі
+    # віртуальні файли й незапущений провайдер Health бачить у manifest
+    # generation (ReasonCode). Повертає кількість попереджень.
+    param(
+        [object[]]$ArchiveDefinitions,
+        [Version]$OSVersion,
+        [string]$SyncRootRegistryPath
+    )
+    $support = if ($null -ne $OSVersion) { Get-BRAVOCloudFilesSupport -OSVersion $OSVersion } else { Get-BRAVOCloudFilesSupport }
+    if (-not $support.Supported) {
+        Write-HealthLog ("Cloud Files: {0}" -f $support.Reason)
+        return 0
+    }
+    $syncRoots = @($(if ([string]::IsNullOrWhiteSpace($SyncRootRegistryPath)) {
+        Get-BRAVOCloudFilesSyncRoots
+    } else {
+        Get-BRAVOCloudFilesSyncRoots -RegistryPath $SyncRootRegistryPath
+    }))
+    $warnings = 0
+    foreach ($definition in @($ArchiveDefinitions)) {
+        $source = ([string]$definition.Source).TrimEnd('*').TrimEnd('\')
+        if ([string]::IsNullOrWhiteSpace($source)) { continue }
+        foreach ($root in @($syncRoots | Where-Object { $_.OnDemand })) {
+            $rootPath = ([string]$root.Path).TrimEnd('\') + '\'
+            $sourcePath = $source + '\'
+            if ($rootPath.StartsWith($sourcePath, [StringComparison]::OrdinalIgnoreCase) -or
+                $sourcePath.StartsWith($rootPath, [StringComparison]::OrdinalIgnoreCase)) {
+                $warnings++
+                Write-HealthLog ("Cloud Files: у джерелі бекапу {0} ({1}) є корінь синхронізації On-demand {2} ({3}). Віртуальні файли в ньому зупинять архівацію (CloudPlaceholdersInSource) або дадуть 7-Zip код 2 без запущеного клієнта (CloudFilesProviderUnavailable). Вимкніть On-demand для каталогу або винесіть його з джерела." -f
+                    [string]$definition.Type, $source, [string]$root.Provider, [string]$root.Path) -Level WARNING -Environmental
+            }
+        }
+    }
+    return $warnings
+}
+
+try {
+    [void](Write-BRAVOHealthCloudFilesWarnings -ArchiveDefinitions @(Get-BRAVOHealthExpectedArchiveDefinitions))
+} catch {
+    Write-HealthLog ("Cloud Files: перевірку коренів синхронізації не виконано: {0}" -f $_.Exception.Message) -Level WARNING -Environmental
 }
 
 # dev.16 (review round 3): BAZA_APP і BAZA_WWW локальна копія — незалежні

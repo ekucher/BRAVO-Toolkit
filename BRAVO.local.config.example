@@ -340,6 +340,9 @@
     # =========================================================
     # 'backupConsistency.Mode' = 'VSS'               # VSS | Direct
     # 'backupConsistency.SnapshotContext' = 'ClientAccessible'
+    # Віртуальні файли Cloud Files (On-demand sync) у джерелі MODEL/BLOG/BRAVOEXCH (#560):
+    # Fail — 7-Zip не запускається для компонента; Warn — попередження й архівація.
+    # 'backupConsistency.CloudPlaceholderPolicy' = 'Fail'   # Fail | Warn
 
     # =========================================================
     # SFTP (скаляри) — фаза 1

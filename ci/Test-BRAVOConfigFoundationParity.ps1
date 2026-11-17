@@ -510,6 +510,10 @@ $knownIntentionalDiffPrefixes = @(
     # @(), поведінка не змінюється); у BEFORE (42cf9ad) не існує.
     'componentSettings.Archive.Exclusions',
     'componentSettings.Synchronization.Exclusions',
+    # #560 (Cloud Files) — політика щодо віртуальних файлів On-demand sync
+    # у джерелі MODEL/BLOG/BRAVOEXCH (Fail | Warn); адитивний ключ із
+    # дефолтом Fail; у BEFORE (42cf9ad) не існує.
+    'backupConsistency.CloudPlaceholderPolicy',
     # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
     # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
     # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy

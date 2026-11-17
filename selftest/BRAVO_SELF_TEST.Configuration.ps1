@@ -1684,7 +1684,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
         -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
         -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
 
-    # --- Authorization/Exactly289CanonicalLeaves ---
+    # --- Authorization/Exactly290CanonicalLeaves ---
     # 278 -> 282 (#316, закриття клієнтів BIS перед реставрацією):
     # maintenanceSettings.Restore.ClientClose.{WaitMinutes,ReminderMinutes,
     # PollSeconds,ProcessNames} — чотири нові канонічні листи, усі
@@ -1698,10 +1698,13 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # два нові канонічні листи з ЯВНИМИ записами у реєстрі; жоден наявний
     # лист класу не змінив (дельта класів нижче — рівно +2 ALLOW_SITE).
     #
-    # 284 -> 289 (#561, виключення): componentSettings.Archive.Exclusions.
+    # 284 -> 290: #561 (виключення) — componentSettings.Archive.Exclusions.
     # MODEL/BLOG/BRAVOEXCH і componentSettings.Synchronization.Exclusions.
-    # BAZA_APP/BAZA_WWW — п'ять нових листів (масиви рядків, дефолт @()) з
-    # явними записами ALLOW_WITH_VALIDATOR / ExclusionPatternList.
+    # BAZA_APP/BAZA_WWW, п'ять нових листів (масиви рядків, дефолт @()) з
+    # явними записами ALLOW_WITH_VALIDATOR / ExclusionPatternList; #560
+    # (Cloud Files) — backupConsistency.CloudPlaceholderPolicy (Fail | Warn,
+    # ALLOW_WITH_VALIDATOR Enum:Fail,Warn), один лист. Разом +6
+    # ALLOW_WITH_VALIDATOR.
     #
     # 277 -> 278: maintenanceSettings.Restore.IntegritySmallFileThresholdBytes
     # (поріг «малого» файлу самоперевірки реставрації, ALLOW_SITE) — один
@@ -1721,9 +1724,9 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # Жоден НАЯВНИЙ лист не змінив класу — саме тому дельта класів нижче
     # рівно +3 ALLOW_SITE і +3 ALLOW_WITH_VALIDATOR, а не перерозподіл.
     Test-BRAVOCondition `
-        -Condition ($authLeaves.Count -eq 289) `
-        -Name "Authorization/Exactly289CanonicalLeaves" `
-        -Failure "контракт фіксує рівно 289 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes + 4 #316 ClientClose + 2 #364 LogSync + 5 #561 Exclusions); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+        -Condition ($authLeaves.Count -eq 290) `
+        -Name "Authorization/Exactly290CanonicalLeaves" `
+        -Failure "контракт фіксує рівно 290 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0 + 1 Restore.IntegritySmallFileThresholdBytes + 4 #316 ClientClose + 2 #364 LogSync + 5 #561 Exclusions + 1 #560 CloudPlaceholderPolicy); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
 
     # --- Authorization/AllClassesRecognized ---
     $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
@@ -1771,17 +1774,19 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     # #316 (ClientClose): +4 ALLOW_SITE (206->210). TOTAL 278->282.
     # #364 (LogSync): +2 ALLOW_SITE (210->212) — componentSettings.SFTP.
     # RuntimeLogSyncEnabled і sftpDirectories.RuntimeLogs. TOTAL 282->284.
-    # #561 (виключення): +5 ALLOW_WITH_VALIDATOR (28->33) — списки
-    # componentSettings.Archive/Synchronization.Exclusions.*. TOTAL 284->289.
+    # #561 (виключення): +5 ALLOW_WITH_VALIDATOR — списки
+    # componentSettings.Archive/Synchronization.Exclusions.*; #560 (Cloud
+    # Files): +1 ALLOW_WITH_VALIDATOR — backupConsistency.CloudPlaceholderPolicy.
+    # Разом 28->34, TOTAL 284->290.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 212 -and $authAllowValidatorCount -eq 33 -and
+            $authAllowSiteCount -eq 212 -and $authAllowValidatorCount -eq 34 -and
             $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW, #316 ClientClose і #364 LogSync): ALLOW_SITE=$authAllowSiteCount(212) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(33) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW, #316 ClientClose і #364 LogSync): ALLOW_SITE=$authAllowSiteCount(212) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(34) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,

@@ -173,6 +173,7 @@
         # ===== Storage / VSS-консистентність — фаза 1 =====
         @{ Path = 'backupConsistency.Mode'; Group = 'Storage'; Section = 'Consistency'; Label = 'Режим консистентності'; Description = 'VSS | Direct.'; Type = 'Enum'; AllowedValues = @('VSS', 'Direct'); Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
         @{ Path = 'backupConsistency.SnapshotContext'; Group = 'Storage'; Section = 'Consistency'; Label = 'VSS SnapshotContext'; Description = ''; Type = 'String'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
+        @{ Path = 'backupConsistency.CloudPlaceholderPolicy'; Group = 'Storage'; Section = 'Consistency'; Label = 'Віртуальні файли Cloud Files'; Description = 'Fail — не архівувати компонент із віртуальними файлами On-demand sync; Warn — попередити й архівувати.'; Type = 'Enum'; AllowedValues = @('Fail', 'Warn'); Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 30 }
 
         # ===== Storage / SFTP (скаляри) — фаза 1 =====
         @{ Path = 'sftpHostTemplate'; Group = 'Storage'; Section = 'SFTP'; Label = 'Шаблон хоста SFTP'; Description = '{0} = логін зі сховища credentials.'; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
