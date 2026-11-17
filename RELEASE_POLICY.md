@@ -973,7 +973,8 @@ production-реліз може повторно повернути вже вип
 ### 13.3. Перелік required checks
 
 Канонічний перелік імен, які мусять бути налаштовані як required для
-`master` і `developer`:
+`master` і `developer` (бажана політика; перевірений live-стан і дата
+перевірки — нижче в цьому розділі та в §13.4):
 
 - `Parser / BOM / JSON`
 - `PSScriptAnalyzer`
@@ -1009,20 +1010,20 @@ branch protection зіставляє required checks за ІМЕНЕМ, і пі�
 заново. Запис «застосовано» з'являється тут лише після live-перевірки
 через GitHub API або UI — з датою й методом.
 
-Перевірений live-стан (перевірено через GitHub REST API 2026-10-01,
-`developer` = `610e93f`, `master` = `f8fa5aa`; мусить бути перечитано
+Перевірений live-стан (перевірено через GitHub REST API 2026-11-16,
+`developer` = `3d441d4e`, `master` = `27fd69c6`; мусить бути перечитано
 перед рішенням):
 
 | Налаштування | `master` | `developer` |
 | --- | --- | --- |
-| protection (`GET /branches/{b}` → `protected`) | **так** | **ні** (`protected: false`, `enforcement_level: off`) |
+| protection (`GET /branches/{b}` → `protected`) | **так** | **ні** (`protected: false`; `GET /branches/developer/protection` → HTTP 404) |
 | rulesets гілки (`GET /rules/branches/{b}`) | немає (`[]`) | немає (`[]`) |
 | required status checks | 6, перелік нижче | немає (`contexts: []`) |
 | `Config parity (BRAVO_CONFIG_LOADER)` серед required | ні | ні |
-| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | **не перевірено**: `GET /branches/master/protection` → HTTP 403 (токен перевірки не має `administration=read`) | відсутні — protection немає |
+| `strict`, `enforce_admins`, вимога PR, заборона force push і видалення | `strict: true`, `enforce_admins: true`, вимога PR є (`required_approving_review_count: 0`), force push і видалення заборонені (`GET /branches/master/protection` → HTTP 200) | відсутні — protection немає |
 
 Required checks `master` за live-відповіддю
-(`protection.required_status_checks`, `enforcement_level: everyone`) —
+(`protection.required_status_checks`) —
 рівно шість, і вони збігаються з каноном вище: `Parser / BOM / JSON`,
 `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`, `Secret scanning (gitleaks)`,
 `GitGuardian Security Checks`, `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`.
@@ -1039,13 +1040,14 @@ push-прогони несуть суфікс ` (push)` і required checks не 
 ruleset (чи існував захист 2026-08-26 і був згодом знятий, з репозиторію
 встановити не можна — важливий поточний стан). Отже зараз
 **ніщо технічно не блокує merge у `developer` з червоним CI** — зелений
-CI там тримається лише дисципліною. Для `master` ті самі `strict` і
-`enforce_admins` цим токеном не перевірювані (HTTP 403), тож їх не
-записано ані як увімкнені, ані як вимкнені. Створення захисту
+CI там тримається лише дисципліною. Для `master` `strict` і
+`enforce_admins` 2026-10-01 не перевірялись (HTTP 403); перевірка
+2026-11-16 токеном із правом читання protection показала обидва
+увімкненими (таблиця вище). Створення захисту
 `developer` — дія власника, §13.4.
 
 > **`Config parity (BRAVO_CONFIG_LOADER)` ще НЕ required** — ні на
-> `master`, ні на `developer` (live 2026-09-30). Перевірку навмисно НЕ
+> `master`, ні на `developer` (live 2026-11-16). Перевірку навмисно НЕ
 > додано до канонічного переліку вище: перелік фіксує те, що **мусить
 > бути налаштоване вже зараз**, і запис про невімкнену перевірку
 > відтворив би рівно дефект #149. Передумову промоції виконано: check
@@ -1061,7 +1063,7 @@ CI там тримається лише дисципліною. Для `master` 
 > замінюється записом у live-стані з датою.
 
 > **`BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`** (issue #149): на `master`
-> required (live 2026-09-30); на `developer` не required, бо там немає
+> required (live 2026-11-16); на `developer` не required, бо там немає
 > protection узагалі. Задача виконується на кожному PR і має стабільне
 > ім'я (тригер `pull_request: {}` без умов, креденціал генерується в
 > самій задачі, тож зовнішніх секретів вона не потребує).
@@ -1075,17 +1077,18 @@ CI там тримається лише дисципліною. Для `master` 
 
 ### 13.4. OWNER ACTION REQUIRED: захист `developer`
 
-Статус: **не застосовано** (live 2026-09-30, §13.3). Токеном без
-дозволу Administration цього зробити не можна
-(`GET`/`PUT .../branches/{b}/protection` → HTTP 403), тож дію виконує
-власник — у GitHub UI або через `gh` під власним обліковим записом.
+Статус: **не застосовано** (live 2026-11-16, §13.3:
+`GET .../branches/developer/protection` → HTTP 404). Створення правила
+(`PUT .../branches/{b}/protection`) потребує права Administration: write,
+якого в токена перевірки немає (читання protection доступне), тож дію
+виконує власник — у GitHub UI або через `gh` під власним обліковим записом.
 
 Цільові налаштування `developer` (бажана політика):
 
 | Параметр | Значення | Підстава |
 | --- | --- | --- |
 | Вимога Pull Request | так, без обов'язкових схвалень (`required_approving_review_count: 0`) | §13.2 вимагає CI для PR; кількості схвалень ця політика не встановлює, а автор PR і власник репозиторію — один обліковий запис (GitHub не дозволяє схвалити власний PR). Інше число — окреме рішення власника |
-| Required checks | 6 канонічних (§13.3) + `Config parity (BRAVO_CONFIG_LOADER)` | §13.3, §14.4; передумову «check створюється на кожному PR» перевірено live |
+| Required checks | 6 канонічних (§13.3) + `Config parity (BRAVO_CONFIG_LOADER)` | Config parity входить лише в ЦІЛЬОВИЙ перелік `developer`; до канонічного переліку §13.3 (що вже мусить бути налаштоване) її переносять після застосування цього налаштування й live-перевірки, як сказано в примітці §13.3. §14.4; передумову «check створюється на кожному PR» перевірено live |
 | `strict` (гілка мусить бути актуальною) | `false` | §13.2 — на відміну від `master` (§13.1) |
 | `enforce_admins` | `true` | прецедент PR #61 (§13.3): обхід адміністратором не повинен бути можливим |
 | force push | заборонено | §13.2 |
@@ -1100,7 +1103,8 @@ CI там тримається лише дисципліною. Для `master` 
    лишити вимкненим.
 4. Увімкнути Require status checks to pass before merging;
    Require branches to be up to date before merging лишити
-   **вимкненим**; у пошуку додати рівно сім перевірок:
+   **вимкненим**; у пошуку додати рівно сім перевірок (шість канонічних
+   з §13.3 і `Config parity` як цільову, ще не канонічну):
    `Parser / BOM / JSON`, `PSScriptAnalyzer`, `BRAVO_SELF_TEST.ps1`,
    `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1`, `Secret scanning (gitleaks)`,
    `GitGuardian Security Checks`, `Config parity (BRAVO_CONFIG_LOADER)`

@@ -13,12 +13,17 @@ required CI не змінюється. Внутрішньопроцесна па
 ## 1. Підсумок
 
 Переважна більшість self-test ізольована: фікстури лежать у каталогах з
-`NewGuid()`, а служби, Планувальник, реєстр і Credential Manager замінено
-заглушками. Реальних machine-wide точок мало:
+`NewGuid()`, а служби, Планувальник і реєстр замінено заглушками. Credential Manager
+в інших місцях замінено заглушками (повністю не перевірялось), але не скрізь: inline-тіло кореня
+`BRAVO_SELF_TEST.ps1` виконує реальний цикл запис/читання/видалення target
+`BRAVO_SELF_TEST_SECURESTRING` (`BRAVO_SELF_TEST.ps1:11007-11058`, модуль
+`BRAVO.Credentials`, `CredWriteW`/`CredReadW`/`CredDeleteW`,
+`CRED_PERSIST_LOCAL_MACHINE`) без суфікса унікальності. Реальних machine-wide точок мало:
 
 | Ресурс | Де | Спільний між процесами? | Висновок |
 | --- | --- | --- | --- |
 | Credential Manager, фіксований target `BRAVO_PILOT_SELFTEST_F23_EXISTS` (`cmdkey /delete`, `/generic`, `/delete`) | `selftest/BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1:679-693` | так, фіксоване ім'я | лише один процес за раз; скрипт уже окремий CI job (`.github/workflows/config-v2-pilot-artifact.yml:51`) |
+| Credential Manager, фіксований target `BRAVO_SELF_TEST_SECURESTRING` (реальні `Set-/Get-/Remove-BRAVOCredential`) | `BRAVO_SELF_TEST.ps1:11007-11058` (inline-тіло кореня) | так, фіксоване ім'я, у межах одного облікового запису Windows (`CRED_PERSIST_LOCAL_MACHINE` зберігає запис між сеансами того самого користувача на цій машині, іншим користувачам він не видний) | кожен процес кореня під тим самим обліковим записом пише той самий target; паралельні процеси кореня під одним обліковим записом потребують унікалізації target або серіалізації (не вирішено; OPT-11 — лише аналіз) |
 | Named mutex `Global\BRAVOConfigV2Pilot-<sha256(InstallRoot)>` | `deploy/BRAVOConfigV2Pilot.Runtime.ps1:1252`; використання `ConfigV2PilotArtifact.ps1:907-925` | `Global\`, але ім'я залежить від шляху в GUID-каталозі | колізій між процесами немає |
 | Named mutex `Global\BRAVOOperationsEnrollmentClaim-<sha256(StatePath)>` | `modules/BRAVO.Operations/BRAVO.Operations.psm1:388`; тест `selftest/BRAVO_SELF_TEST.Operations.ps1:843-880` | `Global\`, ім'я від шляху в `$opsSelfTestRoot` | колізій немає, якщо `$opsSelfTestRoot` унікальний (унікальність не перевірено окремо) |
 | Журнал helper-а `<корінь репозиторію>\LOGS\HELPERS\<скрипт>_yyyyMMdd_HHmmss_fff_PID<PID>.log` | `BRAVO_SELF_TEST.ps1:164`, `modules/BRAVO.HelperLogging/BRAVO.HelperLogging.psm1:58` | каталог спільний у чекауті, імена файлів — ні | ім'я містить `$PID`, тож паралельні процеси не конфліктують за файл |
@@ -73,8 +78,8 @@ required CI не змінюється. Внутрішньопроцесна па
 ## 3. Висновок щодо розбиття на процеси
 
 Обмеження, яке зменшує користь: кожен вибірковий процес виконує inline-тіло
-кореня (за `README.md` — 961 із 2107 перевірок на момент написання, цифра
-застаріла), тож N паралельних процесів N разів платять за корінь, а виграш
+кореня (суттєва частка перевірок і часу; точне число тут не фіксується, бо
+застаріває, — актуальний вимір дає Timing summary на потрібному SHA), тож N паралельних процесів N разів платять за корінь, а виграш
 дають лише частки suite. Накладні витрати кореня треба виміряти до рішення.
 
 **Кандидати на окремі worker-процеси або CI-job-и** (machine-wide конфліктів

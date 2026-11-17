@@ -318,8 +318,10 @@ $script:environmentLimitations = New-Object System.Collections.ArrayList
 # bootstrap-і, або в тілі кореня до першого споживача. Інваріант стереже
 # Framework/SelectiveSuitesHaveNoCrossSuiteDependency.
 #
-# Тому економія часу обмежена зверху: корінь — це 961 з 2107 перевірок і
-# 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
+# Тому економія часу обмежена зверху: корінь — суттєва частка перевірок і
+# часу sum-of-suites (точні числа застарівають; актуальний вимір — Timing
+# summary чи профіль на потрібному SHA, docs/engineering/selftest-performance/).
+# Вибірковий прогін не може бути швидшим
 # за цю частину, і обіцяти більше було б неправдою.
 # Каталог suite, підказка "змінений шлях -> suite" і план Affected живуть в одному
 # файлі мапи (VAL-05, PR1); це єдиний власник. Файл входить до RUNTIME_MANIFEST,
