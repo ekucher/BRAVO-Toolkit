@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "description": "Знеособлені characterization-фікстури VetOffice (#486). Усі імена, шляхи й вміст вигадані. Плейсхолдер {{VETOFFICE_ROOT}} замінюється на матеріалізований корінь інсталяції в каталозі виводу harness-а.",
+  "scenarios": [
+    {
+      "id": "vetoffice-drive-d",
+      "label": "Сайт A: VetOffice на диску D:",
+      "logicalRoot": "D:\\VetOffice",
+      "driveLetter": "D",
+      "bravoIniTemplate": "templates\\bravo.ini.template",
+      "httpdConfTemplate": "templates\\httpd.conf.template"
+    },
+    {
+      "id": "vetoffice-drive-c",
+      "label": "Сайт B: VetOffice на диску C:",
+      "logicalRoot": "C:\\VetOffice",
+      "driveLetter": "C",
+      "bravoIniTemplate": "templates\\bravo.ini.template",
+      "httpdConfTemplate": "templates\\httpd.conf.template"
+    }
+  ],
+  "layout": {
+    "directories": [
+      "Model",
+      "BLOG",
+      "www\\BAZA",
+      "www\\PRINT",
+      "www\\log",
+      "apache\\bin",
+      "apache\\conf",
+      "apache\\logs",
+      "ARCHIV\\Trace\\2026-01-15",
+      "ARCHIV\\Trace\\2026-01-16"
+    ],
+    "stubFiles": [
+      { "path": "bravo.exe", "text": "fixture stub: not an executable" },
+      { "path": "Model\\VetOffice.md", "text": "fixture stub model project" },
+      { "path": "BLOG\\blog_000001.log", "text": "fixture stub blog entry" },
+      { "path": "www\\BAZA\\index.php", "text": "<?php // fixture stub ?>" },
+      { "path": "www\\PRINT\\print_job_0001.pdf", "text": "fixture stub print job" },
+      { "path": "www\\log\\app.log", "text": "fixture stub web application log" },
+      { "path": "apache\\bin\\httpd.exe", "text": "fixture stub: not an executable" },
+      { "path": "apache\\logs\\access.log", "text": "192.0.2.10 - - [15/Jan/2026:10:00:00 +0200] \"GET / HTTP/1.1\" 200 1" },
+      { "path": "apache\\logs\\error.log", "text": "[Thu Jan 15 10:00:00 2026] [notice] fixture stub" }
+    ],
+    "cp1251TraceFiles": [
+      { "path": "TraceSRV.out", "source": "trace\\TraceSRV.sample.utf8.txt" },
+      { "path": "TraceSRV_20260301_101500.out", "source": "trace\\TraceSRV.sample.utf8.txt" },
+      { "path": "ARCHIV\\Trace\\2026-01-15\\TraceSRV_000001.out", "source": "trace\\TraceSRV.sample.utf8.txt" },
+      { "path": "ARCHIV\\Trace\\2026-01-15\\TraceSRV_000002.out", "source": "trace\\TraceSRV.sample.utf8.txt" },
+      { "path": "ARCHIV\\Trace\\2026-01-16\\TraceSRV_000001.out", "source": "trace\\TraceSRV.sample.utf8.txt" }
+    ],
+    "legacyArchiveStubs": [
+      "ARCHIV\\vet_control_20260115_0300.mdz",
+      "ARCHIV\\vet_control_20260116_0300.mdz"
+    ]
+  },
+  "services": [
+    {
+      "Name": "BRAVO",
+      "DisplayName": "BRAVO Service",
+      "State": "Running",
+      "StartMode": "Auto",
+      "PathName": "\"{{VETOFFICE_ROOT}}\\bravo.exe\" -k runservice",
+      "DependsOn": []
+    },
+    {
+      "Name": "Apache2.4",
+      "DisplayName": "Apache2.4",
+      "State": "Running",
+      "StartMode": "Auto",
+      "PathName": "\"{{VETOFFICE_ROOT}}\\apache\\bin\\httpd.exe\" -k runservice",
+      "DependsOn": [ "BRAVO" ]
+    }
+  ],
+  "absentServices": [ "exchangAPI" ]
+}
