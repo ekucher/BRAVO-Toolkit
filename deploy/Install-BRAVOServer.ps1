@@ -3,7 +3,9 @@ param(
     [string]$RuntimeRoot = 'C:\Program Files\BRAVO-Toolkit',
     [string]$Tag = 'v5.2.4',
     [string]$ZipPath,
-    [string]$StagingRoot = 'C:\Temp\BRAVO_INSTALL',
+    # Застарілий (#545): staging завжди приватний каталог (New-BRAVOInstallPrivateDirectory),
+    # значення ігнорується з попередженням. Параметр лишено для сумісності команд.
+    [string]$StagingRoot,
     [switch]$SeedLocalConfig,
     # Профіль напрямків резервного копіювання для НОВОГО BRAVO.local.config
     # (лише разом із -SeedLocalConfig; наявний файл не змінюється). Явний
@@ -355,7 +357,7 @@ function Get-BRAVOInstallPrivateDirectoryBase {
     $systemRoot = $env:SystemRoot
     $privateBase = $(if ([string]::IsNullOrWhiteSpace($systemRoot)) { '' } else { Join-Path $systemRoot 'Temp' })
     if ([string]::IsNullOrEmpty($privateBase) -or -not (Test-Path -LiteralPath $privateBase -PathType Container)) {
-        throw ('Немає каталогу для приватної перевірки -BackupDestination: ' + $(if ([string]::IsNullOrEmpty($privateBase)) { '$env:SystemRoot не задано' } else { $privateBase }) +
+        throw ('Немає каталогу для приватного каталогу інсталятора (staging і перевірка -BackupDestination): ' + $(if ([string]::IsNullOrEmpty($privateBase)) { '$env:SystemRoot не задано' } else { $privateBase }) +
             '. Нічого не розгорнуто. Перевірте $env:SystemRoot\Temp на сервері й повторіть запуск.')
     }
     return $privateBase
@@ -420,7 +422,7 @@ function New-BRAVOInstallPrivateDirectory {
         if (@(Get-ChildItem -LiteralPath $Path -Force).Count -gt 0) { $problems += 'каталог не порожній' }
         if ($problems.Count -gt 0) { throw ('DACL не той: ' + ($problems -join '; ') + '.') }
     } catch {
-        throw ('Приватний каталог перевірки -BackupDestination ' + $Path + ' не вдалося створити із захищеними правами ' +
+        throw ('Приватний каталог інсталятора (staging або перевірка -BackupDestination) ' + $Path + ' не вдалося створити із захищеними правами ' +
             '(без успадкування; лише BUILTIN\Administrators і NT AUTHORITY\SYSTEM): ' + $_.Exception.Message +
             ' Нічого не розгорнуто. Запустіть інсталятор у елевованій консолі адміністратора й повторіть запуск.')
     }
@@ -461,6 +463,15 @@ if (-not (Test-Path -LiteralPath $script:ReleaseGatePath -PathType Leaf)) {
         '). Це файл політики гейта релізу — скопіюйте весь каталог deploy\, а не один скрипт.')
 }
 . $script:ReleaseGatePath
+
+# Звірка staged-дерева з перевіреним архівом перед першим записом у каталог
+# інсталяції (#545) — спільна з Update-BRAVOServer.ps1. Fail-closed, як і гейт.
+$script:StagingHelperPath = Join-Path $PSScriptRoot 'BRAVO.Deploy.Staging.ps1'
+if (-not (Test-Path -LiteralPath $script:StagingHelperPath -PathType Leaf)) {
+    throw ('Поруч зі скриптом немає BRAVO.Deploy.Staging.ps1 (' + $script:StagingHelperPath +
+        '). Без нього staged-комплект нема чим звірити з архівом — скопіюйте весь каталог deploy\, а не один скрипт.')
+}
+. $script:StagingHelperPath
 
 # --- 0. Передумови ----------------------------------------------------------
 
@@ -601,14 +612,21 @@ if (-not $RuntimeRoot.StartsWith($programFiles, [StringComparison]::OrdinalIgnor
 
 Write-Step ('1. Артефакт ' + $Tag)
 
-if (-not (Test-Path -LiteralPath $StagingRoot)) {
-    [void](New-Item -ItemType Directory -Path $StagingRoot -Force)
+# Staging (#545, AUD-AG14-001): щоразу новий приватний каталог (лише
+# Administrators і SYSTEM, без успадкування) замість C:\Temp\BRAVO_INSTALL,
+# який може створити й контролювати звичайний користувач. Усе, що далі
+# розпаковується й копіюється в каталог інсталяції, лежить лише тут.
+if (-not [string]::IsNullOrWhiteSpace($StagingRoot)) {
+    Write-Warn2 ('-StagingRoot ' + $StagingRoot + ' ігнорується: staging завжди приватний каталог ' +
+        'у $env:SystemRoot\Temp із захищеними правами (#545).')
 }
-$downloadDir = Join-Path $StagingRoot 'download'
+$installStagingRoot = Join-Path (Get-BRAVOInstallPrivateDirectoryBase) ('BRAVO_INSTALL_' + [guid]::NewGuid().ToString('N'))
+New-BRAVOInstallPrivateDirectory -Path $installStagingRoot
+Write-Ok ('приватний staging: ' + $installStagingRoot)
+$downloadDir = Join-Path $installStagingRoot 'download'
 
 if ([string]::IsNullOrWhiteSpace($ZipPath)) {
-    if (Test-Path -LiteralPath $downloadDir) { Remove-Item -LiteralPath $downloadDir -Recurse -Force }
-    [void](New-Item -ItemType Directory -Path $downloadDir -Force)
+    [void](New-Item -ItemType Directory -Path $downloadDir)
     # TLS 1.2 не є дефолтом на Windows Server 2016.
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -635,12 +653,24 @@ if ([string]::IsNullOrWhiteSpace($ZipPath)) {
     Write-Note ('локальний архів: ' + $ZipPath)
 }
 
-$shaFile = $ZipPath + '.sha256'
+# Супутні файли релізу (.sha256, release-manifest.json) — поруч із вихідним
+# архівом; читаються один раз, у пам'ять.
+$sourceZipPath = $ZipPath
+$sourceZipDirectory = Split-Path -Parent $sourceZipPath
+$shaFile = $sourceZipPath + '.sha256'
 if (-not (Test-Path -LiteralPath $shaFile -PathType Leaf)) {
     throw ('Немає файлу контрольної суми: ' + $shaFile + ' — покладіть його поруч із архівом. ' +
         'Без нього походження комплекту не підтверджене, і розгортання не виконується.')
 }
 $expected = (((Get-Content -LiteralPath $shaFile -Raw).Trim()) -split '\s+')[0].ToLowerInvariant()
+
+# Архів оператора може лежати в каталозі, доступному іншим на запис. Тому SHA-256
+# рахується на копії в приватному staging, і розпаковується саме ця копія: між
+# перевіркою й розпакуванням підмінити байти нікому (#545).
+$ZipPath = Join-Path $installStagingRoot (Split-Path -Leaf $sourceZipPath)
+if (-not [string]::Equals($sourceZipPath, $ZipPath, [StringComparison]::OrdinalIgnoreCase)) {
+    Copy-Item -LiteralPath $sourceZipPath -Destination $ZipPath
+}
 $actual = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($expected -ne $actual) {
     throw ('SHA-256 не збігається. очікувано=' + $expected + ' фактично=' + $actual)
@@ -651,9 +681,8 @@ Write-Ok ('sha256 ' + $actual)
 # Expand-Archive і подальший запуск .ps1 можуть блокуватись.
 try { Unblock-File -LiteralPath $ZipPath -ErrorAction Stop } catch { }
 
-$staged = Join-Path $StagingRoot 'staged'
-if (Test-Path -LiteralPath $staged) { Remove-Item -LiteralPath $staged -Recurse -Force }
-Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged -Force
+$staged = Join-Path $installStagingRoot 'staged'
+Expand-Archive -LiteralPath $ZipPath -DestinationPath $staged
 
 $stagedVersionFile = Join-Path $staged 'VERSION.json'
 if (-not (Test-Path -LiteralPath $stagedVersionFile -PathType Leaf)) {
@@ -677,7 +706,7 @@ Write-Ok ('розпаковано: ' + $stagedVersion.packageVersion + ' / ' + $
 
 # Конвенція одна: release-manifest.json лежить поруч з архівом — і коли його
 # завантажив цей скрипт, і коли оператор приніс zip разом з ассетами релізу.
-$releaseManifestPath = Join-Path (Split-Path -Parent $ZipPath) 'release-manifest.json'
+$releaseManifestPath = Join-Path $sourceZipDirectory 'release-manifest.json'
 $releaseManifest = $null
 if (Test-Path -LiteralPath $releaseManifestPath -PathType Leaf) {
     try {
@@ -738,10 +767,10 @@ $implicitProfileUsesExample = $false
 $implicitProfilePreflight = ($SeedLocalConfig -and -not $PSBoundParameters.ContainsKey('BackupDestination') -and
     -not (Test-Path -LiteralPath $existingSiteConfig -PathType Leaf))
 if ($PSBoundParameters.ContainsKey('BackupDestination') -or $implicitProfilePreflight) {
-    # Код комплекту для цієї перевірки не імпортується з $StagingRoot: той
-    # каталог може бути створений заздалегідь і доступний на запис звичайному
-    # користувачеві, тож файл, підмінений між перевіркою цілісності й
-    # Import-Module, виконався б із піднятими правами (TOCTOU). Тому — свіжий
+    # Код комплекту для цієї перевірки не імпортується з каталогу staging. Від
+    # #545 staging теж приватний, але ця перевірка має власний ізольований корінь
+    # (#434): файл, підмінений між перевіркою цілісності й Import-Module,
+    # виконався б із піднятими правами (TOCTOU). Тому — свіжий
     # приватний каталог елевованого процесу ($env:SystemRoot\Temp,
     # Get-BRAVOInstallPrivateDirectoryBase; випадкова назва): туди копіюється архів, його SHA-256 звіряється з уже
     # перевіреним значенням, і комплект розпаковується заново. Можливості,
@@ -865,6 +894,20 @@ if ($null -ne $freeBytes) {
 
 Write-Step '3. Розгортання'
 
+# Остання звірка ДО першого запису в каталог інсталяції (#545). Спершу
+# staged-дерево == усі записи перевіреної копії архіву (кожен файл, який
+# скопіює robocopy, будь-якого розширення), далі — RUNTIME_MANIFEST.json
+# комплекту. Файл, змінений після SHA-256 архіву, зупиняє інсталяцію тут, а не
+# гейтом кроку 5 після копіювання.
+$stagedArchiveMatch = Test-BRAVODeployStagedTreeMatchesArchive -ArchivePath $ZipPath -StagedRoot $staged
+if (-not $stagedArchiveMatch.IsMatch) {
+    throw ('Staged-комплект не збігається з перевіреним архівом (' +
+        (@($stagedArchiveMatch.Problems | Select-Object -First 10) -join '; ') +
+        $(if (@($stagedArchiveMatch.Problems).Count -gt 10) { '; ...' } else { '' }) +
+        '). Нічого не розгорнуто. Візьміть комплект заново й повторіть запуск.')
+}
+Assert-BRAVOInstallBundleIntegrity -BundleRoot $staged -BeforeDeploy
+
 # Явний профіль (#434): BRAVO.local.config, перевірений у кроці 1, мусить
 # бути тим самим і зараз — до ПЕРШОГО запису в каталог інсталяції. Інакше
 # крок 4 відмовив би вже після копіювання, лишивши VERSION.json і частковий
@@ -887,7 +930,7 @@ if (-not $targetExists) {
 # RUNTIME_MANIFEST.json, тож комплект із ним лишається «цілісним», а копія
 # переписала б наявний файл (уже після звірки відбитка вище) чи підклала б
 # чужий замість seed. Site-файл у каталозі інсталяції створює лише крок 4.
-$robocopyLog = Join-Path $StagingRoot ('robocopy_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
+$robocopyLog = Join-Path $installStagingRoot ('robocopy_' + (Get-Date -Format 'yyyyMMdd_HHmmss') + '.log')
 $null = & robocopy.exe $staged $RuntimeRoot /E /R:2 /W:2 /NFL /NDL /NP /XF 'BRAVO.local.config' ('/LOG:' + $robocopyLog)
 $robocopyCode = $LASTEXITCODE
 if ($robocopyCode -ge 8) {
@@ -1085,7 +1128,7 @@ Write-Step 'Готово: комплект розгорнуто'
 Write-Host ('  каталог:     ' + $RuntimeRoot)
 Write-Host ('  версія:      ' + $deployedVersion.packageVersion + ' / ' + $deployedVersion.releaseChannel)
 Write-Host ('  sourceCommit: ' + $stagedCommit)
-Write-Host ('  staging:     ' + $StagingRoot + ' (можна видалити)')
+Write-Host ('  staging:     ' + $installStagingRoot + ' (приватний каталог; можна видалити)')
 Write-Host ''
 Write-Host '  Сервер ЩЕ НЕ налаштований: credentials не створені, завдання' -ForegroundColor Yellow
 Write-Host '  Планувальника не зареєстровані, архівація не виконується.' -ForegroundColor Yellow

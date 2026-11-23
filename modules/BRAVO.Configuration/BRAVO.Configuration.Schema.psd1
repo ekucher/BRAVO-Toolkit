@@ -10,6 +10,7 @@
         'Resolve-BRAVOConfigurationSchemaVersion',
         'Get-BRAVOConfigurationSchemaVersionDeclarationLine',
         'Test-BRAVOConfigurationOverrideAuthorization',
+        'Test-BRAVOExclusionPattern',
         'Get-BRAVOConfigurationSchemaAuthorizationClass',
         'Test-BRAVOConfigurationAuthorizationValidatorValue',
         'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed',

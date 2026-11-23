@@ -246,6 +246,97 @@ function New-BRAVOBazaCycleId {
     return ('{0:yyyyMMdd_HHmmss}_{1}' -f $NowUtc, [guid]::NewGuid().ToString('N').Substring(0, 6))
 }
 
+# =====================================================================
+# ВИКЛЮЧЕННЯ (#561)
+# =====================================================================
+# Виключені об'єкти фільтруються на рівні знімка/плану, а НЕ маскою
+# TransferOptions на PutFiles окремого файла: маска без збігу дала б нуль
+# переданих файлів, що читалося б як збій передачі. Виключений файл не
+# потрапляє у знімок, тож його не завантажують, не звітують як
+# несинхронізований/відсутній і не видаляють у хмарі (рушій не видаляє
+# взагалі). Порожній список = жодних змін поведінки.
+
+function Get-BRAVOBazaExclusionProblem {
+    # $null, якщо всі шаблони допустимі, інакше текст першої проблеми.
+    # Повторна перевірка (fail closed) на випадок, коли шаблон потрапив у
+    # рантайм повз валідатор завантаження конфігурації.
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Exclusions = @())
+
+    foreach ($exclusionPattern in @($Exclusions)) {
+        $problem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        if ($null -ne $problem) {
+            return "недопустимий шаблон виключення '$exclusionPattern': $problem"
+        }
+    }
+    return $null
+}
+
+function Test-BRAVOBazaPathExcluded {
+    # Шлях виключений, якщо під шаблон потрапляє він сам АБО будь-який його
+    # каталог-предок (збіглий каталог виключається цілком). Результати для
+    # каталогів-предків кешуються в $Cache: на сотнях тисяч файлів кожен
+    # каталог перевіряється один раз, а не для кожного файла.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Patterns,
+        [Parameter(Mandatory = $true)][hashtable]$Cache,
+        [switch]$CacheResult
+    )
+
+    if (@($Patterns).Count -eq 0) { return $false }
+    $normalized = $RelativePath.Replace('/', '\').Trim('\')
+    if ($normalized.Length -eq 0) { return $false }
+    if ($Cache.ContainsKey($normalized)) { return [bool]$Cache[$normalized] }
+    $excluded = [bool](Test-BRAVOExclusionMatch -RelativePath $normalized -Patterns $Patterns)
+    if (-not $excluded) {
+        $separatorIndex = $normalized.LastIndexOf('\')
+        if ($separatorIndex -gt 0) {
+            $excluded = [bool](Test-BRAVOBazaPathExcluded `
+                -RelativePath $normalized.Substring(0, $separatorIndex) `
+                -Patterns $Patterns `
+                -Cache $Cache `
+                -CacheResult)
+        }
+    }
+    if ($CacheResult) { $Cache[$normalized] = $excluded }
+    return $excluded
+}
+
+function Get-BRAVOBazaPrunedTreeItems {
+    # #561: перелік дерева по одному каталогу (TopDirectoryOnly) з відсіканням
+    # виключених файлів і каталогів ДО спуску. Семантика спуску та сама, що в
+    # SearchOption.AllDirectories (зокрема reparse-каталоги проходяться), а
+    # помилка переліку НЕвиключеного каталогу так само кидає виняток. Повертає
+    # List[FileSystemInfo]: файли і, з -IncludeDirectories, каталоги.
+    param(
+        [Parameter(Mandatory = $true)][IO.DirectoryInfo]$Root,
+        [Parameter(Mandatory = $true)][string]$NormalizedRoot,
+        [Parameter(Mandatory = $true)][string[]]$Patterns,
+        [Parameter(Mandatory = $true)][hashtable]$Cache,
+        [switch]$IncludeDirectories
+    )
+    $items = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
+    $pending = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+    $pending.Push($Root)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        foreach ($item in $directory.EnumerateFileSystemInfos('*', [IO.SearchOption]::TopDirectoryOnly)) {
+            $relativePath = $item.FullName.Substring($NormalizedRoot.Length).TrimStart('\', '/')
+            if (Test-BRAVOBazaPathExcluded -RelativePath $relativePath -Patterns $Patterns -Cache $Cache) { continue }
+            if ($item -is [IO.DirectoryInfo]) {
+                $pending.Push([IO.DirectoryInfo]$item)
+                if ($IncludeDirectories) { $items.Add($item) }
+            } else {
+                $items.Add($item)
+            }
+        }
+    }
+    return ,$items
+}
+
 function Get-BRAVOBazaLocalSnapshot {
     # Один прохід .NET-переліку (не Get-ChildItem provider layer — той самий
     # підхід, що вже застосований у Maintenance для великих дерев) —
@@ -267,11 +358,16 @@ function Get-BRAVOBazaLocalSnapshot {
     param(
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
         [switch]$IncludeHiddenSystem,
-        [switch]$IncludeDirectories
+        [switch]$IncludeDirectories,
+        # #561: виключені об'єкти (і все під виключеним каталогом) у знімок не
+        # потрапляють. Порожньо — знімок і перелік ті самі, що раніше.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
     $snapshotUtc = (Get-Date).ToUniversalTime()
     $entries = @{}
+    $exclusionPatterns = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $exclusionCache = @{}
     # Пряме присвоєння, не вираз if: колекція лишається одним об'єктом.
     $directories = $null
     $reparsePointDirectoryCount = $null
@@ -282,12 +378,22 @@ function Get-BRAVOBazaLocalSnapshot {
     if (-not [IO.Directory]::Exists($LocalDirectory)) {
         return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; ReparsePointDirectoryCount = $reparsePointDirectoryCount; Success = $false; Error = "каталог не знайдено: $LocalDirectory" }
     }
+    $exclusionProblem = Get-BRAVOBazaExclusionProblem -Exclusions $exclusionPatterns
+    if ($null -ne $exclusionProblem) {
+        return [pscustomobject]@{ SnapshotUtc = $snapshotUtc; Entries = $entries; Directories = $directories; ReparsePointDirectoryCount = $reparsePointDirectoryCount; Success = $false; Error = $exclusionProblem }
+    }
     try {
         $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
         $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
         # Пряме присвоєння результату методу зберігає лінивий перелік; вираз
         # if { ... } розгорнув би все дерево в масив до початку циклу.
-        if ($IncludeDirectories) {
+        if ($exclusionPatterns.Count -gt 0) {
+            # #561 (рев'ю Codex): з виключеннями — обхід по одному каталогу з
+            # відсіканням виключених ДО спуску, інакше нечитабельний виключений
+            # каталог зривав би знімок (AllDirectories спускається в нього).
+            $items = Get-BRAVOBazaPrunedTreeItems -Root $rootInfo -NormalizedRoot $normalizedRoot `
+                -Patterns $exclusionPatterns -Cache $exclusionCache -IncludeDirectories:$IncludeDirectories
+        } elseif ($IncludeDirectories) {
             $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
         } else {
             $items = $rootInfo.EnumerateFiles('*', [IO.SearchOption]::AllDirectories)
@@ -298,6 +404,10 @@ function Get-BRAVOBazaLocalSnapshot {
                 continue
             }
             $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
+            if ($exclusionPatterns.Count -gt 0 -and
+                (Test-BRAVOBazaPathExcluded -RelativePath $relativePath -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+                continue
+            }
             if ($item -is [IO.DirectoryInfo]) {
                 [void]$directories.Add($relativePath)
                 if (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -332,9 +442,14 @@ function Compare-BRAVOBazaLocalSnapshotToLiveTree {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$Snapshot,
-        [Parameter(Mandatory = $true)][string]$LocalDirectory
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        # #561: виключені об'єкти ігноруються з обох боків (і живе дерево, і
+        # записи знімка), тож їхнє зникнення/зміна не є дрейфом знімка.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
+    $exclusionPatterns = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $exclusionCache = @{}
     $vanished = New-Object System.Collections.Generic.List[object]
     $typeReplaced = New-Object System.Collections.Generic.List[object]
     $modified = New-Object System.Collections.Generic.List[object]
@@ -361,9 +476,19 @@ function Compare-BRAVOBazaLocalSnapshotToLiveTree {
     try {
         $rootInfo = New-Object IO.DirectoryInfo($LocalDirectory)
         $normalizedRoot = $rootInfo.FullName.TrimEnd('\', '/')
-        $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        if ($exclusionPatterns.Count -gt 0) {
+            # #561 (рев'ю Codex): відсікання виключених каталогів до спуску.
+            $items = Get-BRAVOBazaPrunedTreeItems -Root $rootInfo -NormalizedRoot $normalizedRoot `
+                -Patterns $exclusionPatterns -Cache $exclusionCache -IncludeDirectories
+        } else {
+            $items = $rootInfo.EnumerateFileSystemInfos('*', [IO.SearchOption]::AllDirectories)
+        }
         foreach ($item in $items) {
             $relativePath = $item.FullName.Substring($normalizedRoot.Length).TrimStart('\', '/')
+            if ($exclusionPatterns.Count -gt 0 -and
+                (Test-BRAVOBazaPathExcluded -RelativePath $relativePath -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+                continue
+            }
             if ($item -is [IO.DirectoryInfo]) {
                 if ($Snapshot.Directories.Contains($relativePath)) {
                     [void]$seen.Add($relativePath)
@@ -392,11 +517,19 @@ function Compare-BRAVOBazaLocalSnapshotToLiveTree {
 
     foreach ($relativePath in $Snapshot.Entries.Keys) {
         if (-not $seen.Contains($relativePath)) {
+            if ($exclusionPatterns.Count -gt 0 -and
+                (Test-BRAVOBazaPathExcluded -RelativePath ([string]$relativePath) -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+                continue
+            }
             $vanished.Add([pscustomobject]@{ RelativePath = [string]$relativePath; IsDirectory = $false })
         }
     }
     foreach ($relativePath in $Snapshot.Directories) {
         if (-not $seen.Contains($relativePath)) {
+            if ($exclusionPatterns.Count -gt 0 -and
+                (Test-BRAVOBazaPathExcluded -RelativePath ([string]$relativePath) -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+                continue
+            }
             $vanished.Add([pscustomobject]@{ RelativePath = [string]$relativePath; IsDirectory = $true })
         }
     }
@@ -436,14 +569,25 @@ function Get-BRAVOBazaSyncPlan {
         # мовчки поводитись як альтернативна політика й давати
         # $MutationPolicy -ne 'Fail' == $true (мутація йде в ToUpload).
         [ValidateSet('Fail')]
-        [string]$MutationPolicy = 'Fail'
+        [string]$MutationPolicy = 'Fail',
+        # #561: захисний фільтр плану — навіть якщо знімок побудовано без
+        # виключень, виключений шлях не потрапляє ні в ToUpload, ні в
+        # TrustedSkip, ні в MutationViolations (його не вантажать і не
+        # звітують). Порожньо — план той самий, що раніше.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
     $toUpload = New-Object System.Collections.Generic.List[object]
     $trustedSkip = New-Object System.Collections.Generic.List[object]
     $mutations = New-Object System.Collections.Generic.List[object]
+    $exclusionPatterns = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $exclusionCache = @{}
 
     foreach ($relativePath in $Snapshot.Entries.Keys) {
+        if ($exclusionPatterns.Count -gt 0 -and
+            (Test-BRAVOBazaPathExcluded -RelativePath ([string]$relativePath) -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+            continue
+        }
         $localEntry = $Snapshot.Entries[$relativePath]
         $stateEntry = $State.Files[$relativePath]
 
@@ -860,9 +1004,15 @@ function ConvertTo-BRAVOBazaFullAuditResult {
         [string]$ComparisonError,
         [object[]]$PendingFiles = @(),
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
-        [Parameter(Mandatory = $true)][object]$LocalSnapshot
+        [Parameter(Mandatory = $true)][object]$LocalSnapshot,
+        # #561: виключені шляхи не потрапляють ні в AlreadyMatching (їх не
+        # засівають як Verified), ні в PendingItems (не звітуються як
+        # розбіжність). Порожньо — результат той самий, що раніше.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
+    $exclusionPatterns = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $exclusionCache = @{}
     if (-not $ComparisonSuccess) {
         return [pscustomobject]@{
             Success = $false; Error = $ComparisonError
@@ -896,6 +1046,10 @@ function ConvertTo-BRAVOBazaFullAuditResult {
             continue
         }
         $relative = $absolutePath.Substring($normalizedRoot.Length).TrimStart('\', '/')
+        if ($exclusionPatterns.Count -gt 0 -and
+            (Test-BRAVOBazaPathExcluded -RelativePath $relative -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+            continue
+        }
         [void]$pendingRelativePaths.Add($relative)
         $pendingAction = if ($null -ne $pendingFile.PSObject.Properties['Action']) { [string]$pendingFile.Action } else { $null }
         $pendingReason = if ($null -ne $pendingFile.PSObject.Properties['Reason']) { [string]$pendingFile.Reason } else { $null }
@@ -911,6 +1065,10 @@ function ConvertTo-BRAVOBazaFullAuditResult {
     $lastWriteTimesUtc = @{}
     foreach ($relativePath in $LocalSnapshot.Entries.Keys) {
         if ($pendingRelativePaths.Contains($relativePath)) { continue }
+        if ($exclusionPatterns.Count -gt 0 -and
+            (Test-BRAVOBazaPathExcluded -RelativePath ([string]$relativePath) -Patterns $exclusionPatterns -Cache $exclusionCache)) {
+            continue
+        }
         $entry = $LocalSnapshot.Entries[$relativePath]
         [void]$alreadyMatching.Add($relativePath)
         $localSizes[$relativePath] = $entry.Size
@@ -967,11 +1125,26 @@ function Invoke-BRAVOBazaSynchronization {
         # Ручний тригер (напр. майбутній CLI-прапорець ручної синхронізації) —
         # ігнорує вік LastFullAuditUtc і FullAuditEveryDays, але НЕ ігнорує
         # відсутність FullAuditProvider (нема звідки брати audit).
-        [switch]$ForceFullAudit
+        [switch]$ForceFullAudit,
+        # #561: виключення цього компонента (Synchronization.Exclusions.*).
+        # Знімок, план і сканування блокерів не бачать виключених шляхів.
+        # Порожньо — поведінка і результат без змін.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
     $startedUtc = (Get-Date).ToUniversalTime()
     $cycleId = New-BRAVOBazaCycleId -NowUtc $startedUtc
+    $Exclusions = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    # Fail closed: невалідний шаблон зупиняє цикл ДО будь-якого читання стану
+    # чи передачі (ні знімка, ні WinSCP-викликів).
+    $exclusionProblem = Get-BRAVOBazaExclusionProblem -Exclusions $Exclusions
+    if ($null -ne $exclusionProblem) {
+        $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+        $result.Status = 'ERROR'
+        $result.Error = "$Component — $exclusionProblem; синхронізацію зупинено"
+        $result.CompletedUtc = (Get-Date).ToUniversalTime()
+        return $result
+    }
     $statePath = Get-BRAVOBazaStatePath -StateRoot $StateRoot -Component $Component
     $stateRead = Read-BRAVOBazaState -Path $statePath
 
@@ -1016,7 +1189,7 @@ function Invoke-BRAVOBazaSynchronization {
 
         # Archive / explicit reconciliation path: ОБИДВА -BootstrapIfNeeded
         # і FullAuditProvider присутні — контрольоване відновлення.
-        $recoverySnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+        $recoverySnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -Exclusions $Exclusions
         if (-not $recoverySnapshot.Success) {
             $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
             $result.Status = 'STATE_INVALID'
@@ -1137,7 +1310,7 @@ function Invoke-BRAVOBazaSynchronization {
         # Знімок ОДИН для всього циклу (і для bootstrap seed, і для плану,
         # і як сам Cutoff) — узгодженість: bootstrap ніколи не бачить
         # ІНШИЙ перелік каталогу, ніж той, що потім планується до upload.
-        $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+        $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -Exclusions $Exclusions
         if (-not $snapshot.Success) {
             $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
             $result.Status = 'ERROR'
@@ -1315,7 +1488,7 @@ function Invoke-BRAVOBazaSynchronization {
     }
 
     $cutoffUtc = $snapshot.SnapshotUtc
-    $plan = Get-BRAVOBazaSyncPlan -Snapshot $snapshot -State $state -MutationPolicy $MutationPolicy
+    $plan = Get-BRAVOBazaSyncPlan -Snapshot $snapshot -State $state -MutationPolicy $MutationPolicy -Exclusions $Exclusions
 
     $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $cutoffUtc
     $result.Bootstrap = $bootstrapPerformed
@@ -1343,8 +1516,13 @@ function Invoke-BRAVOBazaSynchronization {
     # позитивна розв'язка). Скан суто локальний по вже завантаженому
     # state (жодного remote-виклику); блокер лишається в state
     # недоторканим, доки оператор не розв'яже розбіжність.
+    $blockedExclusionCache = @{}
     foreach ($blockedRelativePath in @($state.Files.Keys)) {
         if ($snapshot.Entries.ContainsKey($blockedRelativePath)) { continue }
+        # #561: шлях, що відтоді потрапив під виключення, більше не
+        # синхронізується, тож його старий блокер не звітується.
+        if ($Exclusions.Count -gt 0 -and
+            (Test-BRAVOBazaPathExcluded -RelativePath ([string]$blockedRelativePath) -Patterns $Exclusions -Cache $blockedExclusionCache)) { continue }
         $blockedEntry = $state.Files[$blockedRelativePath]
         if ($null -eq $blockedEntry -or
             $null -eq $blockedEntry.PSObject.Properties['BlockReason'] -or
@@ -1763,7 +1941,10 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
     param(
         [Parameter(Mandatory = $true)][object]$SyncResult,
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
-        [Parameter(Mandatory = $true)][string]$StateRoot
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        # #561: свіжий знімок будується з тими самими виключеннями, що й знімок
+        # циклу, інакше виключений файл рахувався б «новим після cutoff».
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
     if ($SyncResult.Status -notin @('COMPLETE', 'INCOMPLETE', 'MUTATION_VIOLATION', 'MUTATION_AUTO_ARCHIVED', 'INCOMPATIBLE_NAME', 'REMOTE_CONFLICT', 'AUDIT_DRIFT')) {
@@ -1782,7 +1963,7 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
         return $SyncResult
     }
 
-    $freshSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+    $freshSnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -Exclusions $Exclusions
     if (-not $freshSnapshot.Success) {
         return $SyncResult
     }
@@ -2353,11 +2534,25 @@ function Invoke-BRAVOBazaComponentSyncSession {
         [scriptblock]$FullAuditProvider,
         [double]$FullAuditEveryDays = 0,
         [switch]$ForceFullAudit,
-        [switch]$WriteCheckpoint
+        [switch]$WriteCheckpoint,
+        # #561: виключення компонента (Synchronization.Exclusions.*), передаються
+        # у знімок/план Invoke-BRAVOBazaSynchronization. Порожньо — без змін.
+        [AllowEmptyCollection()][string[]]$Exclusions = @()
     )
 
     $cycleId = New-BRAVOBazaCycleId
     $startedUtc = (Get-Date).ToUniversalTime()
+    $Exclusions = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    # Fail closed ДО lock і WinSCP-сесії: невалідний шаблон не доходить ні до
+    # знімка, ні до жодного виклику WinSCP.
+    $sessionExclusionProblem = Get-BRAVOBazaExclusionProblem -Exclusions $Exclusions
+    if ($null -ne $sessionExclusionProblem) {
+        $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+        $result.Status = 'ERROR'
+        $result.Error = "$Component — $sessionExclusionProblem; синхронізацію зупинено"
+        $result.CompletedUtc = (Get-Date).ToUniversalTime()
+        return $result
+    }
 
     # Machine-wide серіалізація ЦЬОГО компонента (ТЗ п.17) — аквайриться ДО
     # відкриття WinSCP-сесії, щоб не платити за зайве з'єднання, коли інший
@@ -2434,7 +2629,8 @@ function Invoke-BRAVOBazaComponentSyncSession {
             -BootstrapIfNeeded:$BootstrapIfNeeded `
             -FullAuditProvider $FullAuditProvider `
             -FullAuditEveryDays $FullAuditEveryDays `
-            -ForceFullAudit:$ForceFullAudit
+            -ForceFullAudit:$ForceFullAudit `
+            -Exclusions $Exclusions
 
         if ($WriteCheckpoint -and (Test-BRAVOBazaSyncStatusSuccess -Status $syncResult.Status)) {
             # P2 (deep review): результат публікації більше НЕ відкидається

@@ -2789,3 +2789,386 @@ function Get-BRAVOTaskStateName {
         default { return [string]$State }
     }
 }
+
+# --- Виключення з архівації й SFTP-синхронізації (#561) ---
+#
+# Шаблони вже перевірено валідатором ExclusionPatternList (лише ім'я або
+# відносний шаблон із * і ?). Семантика збігу та сама, що в 7-Zip -xr@:
+# шаблон без роздільника — ім'я файла чи каталогу на будь-якому рівні;
+# шаблон із роздільником — відносний шлях, що закінчується на будь-якому рівні.
+# Збіглий каталог виключається цілком (усередину не заходимо).
+
+function Test-BRAVOExclusionMatch {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [AllowEmptyCollection()][string[]]$Patterns
+    )
+    $normalized = $RelativePath.Replace('/', '\').Trim('\')
+    $name = @($normalized -split '\\')[-1]
+    foreach ($pattern in @($Patterns)) {
+        if ([string]::IsNullOrEmpty($pattern)) { continue }
+        $normalizedPattern = $pattern.Replace('/', '\')
+        if ($normalizedPattern.IndexOf('\') -lt 0) {
+            if ($name -like $normalizedPattern) { return $true }
+        } elseif ($normalized -like $normalizedPattern -or $normalized -like ('*\' + $normalizedPattern)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-BRAVOExclusionMatchCount {
+    # Скільки файлів і каталогів джерела підпадає під виключення — для журналу.
+    # Обхід через .NET, reparse-каталоги не проходяться; недоступний каталог
+    # не зупиняє підрахунок (рахується окремо).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowEmptyCollection()][string[]]$Patterns
+    )
+    $rootPath = $Path.TrimEnd('*').TrimEnd('\')
+    $result = [pscustomobject]@{ Files = 0; Directories = 0; Inaccessible = 0 }
+    if (@($Patterns).Count -eq 0 -or -not [System.IO.Directory]::Exists($rootPath)) { return $result }
+    $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+    $pending.Push((New-Object System.IO.DirectoryInfo($rootPath)))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            $entries = $directory.GetFileSystemInfos()
+        } catch {
+            $result.Inaccessible++
+            continue
+        }
+        foreach ($entry in $entries) {
+            $relative = $entry.FullName.Substring($rootPath.Length).TrimStart('\')
+            $isDirectory = (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0)
+            if (Test-BRAVOExclusionMatch -RelativePath $relative -Patterns $Patterns) {
+                if ($isDirectory) { $result.Directories++ } else { $result.Files++ }
+                continue
+            }
+            if ($isDirectory -and ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                $pending.Push([System.IO.DirectoryInfo]$entry)
+            }
+        }
+    }
+    return $result
+}
+
+function ConvertTo-BRAVOWinSCPExclusionMask {
+    # Маска виключень WinSCP для synchronize / CompareDirectories / PutFiles:
+    # '|' + умови через ';'. Для кожного шаблону — і файл ('p'), і каталог
+    # ('p/'); шаблон із роздільником — шлях на будь-якому рівні ('*/p').
+    # Порожній список — $null (маска не задається, поведінка не змінюється).
+    # Метасимволи масок (| ; , < > [ ] : =) і лапки валідатор уже відхилив.
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Patterns)
+    $conditions = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in @($Patterns)) {
+        if ([string]::IsNullOrEmpty($pattern)) { continue }
+        $maskPattern = $pattern.Replace('\', '/')
+        if ($maskPattern.IndexOf('/') -ge 0) { $maskPattern = '*/' + $maskPattern }
+        $conditions.Add($maskPattern)
+        $conditions.Add($maskPattern + '/')
+    }
+    if ($conditions.Count -eq 0) { return $null }
+    return ('|' + ($conditions.ToArray() -join ';'))
+}
+
+# --- Windows Cloud Files (On-demand sync) у джерелах бекапу (#560, фаза 1) ---
+#
+# Клієнти синхронізації на основі Cloud Files API (Synology Drive, OneDrive,
+# Google Drive, Dropbox) у режимі On-demand лишають на диску ВІРТУАЛЬНІ файли
+# («лише онлайн»): атрибути RECALL_ON_DATA_ACCESS (0x400000) / RECALL_ON_OPEN
+# (0x40000), часто з OFFLINE (0x1000) і reparse point. Прочитати їхній вміст
+# можна лише через запущений провайдер. 7-Zip від SYSTEM із VSS-знімка цього
+# не може і завершується кодом 2 з "The cloud file provider is not running".
+# BRAVO не гідратує такі файли (від SYSTEM і з VSS-знімка це неможливо, а
+# гідратація з живого тому порушила б point-in-time), а ВИЯВЛЯЄ їх і називає
+# оператору причину.
+#
+# Біти RECALL_ON_* / PINNED / UNPINNED відсутні в [IO.FileAttributes] на
+# .NET 4.x, тому перевірка йде маскою над [long] атрибутів.
+
+function Get-BRAVOCloudFilesSupport {
+    # Cloud Files API з'явився у Windows 10 1709 (build 16299). На старших ОС
+    # (Windows 7 / Server 2008 R2 / Server 2012 R2 / Server 2016) віртуальних
+    # файлів Cloud Files не буває, тож перевірку безпечно пропускаємо (INFO).
+    [CmdletBinding()]
+    param([Version]$OSVersion = [Environment]::OSVersion.Version)
+
+    $minimum = New-Object Version(10, 0, 16299)
+    $supported = ($null -ne $OSVersion -and $OSVersion -ge $minimum)
+    $reason = if ($supported) {
+        ''
+    } else {
+        "Windows $OSVersion не має Cloud Files API (потрібно Windows 10 1709 / build 16299 або новіша) — перевірку віртуальних файлів пропущено"
+    }
+    return [pscustomobject]@{ Supported = $supported; OSVersion = $OSVersion; Reason = $reason }
+}
+
+function Test-BRAVOCloudFilesPlaceholderAttributes {
+    # Віртуальний (не гідратований) файл чи каталог Cloud Files:
+    # RECALL_ON_DATA_ACCESS або RECALL_ON_OPEN. OFFLINE разом із reparse point
+    # сам по собі ознакою НЕ є: так само виглядають файли HSM / storage
+    # tiering / dedup інших постачальників, і політика Fail хибно вилучила б
+    # їх із бекапу (рев'ю #560). PINNED/UNPINNED — теж не ознака.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory = $true)][long]$Attributes)
+
+    if (($Attributes -band 0x400000) -ne 0) { return $true }
+    if (($Attributes -band 0x40000) -ne 0) { return $true }
+    return $false
+}
+
+function Get-BRAVOCloudFilesSyncRoots {
+    # Корені синхронізації, зареєстровані провайдерами Cloud Files:
+    #   HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\<Id>
+    #     HydrationPolicy (DWORD, молодше слово: 0 PARTIAL, 1 PROGRESSIVE,
+    #                      2 FULL, 3 ALWAYS_FULL)
+    #     UserSyncRoots\<SID> = <шлях кореня>
+    # Провайдер — частина Id до першого '!'. OnDemand = не ALWAYS_FULL (за
+    # відсутності значення — $true: віртуальні файли можливі).
+    # -RegistryPath лише для self-test (HKCU-фікстура). Недоступний реєстр —
+    # порожній список, а не виняток: це діагностика, не гейт.
+    [CmdletBinding()]
+    param([string]$RegistryPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager')
+
+    $roots = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-Path -LiteralPath $RegistryPath)) { return @() }
+    try {
+        $rootKeys = @(Get-ChildItem -LiteralPath $RegistryPath -ErrorAction Stop)
+    } catch {
+        return @()
+    }
+    foreach ($rootKey in $rootKeys) {
+        $id = [string]$rootKey.PSChildName
+        $provider = @($id -split '!')[0]
+        $onDemand = $true
+        $hydrationPolicy = $null
+        try {
+            $properties = Get-ItemProperty -LiteralPath $rootKey.PSPath -ErrorAction Stop
+            $policyProperty = $properties.PSObject.Properties['HydrationPolicy']
+            if ($null -ne $policyProperty -and $null -ne $policyProperty.Value) {
+                $hydrationPolicy = ([long]$policyProperty.Value) -band 0xFFFF
+                $onDemand = ($hydrationPolicy -ne 3)
+            }
+        } catch {
+            # Значення недоступне — лишаємо обережне OnDemand = $true.
+        }
+        $userRootsPath = Join-Path $rootKey.PSPath 'UserSyncRoots'
+        if (-not (Test-Path -LiteralPath $userRootsPath)) { continue }
+        try {
+            $userRoots = Get-ItemProperty -LiteralPath $userRootsPath -ErrorAction Stop
+        } catch {
+            continue
+        }
+        foreach ($property in @($userRoots.PSObject.Properties)) {
+            if ($property.Name -like 'PS*') { continue }
+            $rootPath = [string]$property.Value
+            if ([string]::IsNullOrWhiteSpace($rootPath)) { continue }
+            $roots.Add([pscustomobject]@{
+                Id = $id
+                Provider = $provider
+                UserSid = [string]$property.Name
+                Path = $rootPath.TrimEnd('\')
+                HydrationPolicy = $hydrationPolicy
+                OnDemand = $onDemand
+            })
+        }
+    }
+    return @($roots.ToArray())
+}
+
+function Test-BRAVOPathContainsOrWithin {
+    # $true, коли один шлях лежить усередині іншого або вони збігаються
+    # (Windows-семантика: без урахування регістру, з межею по '\').
+    param([string]$First, [string]$Second)
+    if ([string]::IsNullOrWhiteSpace($First) -or [string]::IsNullOrWhiteSpace($Second)) { return $false }
+    $a = $First.TrimEnd('\', '*').TrimEnd('\') + '\'
+    $b = $Second.TrimEnd('\', '*').TrimEnd('\') + '\'
+    return ($a.StartsWith($b, [StringComparison]::OrdinalIgnoreCase) -or
+        $b.StartsWith($a, [StringComparison]::OrdinalIgnoreCase))
+}
+
+$script:BRAVOCloudFilesMaxDepth = 256
+
+function Test-BRAVOCloudFilesDirectoryIsNotLink {
+    # $true — reparse-каталог не є junction/symlink (тобто це може бути
+    # каталог Cloud Files, у який можна заходити). LinkType провайдера
+    # FileSystem з'явився в PowerShell 5.0; без нього або за будь-якої помилки
+    # — $false (не заходимо: обережно, як до #560).
+    param([Parameter(Mandatory = $true)][string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $linkTypeProperty = $item.PSObject.Properties['LinkType']
+        if ($null -eq $linkTypeProperty) { return $false }
+        return [string]::IsNullOrEmpty([string]$linkTypeProperty.Value)
+    } catch {
+        return $false
+    }
+}
+
+function Get-BRAVOCloudFilesSourceState {
+    # Обхід джерела бекапу ЯВНО через .NET (DirectoryInfo.GetFileSystemInfos),
+    # без залежності від семантики Get-ChildItem -Recurse для reparse point у
+    # PS 5.1/7. Віртуальний каталог не відкривається (це запустило б
+    # гідратацію або впало б без провайдера); інші reparse-каталоги
+    # (junction/symlink) не проходяться. Повертає кількість віртуальних файлів,
+    # перші -MaxListed відносних шляхів, корені синхронізації, що перетинаються
+    # з джерелом, і кількість недоступних каталогів.
+    # -AttributeReader лише для self-test: справжні біти RECALL_ON_* звичайний
+    # процес виставити не може.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$MaxListed = 20,
+        [scriptblock]$AttributeReader,
+        [AllowNull()][object[]]$SyncRoots
+    )
+
+    $rootPath = $Path.TrimEnd('*').TrimEnd('\')
+    if ($null -eq $AttributeReader) { $AttributeReader = { param($Item) [long][int]$Item.Attributes } }
+    $listed = New-Object System.Collections.Generic.List[string]
+    $placeholderCount = 0
+    $filesScanned = 0
+    $inaccessible = 0
+    $overlapping = @()
+    if ($null -ne $SyncRoots) {
+        $overlapping = @($SyncRoots | Where-Object { Test-BRAVOPathContainsOrWithin -First $_.Path -Second $rootPath })
+    }
+
+    if (-not [System.IO.Directory]::Exists($rootPath)) {
+        return [pscustomobject]@{
+            Path = $rootPath; Exists = $false; FilesScanned = 0; PlaceholderCount = 0
+            Placeholders = @(); Truncated = $false; InaccessibleCount = 0; SyncRootsInSource = $overlapping
+        }
+    }
+
+    # Корінь джерела сам може бути віртуальним каталогом (джерело = корінь
+    # синхронізації або його підкаталог «лише онлайн»): його атрибути
+    # перевіряються ДО GetFileSystemInfos(), інакше перелік викликав би
+    # провайдер (гідратація) або впав би під SYSTEM без знахідки (рев'ю #560).
+    $rootInfo = New-Object System.IO.DirectoryInfo($rootPath)
+    $rootAttributes = [long](& $AttributeReader $rootInfo)
+    if (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes $rootAttributes) {
+        return [pscustomobject]@{
+            Path = $rootPath; Exists = $true; FilesScanned = 0; PlaceholderCount = 1
+            Placeholders = @('.'); Truncated = $false; InaccessibleCount = 0; SyncRootsInSource = $overlapping
+        }
+    }
+
+    $pending = New-Object System.Collections.Generic.Stack[System.IO.DirectoryInfo]
+    $pending.Push($rootInfo)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            $entries = $directory.GetFileSystemInfos()
+        } catch {
+            $inaccessible++
+            continue
+        }
+        foreach ($entry in $entries) {
+            $attributes = [long](& $AttributeReader $entry)
+            $isDirectory = (($attributes -band 0x10) -ne 0)
+            if (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes $attributes) {
+                $placeholderCount++
+                if ($listed.Count -lt $MaxListed) {
+                    $listed.Add($entry.FullName.Substring($rootPath.Length).TrimStart('\'))
+                }
+                continue
+            }
+            if ($isDirectory) {
+                # Звичайний каталог — обходимо. Reparse-каталог обходимо лише
+                # всередині зареєстрованого кореня синхронізації: заповнений
+                # локально каталог Cloud Files лишається reparse point без
+                # бітів RECALL_ON_*, а під ним можуть бути віртуальні файли
+                # (рев'ю #560). Junction/symlink поза коренями не проходимо.
+                $descend = (($attributes -band 0x400) -eq 0)
+                if (-not $descend) {
+                    $entryPrefix = $entry.FullName.TrimEnd('\') + '\'
+                    $insideSyncRoot = $false
+                    foreach ($syncRoot in @($SyncRoots)) {
+                        if ($null -eq $syncRoot -or [string]::IsNullOrWhiteSpace([string]$syncRoot.Path)) { continue }
+                        if ($entryPrefix.StartsWith(([string]$syncRoot.Path).TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                            $insideSyncRoot = $true
+                            break
+                        }
+                    }
+                    # Junction/symlink навіть усередині кореня синхронізації — НЕ
+                    # каталог Cloud Files: посилання на предка дало б нескінченний
+                    # чи експоненційний обхід ще до VSS (рев'ю PR #563).
+                    if ($insideSyncRoot) { $descend = Test-BRAVOCloudFilesDirectoryIsNotLink -Path $entry.FullName }
+                }
+                # Запобіжник: глибина понад $script:BRAVOCloudFilesMaxDepth рівнів —
+                # не заходимо (рахується як недоступний каталог).
+                if ($descend -and (($entry.FullName.Length - $rootPath.Length) -gt 0) -and
+                    @($entry.FullName.Substring($rootPath.Length).Split('\') | Where-Object { $_ }).Count -gt $script:BRAVOCloudFilesMaxDepth) {
+                    $inaccessible++
+                    $descend = $false
+                }
+                if ($descend) { $pending.Push([System.IO.DirectoryInfo]$entry) }
+                continue
+            }
+            $filesScanned++
+        }
+    }
+    return [pscustomobject]@{
+        Path = $rootPath
+        Exists = $true
+        FilesScanned = $filesScanned
+        PlaceholderCount = $placeholderCount
+        Placeholders = @($listed.ToArray())
+        Truncated = ($placeholderCount -gt $listed.Count)
+        InaccessibleCount = $inaccessible
+        SyncRootsInSource = $overlapping
+    }
+}
+
+function Get-BRAVOSevenZipFailureReason {
+    # Класифікація stderr/stdout 7-Zip відомих збоїв джерела у код причини з
+    # підказкою оператору замість голого "код 2". Невідомий текст — $null
+    # (поведінка без класифікації не змінюється). Тексти Windows локалізовані,
+    # тому поруч з англійськими — російські й українські форми.
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$StandardError,
+        [AllowNull()][AllowEmptyString()][string]$StandardOutput
+    )
+
+    $combined = "$StandardError`n$StandardOutput"
+    if ([string]::IsNullOrWhiteSpace($combined)) { return $null }
+
+    $rules = @(
+        @{
+            ReasonCode = 'CloudFilesProviderUnavailable'
+            Patterns = @('(?i)cloud file provider', '(?i)облачн\w*\s+файл', '(?i)хмарн\w*\s+файл')
+            Hint = 'Джерело містить віртуальні файли Cloud Files (On-demand sync: Synology Drive, OneDrive, Google Drive, Dropbox), а клієнт синхронізації не запущений. Вимкніть On-demand для каталогу в джерелі бекапу або зробіть файли «завжди на цьому пристрої».'
+        },
+        @{
+            ReasonCode = 'SourcePathTooLong'
+            Patterns = @('(?i)filename or extension is too long', '(?i)path is too long', '(?i)path too long', '(?i)слишком длинн', '(?i)задовг')
+            Hint = 'Шлях до частини файлів джерела задовгий для 7-Zip. Скоротіть вкладеність чи імена каталогів у джерелі бекапу.'
+        },
+        @{
+            ReasonCode = 'SourceFileLocked'
+            Patterns = @('(?i)being used by another process', '(?i)занят друг\w+ процесс', '(?i)використовується інш\w+ процес')
+            Hint = 'Частину файлів джерела тримає інший процес. Перевірте, що backup виконується з VSS-знімка, і що програма, яка тримає файл, не блокує його в знімку.'
+        },
+        @{
+            ReasonCode = 'SourceAccessDenied'
+            Patterns = @('(?i)access is denied', '(?i)отказано в доступе', '(?i)відмовлено в доступі')
+            Hint = 'SYSTEM не має права читання частини файлів джерела. Перевірте ACL файлів, названих у журналі 7-Zip.'
+        }
+    )
+    foreach ($rule in $rules) {
+        foreach ($pattern in $rule.Patterns) {
+            if ($combined -match $pattern) {
+                return [pscustomobject]@{ ReasonCode = $rule.ReasonCode; Hint = $rule.Hint }
+            }
+        }
+    }
+    return $null
+}

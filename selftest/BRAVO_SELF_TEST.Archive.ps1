@@ -980,6 +980,9 @@ function Remove-BRAVOVSSSnapshotSet {
     return $true
 }
 function Resolve-BRAVOSnapshotSourcePath { param($SnapshotSet, $OriginalPath) return $OriginalPath }
+# #560: preflight Cloud Files — без віртуальних файлів у джерелах (окремі тести Archive/Cloud*).
+function Invoke-BRAVOArchiveCloudPlaceholderPreflight { param($Archives, $Policy) return @() }
+function Get-BRAVOArchiveCloudPlaceholderRootTypes { param($Archives) return @() }
 function Invoke-BRAVOComponentBackup {
     param($Component, $GenerationId, $OriginalSourcePath, $SourcePath, $DestinationDirectory, $ArchiveName, $ArcPath, $ArcParams)
     Add-ProbeEvent "COMPONENT-BACKUP $Component"
@@ -1886,7 +1889,7 @@ function Get-SanitizedWinSCPDiagnostic { param($Text) return [string]$Text }
 function Show-RunningProgress { param($Id, $Activity, $Status, [switch]$Completed) }
 function Show-ScriptProgress { param($Status, $PercentComplete, [switch]$Completed) }
 function Format-BRAVORunningDetail { param($ElapsedSeconds) return '' }
-function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes) return [pscustomobject]@{ Success = $true; Issues = @() } }
+function Get-BAZARemoteNameCompatibilityIssues { param($LocalPath, $MaximumFileUtf8Bytes, $MaximumDirectoryUtf8Bytes, [string[]]$Exclusions = @()) return [pscustomobject]@{ Success = $true; Issues = @() } }
 function Write-BAZARemoteNameCompatibilityAudit { param($CompatibilityResult, $ComponentName) }
 function Get-BRAVOBazaSyncModeEffective { return 'Legacy' }
 function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return (Test-Path -LiteralPath $Path) }
@@ -1896,7 +1899,7 @@ function Initialize-BRAVOSFTPRemoteDirectories { param($WinSCPPath, $RepositoryS
 # Фейк read-only CompareDirectories(Remote, removeFiles=$false): усе локальне,
 # чого немає в хмарі, — UploadNew; інший розмір — UploadUpdate.
 function Get-BAZASFTPComparison {
-    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null, [object[]]$PreAuditPending = @(), [switch]$SnapshotUnavailable)
+    param($LocalPath, $RemotePath, $RepositorySFTPUrl, $HostKey, $LocalSnapshot = $null, [object[]]$PreAuditPending = @(), [switch]$SnapshotUnavailable, [string[]]$Exclusions = @())
     $script:late501ComparisonCalls++
     $script:late501ComponentComparisons++
     if ($script:late501AfterAuditFails -and $script:late501ComparisonCalls -ge 2) {
@@ -2018,8 +2021,8 @@ function Complete-BRAVOProcessOutputCapture { param($Capture) return [pscustomob
 # Справжній знімок; дії стадії 'Snapshot' — об'єкти, що з'явилися/зникли вже
 # після обходу свого каталогу, але до старту WinSCP (неатомарний обхід).
 function Get-BRAVOBazaLocalSnapshot {
-    param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories)
-    $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories
+    param([string]$LocalDirectory, [switch]$IncludeHiddenSystem, [switch]$IncludeDirectories, [string[]]$Exclusions = @())
+    $snapshot = BRAVO.BazaSync\Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory -IncludeHiddenSystem:$IncludeHiddenSystem -IncludeDirectories:$IncludeDirectories -Exclusions $Exclusions
     Invoke-Late501Ops -Stage 'Snapshot'
     # Збій обходу (напр., об'єкт зник під час читання метаданих): та сама
     # форма результату, що й у catch production-функції.
@@ -2067,7 +2070,9 @@ $late501Module = New-BRAVOSelfTestRuntimeModule `
         'Add-BAZASnapshotConsistencyEvidence', 'Add-BAZASnapshotUnavailableEvidence', 'Test-BAZAPathHasReparsePoint', 'New-Late501FakeSession',
         'Get-BAZAPendingFileCycleClassification', 'Get-BAZASynchronizationOutcome', 'Sync-FolderToSFTP',
         'Invoke-BRAVOBazaCanonicalSync', 'New-BRAVOTransferOperationResult', 'Invoke-ManualBAZASFTPSynchronization',
-        'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader'
+        'Get-BRAVOManualSyncRunOutcomeLabel', 'Resolve-BRAVOSyncBazaExitCode', 'Resolve-BRAVOLogComponentFromHeader',
+        # #561: Sync-FolderToSFTP і диспетчер читають виключення компонента й журналюють їх.
+        'Get-BAZAComponentExclusionsFromSettings', 'Write-BAZAExclusionsApplied', 'Test-BAZAPathExcludedByPatterns'
     )
 
 # Один прогін -SyncBAZA (або лише Sync-FolderToSFTP): повертає результат,
@@ -2441,6 +2446,30 @@ try {
         @($c18Result.RealMissing).Count -eq 0
     ) -Name 'Archive/501/S18TypeReplacementIsChangedNotNew' `
       -Failure "заміна файл<->каталог під час циклу має бути ChangedDuringSync, справжні нові — NewAfterCutoff; changed=$($c18Changed -join ',') new=$($c18New -join ',')"
+
+    # 19. BAZA_WWW поводиться так само, як BAZA_APP: файл, створений у WWW під час
+    # власної синхронізації BAZA_WWW (APP чистий), — ПОПЕРЕДЖЕННЯ/10, не ПОМИЛКА.
+    $c19 = & $late501NewCase 'S19'
+    $r19 = & $late501Run -CaseRoot $c19.Root -Remote $c19.Remote -WithWWW -DuringSyncWrites @(
+        & $late501Write 'BAZA_WWW' (Join-Path $c19.Www 'KZ\2026\late-www.pdf') 50
+    )
+    Test-BRAVOCondition -Condition (
+        $r19.Manual.Success -and $r19.Label -eq 'ПОПЕРЕДЖЕННЯ' -and $r19.ExitCode -eq 10 -and
+        $r19.App.IsComplete -and
+        $r19.Www.NewAfterCutoffCount -eq 1 -and $r19.Www.RealMissingCount -eq 0 -and $r19.Www.IsCompleteWithNewAfterCutoff
+    ) -Name 'Archive/501/S19WwwLateFileDuringWwwSyncIsWarning' `
+      -Failure "файл, створений у WWW під час синхронізації BAZA_WWW, має давати ПОПЕРЕДЖЕННЯ/10; label=$($r19.Label) exit=$($r19.ExitCode) wwwNew=$($r19.Www.NewAfterCutoffCount) wwwReal=$($r19.Www.RealMissingCount)"
+
+    # 20. НЕГАТИВНИЙ КОНТРОЛЬ для WWW: старий (до старту) файл WWW не передано при
+    # коді WinSCP 0 — ПОМИЛКА/50. Файл лише в WWW, щоб FailPaths не зачепили APP.
+    $c20 = & $late501NewCase 'S20'
+    & $late501NewFile (Join-Path $c20.Www 'KZ\2026\www-only-pending.pdf') 300
+    $r20 = & $late501Run -CaseRoot $c20.Root -Remote $c20.Remote -WithWWW -FailPaths @('KZ\2026\www-only-pending.pdf')
+    Test-BRAVOCondition -Condition (
+        -not $r20.Manual.Success -and $r20.Label -eq 'ПОМИЛКА' -and $r20.ExitCode -eq 50 -and
+        $r20.Www.RealMissingCount -eq 1 -and $r20.Www.NewAfterCutoffCount -eq 0
+    ) -Name 'Archive/501/S20WwwPreexistingNotTransferredIsError' `
+      -Failure "непередане старе в WWW має давати ПОМИЛКА/50; label=$($r20.Label) exit=$($r20.ExitCode) wwwReal=$($r20.Www.RealMissingCount) wwwNew=$($r20.Www.NewAfterCutoffCount)"
 
     # ------------------------------------------------------------
     # #501 follow-up: консистентність знімка.
@@ -3468,3 +3497,378 @@ Test-BRAVOCondition -Condition (
     $vssDiskshadowFunctionText.Contains('^[\x20-\x7E]*$')
 ) -Name 'Archive/VSSDiskshadowScriptIsAsciiInAsciiDirectory' `
   -Failure 'New-BRAVOVSSDiskshadowSnapshotSet має брати каталог з Get-BRAVOVSSDiskshadowWorkDirectory (без прямого GetTempPath), перевіряти ASCII-чистоту сценарію і писати його ASCII-кодуванням'
+
+# ============================================================
+# #561 (EXCL-01): виключення з архівації 7-Zip по компонентах — list-файл
+# (-xr@<файл> -scsUTF-8) замість конкатенації шаблонів у командний рядок;
+# порожній список не змінює аргументів. Блок — у власній області.
+# ============================================================
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -Force -ErrorAction Stop
+    $exAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $exFunctionText = @(@('Get-BRAVOArchiveExclusionListPath', 'Get-BRAVOArchiveComponentExclusions', 'Write-BRAVOArchiveExclusionList') | ForEach-Object {
+        $exName = $_
+        @($exAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $exName }, $true)) |
+            ForEach-Object { $_.Extent.Text }
+    }) -join "`r`n"
+    $exSandbox = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_EXCL561_' + [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($exSandbox)
+        $exResults = & {
+            param([string]$FunctionText, [string]$Sandbox)
+            . ([scriptblock]::Create($FunctionText))
+            $out = [ordered]@{}
+            $listPath = Get-BRAVOArchiveExclusionListPath -TemporaryArchivePath (Join-Path $Sandbox 'a.1234.partial.mdz')
+            $out.ListPath = $listPath
+            Write-BRAVOArchiveExclusionList -Path $listPath -Patterns @('*.tmp', 'звіт*.tmp', '?eaDir')
+            $out.Bytes = [IO.File]::ReadAllBytes($listPath)
+            $out.Text = [IO.File]::ReadAllText($listPath, (New-Object System.Text.UTF8Encoding($false)))
+            $badPath = Join-Path $Sandbox 'bad.exclude.txt'
+            try { Write-BRAVOArchiveExclusionList -Path $badPath -Patterns @('*.tmp', '-xr!*'); $out.BadThrew = $false } catch { $out.BadThrew = $true; $out.BadMessage = $_.Exception.Message }
+            $out.BadWritten = [IO.File]::Exists($badPath)
+            $out.Hashtable = @(Get-BRAVOArchiveComponentExclusions -Component 'MODEL' -ComponentSettings @{ Archive = @{ MODEL = $true; Exclusions = @{ MODEL = @('*.tmp', 'desktop.ini'); BLOG = @() } } })
+            $out.MissingNode = @(Get-BRAVOArchiveComponentExclusions -Component 'MODEL' -ComponentSettings @{ Archive = @{ MODEL = $true } })
+            $strictObject = [pscustomobject]@{ Archive = [pscustomobject]@{ MODEL = $true } }
+            # @(& {...}): порожній вивід скриптблока інакше став би $null (а @($null).Count = 1).
+            $out.StrictObject = @(& { Set-StrictMode -Version Latest; Get-BRAVOArchiveComponentExclusions -Component 'BLOG' -ComponentSettings $strictObject })
+            $out.NullSettings = @(Get-BRAVOArchiveComponentExclusions -Component 'BLOG' -ComponentSettings $null)
+            return [pscustomobject]$out
+        } $exFunctionText $exSandbox
+        $exExpectedText = "*.tmp`r`nзвіт*.tmp`r`n?eaDir`r`n"
+        Test-BRAVOCondition -Condition (
+            $exResults.ListPath -like '*.partial.mdz.exclude.txt' -and
+            -not ($exResults.Bytes.Length -ge 3 -and $exResults.Bytes[0] -eq 0xEF) -and $exResults.Text -eq $exExpectedText -and
+            $exResults.BadThrew -and -not $exResults.BadWritten -and $exResults.BadMessage -notlike '*-xr!*'
+        ) -Name 'Archive/ExclusionListFileUtf8WithoutBomAndFailClosed' `
+          -Failure ("list-файл виключень: поруч із тимчасовим архівом (ім'я з .partial для зачистки), UTF-8 без BOM, один шаблон на рядок; недопустимий шаблон — виняток без запису файла й без повторення значення (#561). path=$($exResults.ListPath) threw=$($exResults.BadThrew) written=$($exResults.BadWritten)")
+        Test-BRAVOCondition -Condition (
+            ($exResults.Hashtable -join '|') -eq '*.tmp|desktop.ini' -and @($exResults.MissingNode).Count -eq 0 -and
+            @($exResults.StrictObject).Count -eq 0 -and @($exResults.NullSettings).Count -eq 0
+        ) -Name 'Archive/ExclusionComponentListReadSafely' `
+          -Failure ("componentSettings.Archive.Exclusions.<Компонент> читається з hashtable і pscustomobject; відсутній вузол чи \$null під StrictMode — порожній список, без винятку (#561). hashtable=[$($exResults.Hashtable -join '|')]")
+
+        # Справжній 7za комплекту: -xr@ виключає на будь-якому рівні, юнікод — UTF-8.
+        $exSevenZip = Join-Path $root 'Tools\7za.exe'
+        $exSource = Join-Path $exSandbox 'src'
+        foreach ($exDir in @('SynologyDrive\x', 'Дані', 'sub\#recycle', '@eaDir')) { [void][IO.Directory]::CreateDirectory((Join-Path $exSource $exDir)) }
+        foreach ($exFile in @('a.txt', 'b.tmp', 'desktop.ini', 'SynologyDrive\x\s.txt', 'Дані\звіт.tmp', 'Дані\звіт.docx', 'sub\#recycle\r.txt', 'sub\keep.txt', '@eaDir\e.txt')) {
+            [IO.File]::WriteAllText((Join-Path $exSource $exFile), 'x')
+        }
+        $exList = Join-Path $exSandbox 'list.exclude.txt'
+        [IO.File]::WriteAllText($exList, "*.tmp`r`ndesktop.ini`r`nSynologyDrive`r`n#recycle`r`n?eaDir`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        $exArchive = Join-Path $exSandbox 'out.7z'
+        $exEntries = @()
+        if ([IO.File]::Exists($exSevenZip)) {
+            $exProcess = Start-Process -FilePath $exSevenZip -ArgumentList @('a', '-t7z', "`"$exArchive`"", '-scsUTF-8', "`"-xr@$exList`"", "`"$exSource\*`"") -Wait -PassThru -WindowStyle Hidden
+            $exListing = Join-Path $exSandbox 'listing.txt'
+            $exListProcess = Start-Process -FilePath $exSevenZip -ArgumentList @('l', '-ba', '-slt', '-sccUTF-8', "`"$exArchive`"") -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $exListing
+            $exEntries = @([IO.File]::ReadAllLines($exListing, [Text.Encoding]::UTF8) | Where-Object { $_ -like 'Path = *' } | ForEach-Object { $_.Substring(7) })
+        }
+        $exExpected = @('a.txt', 'sub', 'sub\keep.txt', 'Дані', 'Дані\звіт.docx')
+        Test-BRAVOCondition -Condition (
+            [IO.File]::Exists($exSevenZip) -and $exProcess.ExitCode -eq 0 -and
+            ((@($exEntries | Sort-Object) -join '|') -eq (@($exExpected | Sort-Object) -join '|'))
+        ) -Name 'Archive/ExclusionListAppliedBySevenZipRecursivelyWithUnicode' `
+          -Failure ("7-Zip з -scsUTF-8 -xr@<list> має виключати шаблони на будь-якому рівні (файли й каталоги) і коректно читати юнікодні імена (#561). entries=[$($exEntries -join '|')]")
+
+        # Помічники BRAVO.Compatibility: підрахунок збігів для журналу й маска WinSCP.
+        $exCount = Get-BRAVOExclusionMatchCount -Path ($exSource + '\*') -Patterns @('*.tmp', 'desktop.ini', 'SynologyDrive', '#recycle', '?eaDir')
+        $exEmptyCount = Get-BRAVOExclusionMatchCount -Path $exSource -Patterns @()
+        $exMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.tmp', 'SynologyDrive', 'sub\*.bak')
+        $exEmptyMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @()
+        Test-BRAVOCondition -Condition (
+            $exCount.Files -eq 3 -and $exCount.Directories -eq 3 -and $exEmptyCount.Files -eq 0 -and $exEmptyCount.Directories -eq 0 -and
+            $exMask -eq '|*.tmp;*.tmp/;SynologyDrive;SynologyDrive/;*/sub/*.bak;*/sub/*.bak/' -and $null -eq $exEmptyMask -and
+            (Test-BRAVOExclusionMatch -RelativePath 'a\b\x.TMP' -Patterns @('*.tmp')) -and
+            (Test-BRAVOExclusionMatch -RelativePath 'deep\sub\y.bak' -Patterns @('sub\*.bak')) -and
+            -not (Test-BRAVOExclusionMatch -RelativePath 'keep.txt' -Patterns @('*.tmp'))
+        ) -Name 'Archive/ExclusionMatchCountAndWinSCPMask' `
+          -Failure ("підрахунок збігів (файли/каталоги, збіглий каталог цілком) і маска WinSCP ('|p;p/;...', шлях — '*/p'; порожньо — \$null) (#561). files=$($exCount.Files) dirs=$($exCount.Directories) mask='$exMask'")
+    } finally {
+        if (Test-Path -LiteralPath $exSandbox) { Remove-Item -LiteralPath $exSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Порожній список — аргументи 7-Zip байт-у-байт попередні; непорожній —
+    # лише шлях до list-файлу. Invoke-BRAVOComponentBackup прибирає list-файл,
+    # Main передає список компонента.
+    Test-BRAVOCondition -Condition (
+        $archiveScriptText.Contains('$arguments = "$effectiveArcParams -p `"$fullArchivePath`" `"$SourcePath`""') -and
+        $archiveScriptText.Contains('if (-not [string]::IsNullOrWhiteSpace($ExclusionListPath)) {') -and
+        $archiveScriptText.Contains('$arguments = "$effectiveArcParams -scsUTF-8 `"-xr@$ExclusionListPath`" -p `"$fullArchivePath`" `"$SourcePath`""') -and
+        $archiveScriptText.Contains('-ExclusionListPath $exclusionListPath') -and
+        $archiveScriptText.Contains('Remove-Item -LiteralPath $exclusionListPath -Force -ErrorAction SilentlyContinue') -and
+        $archiveScriptText.Contains('-Exclusions @(Get-BRAVOArchiveComponentExclusions -Component ([string]$archive.Type) -ComponentSettings $componentSettings)')
+    ) -Name 'Archive/ExclusionsReachSevenZipOnlyViaListFile' `
+      -Failure 'New-Archive: без виключень — попередній рядок аргументів; з виключеннями — лише -scsUTF-8 "-xr@<list>"; list-файл прибирається після 7-Zip; Main передає componentSettings.Archive.Exclusions.<Компонент> (#561)'
+}
+
+# ============================================================
+# #560 (CF-01): Windows Cloud Files (On-demand sync) у джерелах бекапу —
+# виявлення віртуальних файлів до 7-Zip, класифікація stderr 7-Zip, пропуск
+# на ОС без Cloud Files API. Біти RECALL_ON_* звичайний процес виставити не
+# може, тому атрибути подаються через shim (-AttributeReader), а корені
+# синхронізації — HKCU-фікстурою (-RegistryPath). Блок — у власній області.
+# ============================================================
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1') -Force -ErrorAction Stop
+    $cfSandbox = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_CF560_' + [guid]::NewGuid().ToString('N'))
+    $cfRegistryRoot = 'HKCU:\Software\BRAVOSelfTest_CF560_' + [guid]::NewGuid().ToString('N')
+    try {
+        # --- Атрибути ---
+        $cfAttributeCases = @(
+            @{ Value = 0x400000; Expected = $true }, @{ Value = 0x40000; Expected = $true },
+            @{ Value = (0x1000 -bor 0x400); Expected = $false }, @{ Value = 0x1000; Expected = $false },
+            @{ Value = 0x80000; Expected = $false }, @{ Value = 0x100000; Expected = $false }, @{ Value = 0x20; Expected = $false })
+        $cfAttributeWrong = @($cfAttributeCases | Where-Object { (Test-BRAVOCloudFilesPlaceholderAttributes -Attributes ([long]$_.Value)) -ne $_.Expected } |
+            ForEach-Object { '0x{0:X}' -f $_.Value })
+        Test-BRAVOCondition -Condition ($cfAttributeWrong.Count -eq 0) `
+            -Name 'Archive/CloudFilesPlaceholderAttributes' `
+            -Failure ("віртуальний файл = RECALL_ON_DATA_ACCESS або RECALL_ON_OPEN; OFFLINE+reparse (HSM/tiering/dedup), OFFLINE, PINNED, UNPINNED — ні (#560). Хибно: $($cfAttributeWrong -join ', ')")
+
+        # --- Обхід джерела через shim атрибутів ---
+        $cfUtf8 = New-Object System.Text.UTF8Encoding($false)
+        $cfSource = Join-Path $cfSandbox 'MODEL'
+        $cfClean = Join-Path $cfSandbox 'BLOG'
+        foreach ($cfDir in @($cfSource, (Join-Path $cfSource 'sub'), (Join-Path $cfSource 'cloudDir'), $cfClean)) { [void][IO.Directory]::CreateDirectory($cfDir) }
+        foreach ($cfFile in @('a.txt', 'sub\b.txt', 'sub\c.txt', 'cloudDir\inside.txt')) { [IO.File]::WriteAllText((Join-Path $cfSource $cfFile), 'x', $cfUtf8) }
+        [IO.File]::WriteAllText((Join-Path $cfClean 'ok.txt'), 'x', $cfUtf8)
+        $cfReader = & {
+            param([string[]]$VirtualNames)
+            {
+                param($Item)
+                $value = [long][int]$Item.Attributes
+                if ($VirtualNames -contains $Item.Name) { $value = $value -bor 0x400000 -bor 0x1000 -bor 0x400 }
+                if ($Item.Name -eq 'inside.txt') { throw 'віртуальний каталог не повинен відкриватися' }
+                return $value
+            }.GetNewClosure()
+        } @('b.txt', 'cloudDir')
+        $cfState = Get-BRAVOCloudFilesSourceState -Path ($cfSource + '\*') -MaxListed 1 -AttributeReader $cfReader
+        $cfStateFull = Get-BRAVOCloudFilesSourceState -Path $cfSource -MaxListed 20 -AttributeReader $cfReader
+        Test-BRAVOCondition -Condition (
+            $cfState.Exists -and $cfState.PlaceholderCount -eq 2 -and $cfState.FilesScanned -eq 2 -and
+            @($cfState.Placeholders).Count -eq 1 -and $cfState.Truncated -and
+            @($cfStateFull.Placeholders) -contains 'sub\b.txt' -and @($cfStateFull.Placeholders) -contains 'cloudDir' -and
+            -not $cfStateFull.Truncated -and $cfStateFull.InaccessibleCount -eq 0
+        ) -Name 'Archive/CloudFilesSourceStateCountsAndLists' `
+          -Failure ("обхід джерела через .NET: віртуальні файли й каталоги рахуються, віртуальний каталог не відкривається, перелік обмежено -MaxListed (#560). count=$($cfState.PlaceholderCount) files=$($cfState.FilesScanned) list=[$(@($cfStateFull.Placeholders) -join '; ')] truncated=$($cfState.Truncated)")
+
+        # Корінь джерела сам віртуальний: знахідка '.' без відкриття каталогу
+        # (усередині лежить inside.txt — shim кидає, якщо його прочитати).
+        $cfVirtualRoot = Join-Path $cfSandbox 'cloudDir'
+        [void][IO.Directory]::CreateDirectory($cfVirtualRoot)
+        [IO.File]::WriteAllText((Join-Path $cfVirtualRoot 'inside.txt'), 'x', $cfUtf8)
+        $cfRootState = Get-BRAVOCloudFilesSourceState -Path ($cfVirtualRoot + '\*') -AttributeReader $cfReader
+        Test-BRAVOCondition -Condition (
+            $cfRootState.Exists -and $cfRootState.PlaceholderCount -eq 1 -and @($cfRootState.Placeholders) -contains '.' -and
+            $cfRootState.FilesScanned -eq 0 -and $cfRootState.InaccessibleCount -eq 0
+        ) -Name 'Archive/CloudFilesVirtualSourceRootNotEnumerated' `
+          -Failure ("віртуальний корінь джерела має бути знахідкою без GetFileSystemInfos() — інакше перелік запускає провайдер або падає під SYSTEM без знахідки (#560). count=$($cfRootState.PlaceholderCount) list=[$(@($cfRootState.Placeholders) -join '; ')] inaccessible=$($cfRootState.InaccessibleCount)")
+
+        # --- Корені синхронізації з реєстру (HKCU-фікстура) ---
+        $cfManager = Join-Path $cfRegistryRoot 'SyncRootManager'
+        $cfOnDemandKey = Join-Path $cfManager 'SynologyDrive!S-1-5-21-1!demo'
+        $cfFullKey = Join-Path $cfManager 'OneDrive!S-1-5-21-1!full'
+        foreach ($cfKey in @($cfOnDemandKey, $cfFullKey)) { [void](New-Item -Path (Join-Path $cfKey 'UserSyncRoots') -Force) }
+        [void](New-ItemProperty -LiteralPath $cfOnDemandKey -Name 'HydrationPolicy' -Value 2 -PropertyType DWord -Force)
+        [void](New-ItemProperty -LiteralPath $cfFullKey -Name 'HydrationPolicy' -Value 3 -PropertyType DWord -Force)
+        [void](New-ItemProperty -LiteralPath (Join-Path $cfOnDemandKey 'UserSyncRoots') -Name 'S-1-5-21-1' -Value (Join-Path $cfSource 'sub') -PropertyType String -Force)
+        [void](New-ItemProperty -LiteralPath (Join-Path $cfFullKey 'UserSyncRoots') -Name 'S-1-5-21-1' -Value 'Z:\Elsewhere' -PropertyType String -Force)
+        $cfRoots = @(Get-BRAVOCloudFilesSyncRoots -RegistryPath $cfManager)
+        $cfSynology = @($cfRoots | Where-Object { $_.Provider -eq 'SynologyDrive' })
+        $cfOneDrive = @($cfRoots | Where-Object { $_.Provider -eq 'OneDrive' })
+        $cfOverlap = Get-BRAVOCloudFilesSourceState -Path $cfSource -SyncRoots $cfRoots -AttributeReader $cfReader
+        $cfMissingRegistry = @(Get-BRAVOCloudFilesSyncRoots -RegistryPath (Join-Path $cfRegistryRoot 'absent'))
+        Test-BRAVOCondition -Condition (
+            $cfRoots.Count -eq 2 -and $cfSynology.Count -eq 1 -and $cfSynology[0].OnDemand -and
+            $cfOneDrive.Count -eq 1 -and -not $cfOneDrive[0].OnDemand -and
+            @($cfOverlap.SyncRootsInSource).Count -eq 1 -and @($cfOverlap.SyncRootsInSource)[0].Provider -eq 'SynologyDrive' -and
+            $cfMissingRegistry.Count -eq 0
+        ) -Name 'Archive/CloudFilesSyncRootsFromRegistry' `
+          -Failure ("корені синхронізації: провайдер з Id до '!', On-demand = не ALWAYS_FULL, перетин із джерелом, відсутній реєстр — порожній список (#560). roots=$($cfRoots.Count) overlap=$(@($cfOverlap.SyncRootsInSource).Count)")
+
+        # Заповнений каталог Cloud Files: reparse point без RECALL_ON_*,
+        # усередині — віртуальний файл. У корені синхронізації його обходимо,
+        # поза коренями (як junction) — ні.
+        $cfPopulatedReader = & {
+            {
+                param($Item)
+                $value = [long][int]$Item.Attributes
+                if ($Item.Name -eq 'sub') { $value = $value -bor 0x400 }
+                if ($Item.Name -eq 'b.txt') { $value = $value -bor 0x400000 }
+                if ($Item.Name -eq 'cloudDir') { $value = $value -bor 0x400000 }
+                return $value
+            }
+        }
+        $cfPopulatedInRoot = Get-BRAVOCloudFilesSourceState -Path $cfSource -SyncRoots $cfRoots -AttributeReader $cfPopulatedReader
+        $cfPopulatedNoRoot = Get-BRAVOCloudFilesSourceState -Path $cfSource -SyncRoots @() -AttributeReader $cfPopulatedReader
+        Test-BRAVOCondition -Condition (
+            @($cfPopulatedInRoot.Placeholders) -contains 'sub\b.txt' -and
+            -not (@($cfPopulatedNoRoot.Placeholders) -contains 'sub\b.txt') -and
+            @($cfPopulatedNoRoot.Placeholders) -contains 'cloudDir'
+        ) -Name 'Archive/CloudFilesPopulatedSyncDirectoryIsInspected' `
+          -Failure ("заповнений каталог Cloud Files (reparse без RECALL_ON_*) у корені синхронізації має обходитися, а reparse-каталог поза коренями — ні (#560). inRoot=[$(@($cfPopulatedInRoot.Placeholders) -join '; ')] noRoot=[$(@($cfPopulatedNoRoot.Placeholders) -join '; ')]")
+
+        # Junction на предка всередині кореня синхронізації — не каталог Cloud
+        # Files: обхід у нього не заходить (інакше цикл до вичерпання ресурсів
+        # ще до VSS; рев'ю PR #563). Junction створюється без прав адміністратора.
+        $cfLoopRoot = Join-Path $cfSandbox 'LOOP'
+        [void][IO.Directory]::CreateDirectory((Join-Path $cfLoopRoot 'inner'))
+        [IO.File]::WriteAllText((Join-Path $cfLoopRoot 'inner\f.txt'), 'x', $cfUtf8)
+        $cfJunction = Join-Path $cfLoopRoot 'inner\back'
+        $cfJunctionOutput = & cmd.exe /c mklink /J "$cfJunction" "$cfLoopRoot" 2>&1
+        $cfJunctionCreated = [IO.Directory]::Exists($cfJunction) -and
+            (([IO.File]::GetAttributes($cfJunction) -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $cfLoopRoots = @([pscustomobject]@{ Id = 'X!S!loop'; Provider = 'X'; UserSid = 'S'; Path = $cfLoopRoot; HydrationPolicy = $null; OnDemand = $true })
+        $cfLoopWatch = [Diagnostics.Stopwatch]::StartNew()
+        $cfLoopState = Get-BRAVOCloudFilesSourceState -Path $cfLoopRoot -SyncRoots $cfLoopRoots
+        $cfLoopWatch.Stop()
+        if ($cfJunctionCreated) { [IO.Directory]::Delete($cfJunction) }
+        Test-BRAVOCondition -Condition (
+            $cfJunctionCreated -and $cfLoopState.FilesScanned -eq 1 -and $cfLoopState.PlaceholderCount -eq 0 -and $cfLoopWatch.Elapsed.TotalSeconds -lt 30
+        ) -Name 'Archive/CloudFilesJunctionInsideSyncRootNotTraversed' `
+          -Failure ("junction/symlink усередині кореня синхронізації не має обходитися як каталог Cloud Files (цикл на предка) (#560, PR #563). created=$cfJunctionCreated files=$($cfLoopState.FilesScanned) ms=$($cfLoopWatch.ElapsedMilliseconds) mklink=[$($cfJunctionOutput -join ' ')]")
+
+        # Віртуальний корінь джерела визначається лише за атрибутами кореня — до
+        # перевірки шляхів і read probe у Main.
+        $cfRootTypesAst = @([System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null).FindAll({ param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOArchiveCloudPlaceholderRootTypes' }, $true))
+        $cfRootTypes = @(& {
+            param([string]$FunctionText, [object[]]$Archives, [scriptblock]$Reader)
+            . ([scriptblock]::Create($FunctionText))
+            Get-BRAVOArchiveCloudPlaceholderRootTypes -Archives $Archives -OSVersion (New-Object Version(10, 0, 19045)) -AttributeReader $Reader
+        } $(if ($cfRootTypesAst.Count -eq 1) { $cfRootTypesAst[0].Extent.Text } else { 'function Get-BRAVOArchiveCloudPlaceholderRootTypes { @() }' }) @(
+            @{ Type = 'MODEL'; Source = ($cfSource + '\*') },
+            @{ Type = 'BRAVOEXCH'; Source = ((Join-Path $cfSandbox 'cloudDir') + '\*') },
+            @{ Type = 'BLOG'; Source = (Join-Path $cfSandbox 'absent\*') }) $cfReader)
+        $cfRootTypesCall = $archiveScriptText.IndexOf('$cloudPlaceholderRootTypes = @(Get-BRAVOArchiveCloudPlaceholderRootTypes -Archives $enabledArchives)')
+        $cfSourcePathCheck = $archiveScriptText.IndexOf('-Description "Джерело архiву $($archive.Type) мiстить данi"')
+        $cfSourceProbeSkip = $archiveScriptText.IndexOf('if ($cloudPlaceholderRootTypes -contains [string]$archive.Type) { continue }')
+        $cfSourceProbeLoop = $archiveScriptText.IndexOf('$readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probeGroup.Path)')
+        Test-BRAVOCondition -Condition (
+            $cfRootTypes.Count -eq 1 -and $cfRootTypes[0] -eq 'BRAVOEXCH' -and
+            $cfRootTypesCall -gt 0 -and $cfRootTypesCall -lt $cfSourcePathCheck -and
+            $cfSourceProbeSkip -gt $cfRootTypesCall -and $cfSourceProbeSkip -lt $cfSourceProbeLoop
+        ) -Name 'Archive/CloudFilesVirtualRootSkipsPathAndProbeEnumeration' `
+          -Failure ("віртуальний корінь джерела визначається за атрибутами кореня до Test-PathWithLog (wildcard = перелік) і виключається з SYSTEM read probe, щоб рішення ухвалив preflight Cloud Files (#560). types=[$($cfRootTypes -join ', ')]")
+
+        # --- Preflight Archive: обидві політики й пропуск на старій ОС ---
+        $cfAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+        $cfPreflightAst = @($cfAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BRAVOArchiveCloudPlaceholderPreflight' }, $true))
+        $cfPreflightText = $(if ($cfPreflightAst.Count -eq 1) { $cfPreflightAst[0].Extent.Text } else { '' })
+        $cfPreflightRun = {
+            param([string]$FunctionText, [string]$Policy, [object[]]$Archives, [scriptblock]$Reader, [Version]$OS, [string]$Registry)
+            $log = New-Object System.Collections.Generic.List[object]
+            function Write-BRAVOLog { param([string]$Message, [string]$Level = 'INFO', [string]$Component) $log.Add([pscustomobject]@{ Level = $Level; Message = $Message }) }
+            . ([scriptblock]::Create($FunctionText))
+            $findings = @(Invoke-BRAVOArchiveCloudPlaceholderPreflight -Archives $Archives -Policy $Policy -AttributeReader $Reader -OSVersion $OS -SyncRootRegistryPath $Registry)
+            return [pscustomobject]@{ Findings = $findings; Log = @($log.ToArray()) }
+        }
+        $cfArchives = @(@{ Type = 'MODEL'; Source = ($cfSource + '\*') }, @{ Type = 'BLOG'; Source = ($cfClean + '\*') })
+        $cfWin10 = New-Object Version(10, 0, 19045)
+        $cfFail = & $cfPreflightRun $cfPreflightText 'Fail' $cfArchives $cfReader $cfWin10 $cfManager
+        $cfWarn = & $cfPreflightRun $cfPreflightText 'Warn' $cfArchives $cfReader $cfWin10 $cfManager
+        $cfDefault = & $cfPreflightRun $cfPreflightText 'unexpected' $cfArchives $cfReader $cfWin10 $cfManager
+        $cfFailError = @($cfFail.Log | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -like 'CloudPlaceholdersInSource: MODEL:*' -and $_.Message -like '*sub\b.txt*' })
+        $cfWarnLine = @($cfWarn.Log | Where-Object { $_.Level -eq 'WARNING' -and $_.Message -like 'CloudPlaceholdersInSource: MODEL:*Warn*' })
+        Test-BRAVOCondition -Condition (
+            $cfPreflightText.Length -gt 0 -and
+            @($cfFail.Findings).Count -eq 1 -and $cfFail.Findings[0].Type -eq 'MODEL' -and $cfFail.Findings[0].Blocked -and
+            $cfFail.Findings[0].PlaceholderCount -eq 2 -and $cfFailError.Count -eq 1 -and
+            @($cfWarn.Findings).Count -eq 1 -and -not $cfWarn.Findings[0].Blocked -and $cfWarnLine.Count -eq 1 -and
+            @($cfDefault.Findings).Count -eq 1 -and $cfDefault.Findings[0].Blocked -and
+            @($cfFail.Log | Where-Object { $_.Level -eq 'WARNING' -and $_.Message -like '*SynologyDrive*' }).Count -eq 1
+        ) -Name 'Archive/CloudPlaceholderPreflightPolicies' `
+          -Failure ("preflight: Fail (і невідоме значення) блокує компонент із віртуальними файлами з причиною CloudPlaceholdersInSource і переліком у журналі, Warn — WARNING без блокування; чисте джерело — без знахідок; корінь синхронізації в джерелі — WARNING (#560). fail=$(@($cfFail.Findings).Count) warn=$(@($cfWarn.Findings).Count) log=[$((@($cfFail.Log) | ForEach-Object { $_.Level + ':' + $_.Message }) -join ' | ')]")
+
+        $cfThrowingReader = { param($Item) throw 'на ОС без Cloud Files API обхід не виконується' }
+        $cfWin7 = & $cfPreflightRun $cfPreflightText 'Fail' $cfArchives $cfThrowingReader (New-Object Version(6, 1, 7601)) $cfManager
+        Test-BRAVOCondition -Condition (
+            @($cfWin7.Findings).Count -eq 0 -and
+            @($cfWin7.Log | Where-Object { $_.Level -eq 'INFO' -and $_.Message -like '*пропущено*' }).Count -eq 1 -and
+            @($cfWin7.Log | Where-Object { $_.Level -ne 'INFO' }).Count -eq 0 -and
+            -not (Get-BRAVOCloudFilesSupport -OSVersion (New-Object Version(10, 0, 14393))).Supported -and
+            (Get-BRAVOCloudFilesSupport -OSVersion (New-Object Version(10, 0, 16299))).Supported
+        ) -Name 'Archive/CloudFilesSkippedWithInfoOnOldWindows' `
+          -Failure ("Windows без Cloud Files API (Win7 6.1, Server 2016 build 14393): перевірка пропускається з INFO, без обходу й без збою; з build 16299 — виконується (#560). log=[$((@($cfWin7.Log) | ForEach-Object { $_.Level + ':' + $_.Message }) -join ' | ')]")
+
+        # --- Класифікація stderr 7-Zip ---
+        $cfStderrCases = @(
+            @{ Text = "ERROR: The cloud file provider is not running.`r`nD:\BRAVOEXCH\a.dat"; Code = 'CloudFilesProviderUnavailable' },
+            @{ Text = 'ПОМИЛКА: Поставщик облачных файлов не запущен.'; Code = 'CloudFilesProviderUnavailable' },
+            @{ Text = 'WARNING: Access is denied. : D:\MODEL\x.mdb'; Code = 'SourceAccessDenied' },
+            @{ Text = 'The process cannot access the file because it is being used by another process.'; Code = 'SourceFileLocked' },
+            @{ Text = 'ERROR: The filename or extension is too long.'; Code = 'SourcePathTooLong' },
+            @{ Text = 'Unexpected end of archive'; Code = $null },
+            @{ Text = ''; Code = $null })
+        $cfStderrWrong = @()
+        foreach ($cfCase in $cfStderrCases) {
+            $cfReason = Get-BRAVOSevenZipFailureReason -StandardError $cfCase.Text -StandardOutput ''
+            $cfActual = $(if ($null -eq $cfReason) { $null } else { [string]$cfReason.ReasonCode })
+            if ($cfActual -ne $cfCase.Code -or ($null -ne $cfReason -and [string]::IsNullOrWhiteSpace([string]$cfReason.Hint))) {
+                $cfStderrWrong += ("'{0}' -> '{1}' (очікувалось '{2}')" -f $cfCase.Text, $cfActual, $cfCase.Code)
+            }
+        }
+        Test-BRAVOCondition -Condition ($cfStderrWrong.Count -eq 0) `
+            -Name 'Archive/SevenZipStderrClassifiedToReasonCode' `
+            -Failure ("stderr 7-Zip відомих збоїв джерела -> код причини з підказкою; невідомий текст — без класифікації (#560): $($cfStderrWrong -join '; ')")
+    } finally {
+        if (Test-Path -LiteralPath $cfSandbox) { Remove-Item -LiteralPath $cfSandbox -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $cfRegistryRoot) { Remove-Item -LiteralPath $cfRegistryRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- Підключення в Archive / Health / BRAVO_TASKS_DIAGNOSE (статично) ---
+    $cfPreflightCall = $archiveScriptText.IndexOf('Invoke-BRAVOArchiveCloudPlaceholderPreflight `')
+    $cfVssCall = $archiveScriptText.IndexOf('$generationSnapshotSet = New-BRAVOVSSSnapshotSet `')
+    $cfHealthText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $cfDiagnoseText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition -Condition (
+        $cfPreflightCall -gt 0 -and $cfVssCall -gt $cfPreflightCall -and
+        $archiveScriptText.Contains("`$backupConsistency.Contains('CloudPlaceholderPolicy')") -and
+        $archiveScriptText.Contains('-Policy $cloudPlaceholderPolicy)') -and
+        $archiveScriptText.Contains("ErrorStage = 'CLOUDFILES'") -and
+        $archiveScriptText.Contains('$sevenZipFailureReason = Get-BRAVOSevenZipFailureReason -StandardError $errorOutput -StandardOutput $standardOutput') -and
+        $archiveScriptText.Contains("ReasonCode = `$(if (`$null -ne `$component.PSObject.Properties['ReasonCode']") -and
+        $archiveScriptText.Contains('$summaryReason = if (-not [string]::IsNullOrWhiteSpace($failedReasonCode))') -and
+        $cfHealthText.Contains('[void](Write-BRAVOHealthCloudFilesWarnings -ArchiveDefinitions @(Get-BRAVOHealthExpectedArchiveDefinitions))') -and
+        $cfHealthText.Contains("`$component.Value.PSObject.Properties['ReasonCode']") -and
+        $cfDiagnoseText.Contains('=== CLOUD FILES У ДЖЕРЕЛАХ БЕКАПУ (#560, лише читання) ===')
+    ) -Name 'Archive/CloudFilesWiredIntoArchiveHealthDiagnose' `
+      -Failure 'preflight Cloud Files має стояти до VSS Snapshot Set і брати backupConsistency.CloudPlaceholderPolicy; збій 7-Zip — класифікуватися Get-BRAVOSevenZipFailureReason; ReasonCode — у manifest і РЕЗУЛЬТАТ; Health і BRAVO_TASKS_DIAGNOSE — попереджати (#560)'
+
+    # Health: код причини з manifest поруч з етапом збою.
+    $cfHealthAst = [System.Management.Automation.Language.Parser]::ParseInput($cfHealthText, [ref]$null, [ref]$null)
+    $cfStageAst = @($cfHealthAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOHealthManifestFailedStage' }, $true))
+    $cfStageResults = & {
+        param([string]$FunctionText)
+        . ([scriptblock]::Create($FunctionText))
+        $withReason = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{
+            BRAVOEXCH = [pscustomobject]@{ ErrorStage = 'CLOUDFILES'; ReasonCode = 'CloudPlaceholdersInSource' } } })
+        $withoutReason = Get-BRAVOHealthManifestFailedStage -Manifest ([pscustomobject]@{ components = [pscustomobject]@{
+            MODEL = [pscustomobject]@{ ErrorStage = 'CREATE'; ReasonCode = $null } } })
+        return @($withReason, $withoutReason)
+    } $(if ($cfStageAst.Count -eq 1) { $cfStageAst[0].Extent.Text } else { 'function Get-BRAVOHealthManifestFailedStage { "" }' })
+    Test-BRAVOCondition -Condition (
+        $cfStageResults[0] -eq 'BRAVOEXCH/CLOUDFILES (CloudPlaceholdersInSource)' -and $cfStageResults[1] -eq 'MODEL/CREATE'
+    ) -Name 'Health/ManifestFailedStageShowsReasonCode' `
+      -Failure ("Health має показувати код причини з manifest поруч з етапом збою, а без коду — як раніше (#560): [$($cfStageResults -join ' | ')]")
+
+    # Фінальна подія Operations несе класифіковані причини компонентів.
+    $cfArchiveAst = [System.Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $cfReasonsAst = @($cfArchiveAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-BRAVOArchiveComponentReasons' }, $true))
+    $cfReasons = @(& {
+        param([string]$FunctionText)
+        . ([scriptblock]::Create($FunctionText))
+        Get-BRAVOArchiveComponentReasons -Results @{
+            MODEL = @{ ArchiveSuccess = $true; ToolFailure = $null }
+            BRAVOEXCH = @{ ArchiveSuccess = $false; ToolFailure = [pscustomobject]@{ Tool = 'Cloud Files'; ReasonCode = 'CloudPlaceholdersInSource'; ReasonText = 'CloudPlaceholdersInSource: 3' } }
+            BLOG = @{ ArchiveSuccess = $false; ToolFailure = [pscustomobject]@{ Tool = '7-Zip'; ToolExitCodeText = '2'; ReasonText = '7-Zip код 2' } }
+        }
+    } $(if ($cfReasonsAst.Count -eq 1) { $cfReasonsAst[0].Extent.Text } else { 'function Get-BRAVOArchiveComponentReasons { @() }' }))
+    Test-BRAVOCondition -Condition (
+        $cfReasons.Count -eq 1 -and $cfReasons[0].component -eq 'BRAVOEXCH' -and $cfReasons[0].reasonCode -eq 'CloudPlaceholdersInSource' -and
+        $archiveScriptText.Contains('componentReasons = @(Get-BRAVOArchiveComponentReasons -Results $results)') -and
+        $archiveScriptText.Contains('-Details ("CloudPlaceholdersInSource: {0} віртуальних файлів" -f $cloudFinding.PlaceholderCount)') -and
+        $archiveScriptText.Contains('-Details $archiveStepReasonCode')
+    ) -Name 'Archive/OperationsEventCarriesComponentReasons' `
+      -Failure ("фінальна подія Operations має нести класифіковані причини компонентів (componentReasons), а крок архівації — код причини в Details; компоненти без коду не потрапляють у перелік (#560). reasons=$($cfReasons.Count)")
+}

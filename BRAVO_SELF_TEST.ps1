@@ -9610,6 +9610,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             "Get-BRAVOCollisionSafeGenerationId",
             "New-BRAVOTemporaryArchivePath",
             "Remove-BRAVOTemporaryArchiveArtifacts",
+            "Get-BRAVOArchiveExclusionListPath",
+            "Get-BRAVOArchiveComponentExclusions",
+            "Write-BRAVOArchiveExclusionList",
             "Write-BRAVOFinalHashFile",
             "Invoke-BRAVOComponentBackup",
             "Remove-BRAVOWinSCPSensitiveTemporaryScript",
@@ -26539,6 +26542,12 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
     # (Test-BRAVOSevenZipArchiveSpecificFailure, BRAVO.Compatibility), а
     # обидва споживачі викликають його. Дубль у двох модулях уже розходився б
     # при наступній правці одного з них (fail-open в одному шляху).
+    # #560: Get-BRAVOSevenZipFailureReason (BRAVO.Compatibility) — другий,
+    # ЯВНО дозволений власник літерала 'being used by another process'. Він
+    # не вирішує «архів чи середовище» для перевірки цілісності (це лише
+    # канонічний класифікатор нижче), а дає код причини й підказку оператору
+    # для збою СТВОРЕННЯ архіву (SourceFileLocked). Будь-який третій власник —
+    # провал, як і раніше.
     $sz394LiteralOwners = New-Object System.Collections.Generic.List[string]
     $sz394CallersFound = New-Object System.Collections.Generic.List[string]
     $sz394CanonicalName = 'Test-BRAVOSevenZipArchiveSpecificFailure'
@@ -26590,9 +26599,10 @@ function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchi
     $sz394DistinctOwners = @($sz394LiteralOwners | Sort-Object -Unique)
     Test-BRAVOCondition `
         -Condition (
-            $sz394LiteralOwners.Count -eq 2 -and
-            $sz394DistinctOwners.Count -eq 1 -and
-            $sz394DistinctOwners[0] -ceq "BRAVO.Compatibility.psm1:$sz394CanonicalName" -and
+            @($sz394LiteralOwners | Where-Object { $_ -ceq "BRAVO.Compatibility.psm1:$sz394CanonicalName" }).Count -eq 2 -and
+            @($sz394LiteralOwners | Where-Object { $_ -ceq 'BRAVO.Compatibility.psm1:Get-BRAVOSevenZipFailureReason' }).Count -eq 1 -and
+            $sz394LiteralOwners.Count -eq 3 -and
+            $sz394DistinctOwners.Count -eq 2 -and
             $sz394CallersFound.Contains('BRAVO.ArchiveHelpers.psm1:Test-SevenZipArchiveIntegrity') -and
             $sz394CallersFound.Contains('BRAVO.Compatibility.psm1:Invoke-BRAVOSevenZipIntegrityTest')
         ) `
