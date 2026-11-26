@@ -491,6 +491,11 @@ function Get-BRAVODirectories {
 }
 
 function Get-BRAVOFileHash {
+    # #498: власне хешування через FileStream з буфером 1 MiB замість
+    # Get-FileHash (читає по 4 KB). Контракт той самий: -LiteralPath,
+    # відсутній шлях кидає виняток, каталог мовчки дає нічого (як Get-FileHash),
+    # фабрика хешера в тому ж порядку, що й Get-FileHash, для сумісності з FIPS
+    # (${Algorithm}CryptoServiceProvider, а не SHA512Managed).
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -498,29 +503,49 @@ function Get-BRAVOFileHash {
         [string]$Algorithm = "SHA512"
     )
 
-    if (Test-BRAVOCommandAvailable -Name "Get-FileHash") {
-        return Get-FileHash -LiteralPath $Path -Algorithm $Algorithm -ErrorAction Stop
-    }
-
+    $bufferSize = 1048576  # #498: 1 MiB, а не 4 MiB (LOH, 32-бітні хости)
     $stream = $null
     $hasher = $null
     try {
-        $stream = [System.IO.File]::Open(
-            $Path,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::Read
-        )
-        $hasher = [System.Security.Cryptography.HashAlgorithm]::Create($Algorithm)
+        $resolved = @(Resolve-Path -LiteralPath $Path -ErrorAction Stop | ForEach-Object { $_.ProviderPath })
+        if ($resolved.Count -ne 1) {
+            throw "Шлях має вказувати рівно на один елемент: $Path"
+        }
+        $p = $resolved[0]
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            return
+        }
+
+        $hasherType = "System.Security.Cryptography.${Algorithm}CryptoServiceProvider" -as [Type]
+        if ($null -ne $hasherType) {
+            $hasher = New-Object -TypeName $hasherType.FullName
+        } else {
+            $algorithmType = "System.Security.Cryptography.$Algorithm" -as [Type]
+            if ($null -ne $algorithmType) {
+                $hasher = $algorithmType::Create()
+            }
+        }
         if ($null -eq $hasher) {
             throw "Алгоритм хешування не підтримується: $Algorithm"
         }
+        $stream = New-Object -TypeName System.IO.FileStream -ArgumentList @(
+            $p,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            [int]$bufferSize,
+            [System.IO.FileOptions]::SequentialScan
+        ) -ErrorAction Stop
         $hashBytes = $hasher.ComputeHash($stream)
         return New-Object PSObject -Property @{
             Algorithm = $Algorithm
             Hash = ([System.BitConverter]::ToString($hashBytes)).Replace("-", "")
-            Path = (Resolve-Path -LiteralPath $Path).Path
+            Path = $p
         }
+    } catch {
+        # Помилка конструктора (statement-terminating) без зовнішнього try інакше
+        # дала б мовчазний $null; перекидаємо як завершальний виняток.
+        throw
     } finally {
         if ($null -ne $hasher) {
             $hasher.Dispose()
