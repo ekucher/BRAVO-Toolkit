@@ -11,6 +11,7 @@
         'Get-BRAVOConfigurationSchemaVersionDeclarationLine',
         'Test-BRAVOConfigurationOverrideAuthorization',
         'Test-BRAVOExclusionPattern',
+        'Test-BRAVOSyncExclusionPattern',
         'Get-BRAVOConfigurationSchemaAuthorizationClass',
         'Test-BRAVOConfigurationAuthorizationValidatorValue',
         'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed',

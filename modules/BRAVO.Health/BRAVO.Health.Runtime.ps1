@@ -3187,7 +3187,7 @@ function Get-BAZAHealthExclusionFailure {
     param([string[]]$Exclusions = @())
 
     foreach ($exclusionPattern in @($Exclusions)) {
-        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        $exclusionProblem = Test-BRAVOSyncExclusionPattern -Pattern $exclusionPattern
         if ($null -ne $exclusionProblem) {
             return [pscustomobject]@{
                 Success = $false

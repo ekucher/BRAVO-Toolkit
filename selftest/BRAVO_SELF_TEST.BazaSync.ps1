@@ -3085,12 +3085,22 @@
               -Failure "резолвер не має падати без вузла Exclusions (змінна відсутня/hashtable/pscustomobject); absent='$ex561Absent' hash='$ex561EmptyHash' noExclHash='$ex561NoExclHash' noExclObj='$ex561NoExclObj' nullSync='$ex561NullSync' (#561)"
 
             $ex561WithHash = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('*.log', 'cache'); BAZA_WWW = @() } } })
-            $ex561WithObj = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = [pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_APP = @(); BAZA_WWW = @('tmp*', 'a\b') } } }))
+            $ex561WithObj = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = [pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_APP = @(); BAZA_WWW = @('tmp*', 'b') } } }))
             $ex561WithScalar = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = '*.log' } } })
             Test-BRAVOCondition -Condition (
-                $ex561WithHash -eq '*.log,cache|' -and $ex561WithObj -eq '|tmp*,a\b' -and $ex561WithScalar -eq '*.log|'
+                $ex561WithHash -eq '*.log,cache|' -and $ex561WithObj -eq '|tmp*,b' -and $ex561WithScalar -eq '*.log|'
             ) -Name 'BazaSync/ExclusionResolverReadsPerComponentListsFromHashtableAndObject' `
               -Failure "резолвер має віддавати списки BAZA_APP/BAZA_WWW окремо (hashtable, pscustomobject, скаляр); hash='$ex561WithHash' obj='$ex561WithObj' scalar='$ex561WithScalar' (#561)"
+
+            # EXCL-02: рантайм-резолвер (ArchiveRuntime) теж відхиляє шлях у виключеннях SFTP —
+            # маска WinSCP зі шляхом не прив'язується до кореня синхронізації.
+            $ex02PathWww = & $ex561Shape (& $ex561Resolve ([pscustomobject]@{ Synchronization = [pscustomobject]@{ Exclusions = [pscustomobject]@{ BAZA_WWW = @('a\b') } } }))
+            $ex02PathApp = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('sub/x.log') } } })
+            $ex02TrailingDot = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('*.') } } })
+            Test-BRAVOCondition -Condition (
+                $ex02PathWww -like 'ERR:*BAZA_WWW*fail closed*' -and $ex02PathApp -like 'ERR:*BAZA_APP*fail closed*' -and $ex02TrailingDot -like 'ERR:*BAZA_APP*fail closed*'
+            ) -Name 'BazaSync/ExclusionResolverRefusesPathAndTrailingDotForSftp' `
+              -Failure "Get-BRAVOBazaSettingsEffective мусить відхиляти шлях і кінцеву крапку у виключеннях SFTP (fail closed); www='$ex02PathWww' app='$ex02PathApp' dot='$ex02TrailingDot' (EXCL-02)"
 
             $ex561BadDotDot = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_APP = @('..\evil') } } })
             $ex561BadPipe = & $ex561Shape (& $ex561Resolve @{ Synchronization = @{ Exclusions = @{ BAZA_WWW = @('a|b') } } })
@@ -3300,6 +3310,19 @@
             $ex561LegacyBad.Returned -eq $false -and $null -eq $ex561LegacyBad.Probe.Script -and $ex561LegacyBad.Probe.ComparisonCalls -eq 0
         ) -Name 'BazaSync/ExclusionLegacyInvalidPatternNeverReachesWinSCP' `
           -Failure "legacy: невалідний шаблон -> false, жодного скрипта WinSCP і жодного порівняння; returned=$($ex561LegacyBad.Returned) comparisons=$($ex561LegacyBad.Probe.ComparisonCalls) (#561)"
+        # EXCL-02: шлях-шаблон не прив'язати до кореня в масці WinSCP (повний шлях => збіг і над коренем:
+        # корінь ...\BAZA + 'BAZA/file' виключив би ...\BAZA\file, а локальний збіг — ні). Fail closed: до WinSCP
+        # не йде ні скрипт, ні порівняння, файл не лишається «пропущеним, але очікуваним як завантажений».
+        $ex561LegacyPath = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction "@('BAZA/file')" $ex561SyncDir)
+        $ex561MaskThrew = $false
+        try { [void](ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('BAZA/file')) } catch { $ex561MaskThrew = $true }
+        $ex561MaskNames = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.log', 'cache')
+        Test-BRAVOCondition -Condition (
+            $ex561LegacyPath.Returned -eq $false -and $null -eq $ex561LegacyPath.Probe.Script -and $ex561LegacyPath.Probe.ComparisonCalls -eq 0 -and
+            $ex561MaskThrew -and $ex561MaskNames -eq '|*.log;*.log/;cache;cache/' -and
+            -not (Test-BRAVOExclusionMatch -RelativePath 'file' -Patterns @('BAZA/file'))
+        ) -Name 'BazaSync/ExclusionPathPatternNeverReachesWinSCPAnchoredToRoot' `
+          -Failure "шлях-шаблон ('BAZA/file') для WinSCP має бути відхилений (returned=$($ex561LegacyPath.Returned), script=$($ex561LegacyPath.Probe.Script), mask threw=$ex561MaskThrew); маска лише для імен '$ex561MaskNames' (EXCL-02, рев'ю PR #564)"
         $ex561OnlyExcludedDir = Join-Path $ex561Root 'legacy-only-excluded'
         [void](New-BRAVOSelfTestBazaFile -Directory $ex561OnlyExcludedDir -RelativePath 'only.log' -SizeBytes 10)
         $ex561LegacyOnlyExcluded = & $ex561Run $ex561SyncStubs $ex561SyncFunctions (& $ex561MakeLegacyAction "@('*.log')" $ex561OnlyExcludedDir 'true')
@@ -3348,6 +3371,14 @@
             $ex561ArchiveCompare.Success -eq $false -and ([string]$ex561ArchiveCompare.Error).Contains('..\evil')
         ) -Name 'BazaSync/ExclusionArchiveComparisonInvalidPatternRefused' `
           -Failure "Get-BAZASFTPComparison: невалідний шаблон -> Success=false до відкриття сесії; Error=$($ex561ArchiveCompare.Error) (#561)"
+
+        $ex561ArchiveComparePath = & $ex561Run 'function Write-BRAVOLog {}' @($ex561ArchiveFn['Get-BAZASFTPComparison']) ([scriptblock]::Create(@'
+            Get-BAZASFTPComparison -LocalPath 'C:\x' -RemotePath '/x' -RepositorySFTPUrl 'sftp://u@h/' -HostKey 'k' -Exclusions @('sub\file')
+'@))
+        Test-BRAVOCondition -Condition (
+            $ex561ArchiveComparePath.Success -eq $false -and ([string]$ex561ArchiveComparePath.Error).Contains('sub\file')
+        ) -Name 'BazaSync/ExclusionArchiveComparisonPathPatternRefused' `
+          -Failure "Get-BAZASFTPComparison: шлях-шаблон для WinSCP -> Success=false до відкриття сесії; Error=$($ex561ArchiveComparePath.Error) (EXCL-02)"
 
         # Health: CLI-fallback додає той самий -filemask; порожній список - команда без змін.
         $ex561HealthStubs = @'

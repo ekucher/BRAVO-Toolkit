@@ -1821,7 +1821,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
             $authProbeValue = 'probe-value'
         } elseif ($authValidatorId -eq 'SshHostKeyFingerprint') {
             $authProbeValue = 'ssh-ed25519 255 AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/AbCdE'
-        } elseif ($authValidatorId -eq 'ExclusionPatternList') {
+        } elseif ($authValidatorId -eq 'ExclusionPatternList' -or $authValidatorId -eq 'SyncExclusionPatternList') {
             $authProbeValue = @('*.tmp', 'desktop.ini')
         }
         try {
@@ -3411,7 +3411,7 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
     & {
         $exclAccepted = @('*.tmp', 'desktop.ini', '~$*', '#recycle', '?eaDir', 'sub\*.bak', 'a/b/c.txt', 'Дані', 'звіт*.docx', 'SynologyDrive', '.SynologyWorkingDirectory')
         $exclRejected = @('', ' a', 'a ', 'C:\x', 'x:y', '\x', '/x', '..\x', 'a\..\b', 'a\.\b', 'a\', 'a/', 'a\\b', '-x!*', '-p123', '@list', '!x',
-            'a"b', "a'b", 'a`b', 'a%b%', '*.*', 'report.*', 'sub\*.*', 'a|b', 'a;b', 'a,b', 'a<b', 'a>b', 'a[b]', 'a=b', ("a" + [char]9 + "b"), ("a" + [char]0 + "b"), ('x' * 201))
+            'a"b', "a'b", 'a`b', 'a%b%', '*.*', 'report.*', 'sub\*.*', '*.', 'a.', 'sub\x.', 'a.\b', 'a|b', 'a;b', 'a,b', 'a<b', 'a>b', 'a[b]', 'a=b', ("a" + [char]9 + "b"), ("a" + [char]0 + "b"), ('x' * 201))
         $exclWrongAccepted = @($exclAccepted | Where-Object { $null -ne (Test-BRAVOExclusionPattern -Pattern $_) })
         $exclWrongRejected = @($exclRejected | Where-Object { $null -eq (Test-BRAVOExclusionPattern -Pattern $_) } | ForEach-Object { '[' + ($_ -replace '[\x00-\x1F]', '?') + ']' })
         $exclNonString = Test-BRAVOExclusionPattern -Pattern 123
@@ -3419,6 +3419,25 @@ if (Enter-BRAVOSelfTestSection -Name 'Configuration/Authorization') { try {
             -Condition ($exclWrongAccepted.Count -eq 0 -and $exclWrongRejected.Count -eq 0 -and $null -ne $exclNonString) `
             -Name 'Authorization/ExclusionPatternValidatorRejectsForbiddenForms' `
             -Failure ("Test-BRAVOExclusionPattern: дозволено лише ім'я або відносний шаблон із * і ? (юнікод — так); абсолютні шляхи, .., порожні сегменти, кінцевий роздільник, керівні символи, пробіли на краях, лапки, | ; , < > [ ] : =, префікси - @ ! і нерядкові значення — відмова (#561). Хибно відхилено: [$($exclWrongAccepted -join ', ')]; хибно прийнято: $($exclWrongRejected -join ', ')")
+
+        # EXCL-02 (#561, рев'ю бота PR #564): WinSCP-маска не прив'язується до кореня синхронізації, тож для
+        # Synchronization.Exclusions дозволено лише імена (без роздільника); шлях — fail closed.
+        $exclSyncRejected = @('sub\x', 'a/b', 'BAZA/file', '*\x.tmp', '*.', 'a.', '..\x', 'a;b')
+        $exclSyncAccepted = @('*.tmp', 'desktop.ini', 'cache', '?eaDir', 'Дані')
+        $exclSyncWrongAccepted = @($exclSyncRejected | Where-Object { $null -eq (Test-BRAVOSyncExclusionPattern -Pattern $_) })
+        $exclSyncWrongRejected = @($exclSyncAccepted | Where-Object { $null -ne (Test-BRAVOSyncExclusionPattern -Pattern $_) })
+        Test-BRAVOCondition `
+            -Condition ($exclSyncWrongAccepted.Count -eq 0 -and $exclSyncWrongRejected.Count -eq 0 -and $null -ne (Test-BRAVOSyncExclusionPattern -Pattern 5)) `
+            -Name 'Authorization/SyncExclusionPatternRejectsPathsAndTrailingDot' `
+            -Failure ("Test-BRAVOSyncExclusionPattern: для WinSCP лише імена без роздільника, сегмент на '.' відхиляється (EXCL-02). Хибно прийнято: [$($exclSyncWrongAccepted -join ', ')]; хибно відхилено: [$($exclSyncWrongRejected -join ', ')]")
+        $exclSyncList = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'SyncExclusionPatternList' -Value @('*.tmp', 'BAZA/file') -Path 'componentSettings.Synchronization.Exclusions.BAZA_APP'
+        $exclSyncListOk = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'SyncExclusionPatternList' -Value @('*.tmp', 'cache') -Path 'componentSettings.Synchronization.Exclusions.BAZA_APP'
+        $exclSyncAuthRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+        $exclSyncRegistry = @(@('componentSettings.Synchronization.Exclusions.BAZA_APP', 'componentSettings.Synchronization.Exclusions.BAZA_WWW') | Where-Object { [string]$exclSyncAuthRegistry[$_].Validator -ne 'SyncExclusionPatternList' })
+        Test-BRAVOCondition `
+            -Condition ((-not $exclSyncList.IsValid) -and $exclSyncListOk.IsValid -and $exclSyncRegistry.Count -eq 0) `
+            -Name 'Authorization/SyncExclusionListValidatorWiredToSynchronizationKeys' `
+            -Failure "SyncExclusionPatternList: шлях у списку відхиляється, імена приймаються, обидва ключі Synchronization.Exclusions використовують цей валідатор (EXCL-02)"
 
         $exclListOk = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'ExclusionPatternList' -Value @('*.tmp', 'desktop.ini') -Path 'componentSettings.Archive.Exclusions.MODEL'
         $exclListEmpty = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'ExclusionPatternList' -Value @() -Path 'componentSettings.Archive.Exclusions.MODEL'
