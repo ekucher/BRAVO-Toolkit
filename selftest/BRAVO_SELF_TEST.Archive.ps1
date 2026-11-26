@@ -3574,16 +3574,16 @@ Test-BRAVOCondition -Condition (
         # Помічники BRAVO.Compatibility: підрахунок збігів для журналу й маска WinSCP.
         $exCount = Get-BRAVOExclusionMatchCount -Path ($exSource + '\*') -Patterns @('*.tmp', 'desktop.ini', 'SynologyDrive', '#recycle', '?eaDir')
         $exEmptyCount = Get-BRAVOExclusionMatchCount -Path $exSource -Patterns @()
-        $exMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.tmp', 'SynologyDrive', 'sub\*.bak')
+        $exMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @('*.tmp', 'SynologyDrive')
         $exEmptyMask = ConvertTo-BRAVOWinSCPExclusionMask -Patterns @()
         Test-BRAVOCondition -Condition (
             $exCount.Files -eq 3 -and $exCount.Directories -eq 3 -and $exEmptyCount.Files -eq 0 -and $exEmptyCount.Directories -eq 0 -and
-            $exMask -eq '|*.tmp;*.tmp/;SynologyDrive;SynologyDrive/;*/sub/*.bak;*/sub/*.bak/' -and $null -eq $exEmptyMask -and
+            $exMask -eq '|*.tmp;*.tmp/;SynologyDrive;SynologyDrive/' -and $null -eq $exEmptyMask -and
             (Test-BRAVOExclusionMatch -RelativePath 'a\b\x.TMP' -Patterns @('*.tmp')) -and
             (Test-BRAVOExclusionMatch -RelativePath 'deep\sub\y.bak' -Patterns @('sub\*.bak')) -and
             -not (Test-BRAVOExclusionMatch -RelativePath 'keep.txt' -Patterns @('*.tmp'))
         ) -Name 'Archive/ExclusionMatchCountAndWinSCPMask' `
-          -Failure ("підрахунок збігів (файли/каталоги, збіглий каталог цілком) і маска WinSCP ('|p;p/;...', шлях — '*/p'; порожньо — \$null) (#561). files=$($exCount.Files) dirs=$($exCount.Directories) mask='$exMask'")
+          -Failure ("підрахунок збігів (файли/каталоги, збіглий каталог цілком) і маска WinSCP ('|p;p/;...', шлях-шаблон для WinSCP заборонено (EXCL-02); порожньо — \$null) (#561). files=$($exCount.Files) dirs=$($exCount.Directories) mask='$exMask'")
     } finally {
         if (Test-Path -LiteralPath $exSandbox) { Remove-Item -LiteralPath $exSandbox -Recurse -Force -ErrorAction SilentlyContinue }
     }

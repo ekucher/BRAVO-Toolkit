@@ -12,7 +12,7 @@ $loggingManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Logging\B
 Import-Module -Name $loggingManifest -ErrorAction Stop
 
 # #561: Get-BRAVOBazaSettingsEffective повторно перевіряє шаблони виключень
-# (Test-BRAVOExclusionPattern зі схеми конфігурації) — fail closed, якщо
+# (Test-BRAVOSyncExclusionPattern зі схеми конфігурації, EXCL-02) — fail closed, якщо
 # значення потрапило в рантайм повз валідатор завантаження конфігурації.
 # Схема — нижчий модуль без імпортів ArchiveRuntime, циклу немає.
 $configurationSchemaManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
@@ -172,7 +172,8 @@ function Get-BRAVOBazaSettingsEffective {
         }
         $exclusionList = @(@($exclusionNode) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
         foreach ($exclusionPattern in $exclusionList) {
-            $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+            # EXCL-02: для SFTP лише імена — маска WinSCP зі шляхом не прив'язується до кореня синхронізації.
+            $exclusionProblem = Test-BRAVOSyncExclusionPattern -Pattern $exclusionPattern
             if ($null -ne $exclusionProblem) {
                 throw (
                     "componentSettings.Synchronization.Exclusions.$exclusionComponent містить недопустимий шаблон " +

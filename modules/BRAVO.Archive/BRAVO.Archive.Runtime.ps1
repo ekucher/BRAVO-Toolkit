@@ -5091,7 +5091,7 @@ function Get-BAZASFTPComparison {
     # #561: fail closed — шаблон, що потрапив повз валідатор конфігурації,
     # до WinSCP не передається; порівняння не виконується.
     foreach ($exclusionPattern in @($Exclusions)) {
-        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        $exclusionProblem = Test-BRAVOSyncExclusionPattern -Pattern $exclusionPattern
         if ($null -ne $exclusionProblem) {
             return [pscustomobject]@{
                 Success = $false
@@ -7179,7 +7179,7 @@ function Sync-FolderToSFTP {
     # передається до WinSCP: синхронізація не починається.
     $Exclusions = @(@($Exclusions) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
     foreach ($exclusionPattern in $Exclusions) {
-        $exclusionProblem = Test-BRAVOExclusionPattern -Pattern $exclusionPattern
+        $exclusionProblem = Test-BRAVOSyncExclusionPattern -Pattern $exclusionPattern
         if ($null -ne $exclusionProblem) {
             Write-BRAVOLog -Component 'SFTP' -Message "SFTP-синхронiзацiю $ComponentName заблоковано: недопустимий шаблон виключення '$exclusionPattern' ($exclusionProblem)" -Level "ERROR"
             return $false

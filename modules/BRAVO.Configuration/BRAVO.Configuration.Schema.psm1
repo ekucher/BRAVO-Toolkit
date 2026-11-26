@@ -678,8 +678,8 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'componentSettings.Synchronization.BAZA_APP_SFTP' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_WWW_LOCAL' = @{ Class = 'ALLOW_SITE' }
     'componentSettings.Synchronization.BAZA_WWW_SFTP' = @{ Class = 'ALLOW_SITE' }
-    'componentSettings.Synchronization.Exclusions.BAZA_APP' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
-    'componentSettings.Synchronization.Exclusions.BAZA_WWW' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'ExclusionPatternList' }
+    'componentSettings.Synchronization.Exclusions.BAZA_APP' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'SyncExclusionPatternList' }
+    'componentSettings.Synchronization.Exclusions.BAZA_WWW' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'SyncExclusionPatternList' }
     'consoleSettings.BackgroundColor' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.ClearOnStart' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.ConsoleLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
@@ -1317,6 +1317,28 @@ function Test-BRAVOExclusionPattern {
         # знімок BAZA і віддалене порівняння не розходилися (рев'ю бота PR #564),
         # таку форму відхиляємо: пишіть '*' або 'name*'.
         if ($segment.EndsWith('.*')) { return "сегмент на '.*' інструменти трактують по-різному — використайте '*' або 'ім''я*'" }
+        # EXCL-02: '*.' / 'name.': WinSCP і 7-Zip читають кінцеву крапку як «без
+        # розширення», а -like — як ім'я, що закінчується крапкою. Відхиляємо
+        # будь-який сегмент на '.'; безрозширенний файл — окремий шаблон без крапки.
+        if ($segment.EndsWith('.')) { return "сегмент на '.' інструменти трактують по-різному (без розширення чи ім'я з крапкою) — приберіть кінцеву крапку" }
+    }
+    return $null
+}
+
+function Test-BRAVOSyncExclusionPattern {
+    # EXCL-02: шаблон виключення для WinSCP (SFTP-синхронізація BAZA). Те, що
+    # дозволяє Test-BRAVOExclusionPattern, плюс ЗАБОРОНА роздільника шляху: маска
+    # WinSCP зі шляхом порівнюється з ПОВНИМ шляхом і не прив'язується до кореня
+    # синхронізації (``BAZA/file`` для кореня C:\Data\BAZA виключила б
+    # C:\Data\BAZA\file, а локальний збіг по шляху відносно кореня — ні). Тож
+    # для WinSCP лише імена (будь-який рівень); шлях — відмова (fail closed).
+    [CmdletBinding()]
+    param([AllowNull()]$Pattern)
+
+    $problem = Test-BRAVOExclusionPattern -Pattern $Pattern
+    if ($null -ne $problem) { return $problem }
+    if ($Pattern.IndexOf('\') -ge 0 -or $Pattern.IndexOf('/') -ge 0) {
+        return 'шлях із роздільником для SFTP-синхронізації не підтримується (маска WinSCP не прив''язується до кореня) — вкажіть лише ім''я'
     }
     return $null
 }
@@ -1329,7 +1351,8 @@ function Test-BRAVOConfigurationAuthorizationExclusionPatternList {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [switch]$NamesOnly
     )
 
     if ($null -eq $Value -or $Value -isnot [System.Collections.IEnumerable] -or $Value -is [string]) {
@@ -1337,7 +1360,7 @@ function Test-BRAVOConfigurationAuthorizationExclusionPatternList {
     }
     $index = 0
     foreach ($item in $Value) {
-        $problem = Test-BRAVOExclusionPattern -Pattern $item
+        $problem = if ($NamesOnly) { Test-BRAVOSyncExclusionPattern -Pattern $item } else { Test-BRAVOExclusionPattern -Pattern $item }
         if ($null -ne $problem) {
             return [pscustomobject]@{ IsValid = $false; Message = ('{0}[{1}]: {2}. Дозволено лише ім''я або відносний шаблон із * і ?.' -f $Path, $index, $problem) }
         }
@@ -1651,6 +1674,7 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
         'NonEmptyString'     { return Test-BRAVOConfigurationAuthorizationNonEmptyString -Value $Value -Path $Path }
         'SshHostKeyFingerprint' { return Test-BRAVOConfigurationAuthorizationSshHostKeyFingerprint -Value $Value -Path $Path }
         'ExclusionPatternList' { return Test-BRAVOConfigurationAuthorizationExclusionPatternList -Value $Value -Path $Path }
+        'SyncExclusionPatternList' { return Test-BRAVOConfigurationAuthorizationExclusionPatternList -Value $Value -Path $Path -NamesOnly }
         default {
             throw "Схема авторизації конфігурації: невідомий ідентифікатор валідатора '$ValidatorId' для '$Path' — це дефект реєстру схеми, не значення оператора."
         }
@@ -2047,6 +2071,7 @@ function Get-BRAVOConfigurationSchemaVersionDeclarationLine {
 Export-ModuleMember -Function @(
     'Get-BRAVOConfigurationSchema',
     'Test-BRAVOExclusionPattern',
+    'Test-BRAVOSyncExclusionPattern',
     'Test-BRAVOConfigurationOverrideSchema',
     'Get-BRAVOConfigurationSchemaVersionContract',
     'Resolve-BRAVOConfigurationSchemaVersion',

@@ -2859,7 +2859,9 @@ function Get-BRAVOExclusionMatchCount {
 function ConvertTo-BRAVOWinSCPExclusionMask {
     # Маска виключень WinSCP для synchronize / CompareDirectories / PutFiles:
     # '|' + умови через ';'. Для кожного шаблону — і файл ('p'), і каталог
-    # ('p/'); шаблон із роздільником — шлях на будь-якому рівні ('*/p').
+    # ('p/'). Лише імена: маска WinSCP зі шляхом порівнюється з ПОВНИМ шляхом і
+    # не прив'язується до кореня синхронізації (EXCL-02), тож шаблон із
+    # роздільником — виняток (fail closed), а не '*/p'.
     # Порожній список — $null (маска не задається, поведінка не змінюється).
     # Метасимволи масок (| ; , < > [ ] : =) і лапки валідатор уже відхилив.
     [CmdletBinding()]
@@ -2867,8 +2869,10 @@ function ConvertTo-BRAVOWinSCPExclusionMask {
     $conditions = New-Object System.Collections.Generic.List[string]
     foreach ($pattern in @($Patterns)) {
         if ([string]::IsNullOrEmpty($pattern)) { continue }
-        $maskPattern = $pattern.Replace('\', '/')
-        if ($maskPattern.IndexOf('/') -ge 0) { $maskPattern = '*/' + $maskPattern }
+        if ($pattern.IndexOf('\') -ge 0 -or $pattern.IndexOf('/') -ge 0) {
+            throw 'Шаблон виключення зі шляхом не можна передати в маску WinSCP (вона не прив''язується до кореня синхронізації); використовуйте лише імена.'
+        }
+        $maskPattern = $pattern
         $conditions.Add($maskPattern)
         $conditions.Add($maskPattern + '/')
     }
